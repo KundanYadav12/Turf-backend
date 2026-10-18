@@ -1,0 +1,69 @@
+# ==========================================
+# Backend .gitignore (Node.js / Express / MySQL)
+# ==========================================
+
+# Dependencies
+node_modules/
+
+# Environment variables & secrets
+.env
+.env.*
+.env.local
+.env.development
+.env.test
+.env.production
+!.env.example
+!.env.*.example
+
+# Credentials & Keys
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.p8
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Uploads & Media (Preserve structure with .gitkeep)
+uploads/*
+!uploads/.gitkeep
+!uploads/avatars/
+!uploads/avatars/.gitkeep
+!uploads/thumbnails/
+!uploads/thumbnails/.gitkeep
+uploads/avatars/*
+!uploads/avatars/.gitkeep
+uploads/thumbnails/*
+!uploads/thumbnails/.gitkeep
+
+# Testing & Coverage
+coverage/
+.nyc_output/
+*.lcov
+test_*.js
+*_test.js
+*_test_*.js
+*.test.js
+*.spec.js
+test/
+tests/
+__tests__/
+
+# Cache & Temporary
+tmp/
+temp/
+*.tmp
+.cache/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
