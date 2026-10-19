@@ -139,68 +139,124 @@ const updateGroupAssignments = async (tournamentId, { assignments, autoDistribut
 /**
  * 3. Add team with roster to tournament.
  */
-const addTeamToTournament = async (tournamentId, { name, logoUrl, groupName = 'Group 1', playerNames = [] }, user) => {
+const addTeamToTournament = async (tournamentId, { teamId, name, logoUrl, groupName = 'Group 1', playerNames = [] }, user) => {
   const tournament = await getTournamentEntity(tournamentId);
   if (!tournament) {
     throw { statusCode: 404, message: 'Tournament not found.' };
   }
 
-  if (!name || typeof name !== 'string' || name.trim().length === 0) {
+  let internalTeamId = null;
+  let teamUuid = null;
+  let cleanName = typeof name === 'string' ? name.trim() : '';
+
+  // 1. Try finding existing team by teamId
+  if (teamId) {
+    const existing = await db.query(
+      'SELECT id, uuid, name, logo_url FROM teams WHERE uuid = ? OR id = ?',
+      [teamId, /^\d+$/.test(String(teamId)) ? parseInt(teamId, 10) : -1]
+    );
+    if (existing && existing.length > 0) {
+      internalTeamId = existing[0].id;
+      teamUuid = existing[0].uuid;
+      cleanName = cleanName || existing[0].name;
+      logoUrl = logoUrl || existing[0].logo_url;
+    }
+  }
+
+  // 2. Try finding existing team by name if no teamId provided
+  if (!internalTeamId && cleanName) {
+    const existingByName = await db.query(
+      'SELECT id, uuid, name, logo_url FROM teams WHERE LOWER(name) = LOWER(?) LIMIT 1',
+      [cleanName]
+    );
+    if (existingByName && existingByName.length > 0) {
+      internalTeamId = existingByName[0].id;
+      teamUuid = existingByName[0].uuid;
+      cleanName = existingByName[0].name;
+      logoUrl = logoUrl || existingByName[0].logo_url;
+    }
+  }
+
+  // 3. If neither found, ensure a valid name is provided
+  if (!internalTeamId && (!cleanName || cleanName.length === 0)) {
     throw { statusCode: 400, message: 'Team name is required.' };
   }
 
-  const cleanName = name.trim();
-
-  // Validate duplicate team name in this tournament
-  const existingInTournament = await db.query(
-    `SELECT tm.id FROM tournament_teams tt
-     JOIN teams tm ON tt.team_id = tm.id
-     WHERE tt.tournament_id = ? AND LOWER(tm.name) = LOWER(?)`,
-    [tournament.id, cleanName]
-  );
-  if (existingInTournament && existingInTournament.length > 0) {
-    throw { statusCode: 400, message: `A team named "${cleanName}" already exists in this tournament.` };
+  // 4. Validate duplicate registration in this tournament
+  if (internalTeamId) {
+    const existingInTournament = await db.query(
+      `SELECT id FROM tournament_teams WHERE tournament_id = ? AND team_id = ?`,
+      [tournament.id, internalTeamId]
+    );
+    if (existingInTournament && existingInTournament.length > 0) {
+      throw { statusCode: 400, message: `Team "${cleanName}" is already registered in this tournament.` };
+    }
+  } else {
+    const existingNameInTournament = await db.query(
+      `SELECT tm.id FROM tournament_teams tt
+       JOIN teams tm ON tt.team_id = tm.id
+       WHERE tt.tournament_id = ? AND LOWER(tm.name) = LOWER(?)`,
+      [tournament.id, cleanName]
+    );
+    if (existingNameInTournament && existingNameInTournament.length > 0) {
+      throw { statusCode: 400, message: `A team named "${cleanName}" is already registered in this tournament.` };
+    }
   }
 
-  const teamUuid = crypto.randomUUID();
   const defaultLogo = logoUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(cleanName)}&background=10b981&color=fff`;
 
-  // Create team
-  const result = await db.query(
-    `INSERT INTO teams (uuid, name, logo_url, sport_id, captain_id, status)
-     VALUES (?, ?, ?, 6, ?, 'ACTIVE')`,
-    [teamUuid, cleanName, defaultLogo, user ? user.id : 1]
-  );
-  const internalTeamId = result.insertId;
+  // 5. Create team if it does not exist
+  if (!internalTeamId) {
+    teamUuid = crypto.randomUUID();
+    const result = await db.query(
+      `INSERT INTO teams (uuid, name, logo_url, sport_id, captain_id, status)
+       VALUES (?, ?, ?, ?, ?, 'ACTIVE')`,
+      [teamUuid, cleanName, defaultLogo, tournament.sport_id || 1, user ? user.id : 1]
+    );
+    internalTeamId = result.insertId;
+  }
 
-  // Assign to tournament
+  // 6. Assign team to tournament
   await db.query(
     `INSERT INTO tournament_teams (tournament_id, team_id, registration_status, payment_status, group_name)
      VALUES (?, ?, 'APPROVED', 'PAID', ?)`,
-    [tournament.id, internalTeamId, groupName]
+    [tournament.id, internalTeamId, groupName || 'Group 1']
   );
 
-  // Add players
-  const roster = Array.isArray(playerNames) && playerNames.length > 0
-    ? playerNames
-    : Array.from({ length: tournament.roster_size || 12 }, (_, i) => `${cleanName} Player ${i + 1}`);
+  // 7. Add roster players if team doesn't have members or custom players passed
+  const existingMembers = await db.query(
+    'SELECT id FROM team_members WHERE team_id = ?',
+    [internalTeamId]
+  );
 
-  for (let idx = 0; idx < roster.length; idx++) {
-    const pName = typeof roster[idx] === 'string' ? roster[idx].trim() : (roster[idx].name || `Player ${idx + 1}`);
-    const role = idx === 0 ? 'CAPTAIN' : (idx === 1 ? 'VICE_CAPTAIN' : 'PLAYER');
-    await db.query(
-      `INSERT INTO team_members (team_id, user_id, player_name, role, jersey_number)
-       VALUES (?, NULL, ?, ?, ?)`,
-      [internalTeamId, pName, role, idx + 1]
-    );
+  let finalRosterCount = existingMembers ? existingMembers.length : 0;
+
+  if (finalRosterCount === 0 || (Array.isArray(playerNames) && playerNames.length > 0)) {
+    const roster = Array.isArray(playerNames) && playerNames.length > 0
+      ? playerNames
+      : (finalRosterCount === 0 ? Array.from({ length: tournament.roster_size || 12 }, (_, i) => `${cleanName} Player ${i + 1}`) : []);
+
+    for (let idx = 0; idx < roster.length; idx++) {
+      const pName = typeof roster[idx] === 'string' ? roster[idx].trim() : (roster[idx].name || `Player ${idx + 1}`);
+      const role = idx === 0 ? 'CAPTAIN' : (idx === 1 ? 'VICE_CAPTAIN' : 'PLAYER');
+      const isCap = idx === 0 ? 1 : 0;
+      const isViceCap = idx === 1 ? 1 : 0;
+      const pRole = typeof roster[idx] === 'object' && (roster[idx].position || roster[idx].role) ? (roster[idx].position || roster[idx].role) : null;
+      await db.query(
+        `INSERT INTO team_members (team_id, user_id, player_name, role, jersey_number, is_captain, is_vice_captain, position)
+         VALUES (?, NULL, ?, ?, ?, ?, ?, ?)`,
+        [internalTeamId, pName, role, finalRosterCount + idx + 1, isCap, isViceCap, pRole]
+      );
+    }
+    finalRosterCount += roster.length;
   }
 
   return {
     id: teamUuid,
     name: cleanName,
     logoUrl: defaultLogo,
-    groupName,
-    rosterSize: roster.length
+    groupName: groupName || 'Group 1',
+    rosterSize: finalRosterCount
   };
 };
 

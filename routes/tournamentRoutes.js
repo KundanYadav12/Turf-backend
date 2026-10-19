@@ -1,6 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const tournamentService = require('../services/tournamentService');
+const auctionController = require('../controllers/auctionController');
+const { authenticateUser, optionalAuthenticateUser } = require('../middleware/authMiddleware');
+const { authorizeRoles } = require('../middleware/rbacMiddleware');
+const upload = require('../middleware/multerMiddleware');
 
 // 1. GET /api/tournaments - Discovery listing (cursor-based pagination, minimal summary)
 router.get('/', async (req, res, next) => {
@@ -63,10 +67,25 @@ router.get('/:id/teams', async (req, res, next) => {
   }
 });
 
-const auctionController = require('../controllers/auctionController');
-const { authenticateUser } = require('../middleware/authMiddleware');
-const { authorizeRoles } = require('../middleware/rbacMiddleware');
-const upload = require('../middleware/multerMiddleware');
+// 5a. GET /api/tournaments/:id/teams/:teamId/players - Team Squad Roster
+router.get('/:id/teams/:teamId/players', optionalAuthenticateUser, async (req, res, next) => {
+  try {
+    const data = await tournamentService.getTournamentTeamRoster(req.params.id, req.params.teamId, req.user);
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 5b. POST /api/tournaments/:id/teams/:teamId/players - Add Player to Team Squad
+router.post('/:id/teams/:teamId/players', authenticateUser, async (req, res, next) => {
+  try {
+    const data = await tournamentService.addPlayerToTournamentTeamRoster(req.params.id, req.params.teamId, req.body, req.user);
+    res.status(201).json({ success: true, message: 'Player added to squad successfully!', data });
+  } catch (error) {
+    next(error);
+  }
+});
 
 // 6. POST /api/tournaments - Create tournament (Protected: ADMIN, VENUE_OWNER)
 router.post(
@@ -119,8 +138,47 @@ router.get('/:id/groups', async (req, res, next) => {
   }
 });
 
+// Helper middleware: Authorize tournament organizer, venue owner, or admin
+const authorizeTournamentOrganizer = async (req, res, next) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ success: false, message: 'Authentication required. Please login.' });
+    }
+
+    if (req.user.role === 'ADMIN' || req.user.role === 'VENUE_OWNER' || req.user.role === 'VENUE_STAFF') {
+      return next();
+    }
+
+    const db = require('../config/database');
+    const tournamentId = req.params.id;
+    const isNum = /^\d+$/.test(String(tournamentId).trim());
+
+    const rows = await db.query(
+      `SELECT t.id, t.created_by, v.owner_id as venue_owner_id
+       FROM tournaments t
+       LEFT JOIN venues v ON t.venue_id = v.id
+       WHERE t.uuid = ? OR t.id = ?`,
+      [tournamentId, isNum ? parseInt(tournamentId, 10) : -1]
+    );
+
+    if (rows && rows.length > 0) {
+      const tourn = rows[0];
+      if (tourn.created_by === req.user.id || (tourn.venue_owner_id && tourn.venue_owner_id === req.user.id)) {
+        return next();
+      }
+    }
+
+    return res.status(403).json({
+      success: false,
+      message: 'Forbidden. Only the tournament organizer, venue owner, or platform admin can perform this action.'
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 // 10. PUT /api/tournaments/:id/groups - Update groups (manual assignment or auto-distribute)
-router.put('/:id/groups', authenticateUser, authorizeRoles('ADMIN', 'VENUE_OWNER'), async (req, res, next) => {
+router.put('/:id/groups', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
   try {
     const data = await pickleballService.updateGroupAssignments(req.params.id, req.body, req.user);
     res.json({ success: true, message: 'Tournament groups updated successfully!', data });
@@ -130,7 +188,7 @@ router.put('/:id/groups', authenticateUser, authorizeRoles('ADMIN', 'VENUE_OWNER
 });
 
 // 11. POST /api/tournaments/:id/teams - Register team to tournament with roster
-router.post('/:id/teams', authenticateUser, authorizeRoles('ADMIN', 'VENUE_OWNER'), async (req, res, next) => {
+router.post('/:id/teams', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
   try {
     const data = await pickleballService.addTeamToTournament(req.params.id, req.body, req.user);
     res.status(201).json({ success: true, message: 'Team added to tournament successfully!', data });
@@ -143,7 +201,7 @@ router.post('/:id/teams', authenticateUser, authorizeRoles('ADMIN', 'VENUE_OWNER
 const tournamentEngineService = require('../services/tournamentEngineService');
 const statisticsAwardsService = require('../services/statisticsAwardsService');
 
-router.post('/:id/generate-fixtures', authenticateUser, authorizeRoles('ADMIN', 'VENUE_OWNER'), async (req, res, next) => {
+router.post('/:id/generate-fixtures', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
   try {
     const data = await tournamentEngineService.generateFixtures(req.params.id, req.body, req.user);
     res.json(data);
@@ -152,7 +210,7 @@ router.post('/:id/generate-fixtures', authenticateUser, authorizeRoles('ADMIN', 
   }
 });
 
-router.post('/:id/fixtures/generate', authenticateUser, authorizeRoles('ADMIN', 'VENUE_OWNER'), async (req, res, next) => {
+router.post('/:id/fixtures/generate', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
   try {
     const data = await tournamentEngineService.generateFixtures(req.params.id, req.body, req.user);
     res.json(data);
@@ -182,7 +240,7 @@ router.get('/:id/awards', async (req, res, next) => {
 });
 
 // 15. POST /api/tournaments/:id/awards/calculate - Calculate & compute awards
-router.post('/:id/awards/calculate', authenticateUser, authorizeRoles('ADMIN', 'VENUE_OWNER'), async (req, res, next) => {
+router.post('/:id/awards/calculate', optionalAuthenticateUser, async (req, res, next) => {
   try {
     const data = await statisticsAwardsService.computeTournamentAwards(req.params.id);
     res.json({ success: true, message: 'Tournament awards computed successfully!', data });
@@ -192,7 +250,7 @@ router.post('/:id/awards/calculate', authenticateUser, authorizeRoles('ADMIN', '
 });
 
 // 16. PUT /api/tournaments/:id/awards/:awardId - Organizer award override with audit trail
-router.put('/:id/awards/:awardId', authenticateUser, authorizeRoles('ADMIN', 'VENUE_OWNER'), async (req, res, next) => {
+router.put('/:id/awards/:awardId', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
   try {
     const data = await statisticsAwardsService.overrideAward(req.params.awardId, req.body, req.user);
     res.json(data);

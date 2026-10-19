@@ -1,4 +1,5 @@
 const db = require('../config/database');
+const sportRolesConfig = require('../config/sportRoles');
 
 /**
  * Returns lightweight tournament summary cards with cursor-based pagination.
@@ -89,24 +90,30 @@ const getTournamentsPaginated = async ({
   }
 
   // Format response: Strip internal _internal_id completely
-  const cleanItems = items.map(item => ({
-    id: item.public_id,
-    name: item.name,
-    format: item.format,
-    city: item.city,
-    bannerUrl: item.banner_url,
-    totalTeams: item.max_teams,
-    registeredTeams: parseInt(item.registered_teams_count, 10) || 0,
-    startDate: item.start_date,
-    endDate: item.end_date,
-    status: item.status,
-    liveMatchCount: parseInt(item.live_match_count, 10) || 0,
-    sport: {
-      name: item.sport_name,
-      slug: item.sport_slug,
-      icon: item.sport_icon
-    }
-  }));
+  const cleanItems = items.map(item => {
+    const regCount = parseInt(item.registered_teams_count, 10) || 0;
+    return {
+      id: item.public_id,
+      name: item.name,
+      format: item.format,
+      city: item.city,
+      bannerUrl: item.banner_url,
+      totalTeams: item.max_teams,
+      maxTeams: item.max_teams,
+      registeredTeams: regCount,
+      registeredTeamsCount: regCount,
+      teamsCount: regCount,
+      startDate: item.start_date,
+      endDate: item.end_date,
+      status: item.status,
+      liveMatchCount: parseInt(item.live_match_count, 10) || 0,
+      sport: {
+        name: item.sport_name,
+        slug: item.sport_slug,
+        icon: item.sport_icon
+      }
+    };
+  });
 
   return {
     items: cleanItems,
@@ -158,7 +165,10 @@ const getTournamentByPublicId = async (publicId) => {
       end: t.end_date
     },
     maxTeams: t.max_teams,
+    totalTeams: t.max_teams,
+    registeredTeams: parseInt(t.registered_teams_count, 10) || 0,
     registeredTeamsCount: parseInt(t.registered_teams_count, 10) || 0,
+    teamsCount: parseInt(t.registered_teams_count, 10) || 0,
     status: t.status,
     rules: t.rules,
     hasAuction: Boolean(t.has_auction || t.auction_id),
@@ -346,12 +356,15 @@ const getTournamentTeams = async (publicId) => {
 
   const teamsWithMembers = await Promise.all(rows.map(async (t) => {
     const members = await db.query(
-      `SELECT tm.id, tm.role, tm.jersey_number, 
+      `SELECT tm.id, tm.role, tm.jersey_number, tm.position, tm.is_captain, tm.is_vice_captain,
               COALESCE(u.full_name, tm.player_name, 'Player') as name,
-              tm.user_id
+              COALESCE(u.profile_photo, tm.photo_url) as avatar,
+              tm.user_id,
+              u.batting_style, u.bowling_style, u.preferred_hand_foot
        FROM team_members tm
        LEFT JOIN users u ON tm.user_id = u.id
-       WHERE tm.team_id = ?`,
+       WHERE tm.team_id = ?
+       ORDER BY (CASE WHEN tm.is_captain = 1 OR tm.role = 'CAPTAIN' THEN 0 WHEN tm.is_vice_captain = 1 OR tm.role = 'VICE_CAPTAIN' THEN 1 ELSE 2 END), tm.id ASC`,
       [t.internal_team_id]
     );
     return {
@@ -362,17 +375,265 @@ const getTournamentTeams = async (publicId) => {
       seed: t.seed_number,
       status: t.registration_status,
       groupName: t.group_name || 'Group 1',
+      playersCount: members.length,
       members: members.map(m => ({
         id: m.id,
         name: m.name,
-        role: m.role,
+        role: m.position || (m.role === 'CAPTAIN' ? 'Captain' : m.role === 'VICE_CAPTAIN' ? 'Vice-Captain' : 'Player'),
+        leadershipRole: m.role || 'PLAYER',
+        isCaptain: Boolean(m.is_captain || m.role === 'CAPTAIN'),
+        isViceCaptain: Boolean(m.is_vice_captain || m.role === 'VICE_CAPTAIN'),
         jerseyNumber: m.jersey_number,
-        userId: m.user_id
+        avatar: m.avatar,
+        userId: m.user_id,
+        battingStyle: m.batting_style || null,
+        bowlingStyle: m.bowling_style || null,
+        preferredHandFoot: m.preferred_hand_foot || null
       }))
     };
   }));
 
   return teamsWithMembers;
+};
+
+/**
+ * Returns detailed squad roster for a specific team in a tournament.
+ */
+const getTournamentTeamRoster = async (tournamentPublicId, teamPublicId, user = null) => {
+  const isTournNum = /^\d+$/.test(String(tournamentPublicId).trim());
+  const tournamentRows = await db.query(
+    `SELECT t.*, s.name as sport_name, s.slug as sport_slug,
+            v.owner_id as venue_owner_id
+     FROM tournaments t
+     LEFT JOIN sports s ON t.sport_id = s.id
+     LEFT JOIN venues v ON t.venue_id = v.id
+     WHERE t.uuid = ? OR t.id = ?`,
+    [tournamentPublicId, isTournNum ? parseInt(tournamentPublicId, 10) : -1]
+  );
+
+  if (!tournamentRows || tournamentRows.length === 0) {
+    throw { statusCode: 404, message: 'Tournament not found.' };
+  }
+  const tournament = tournamentRows[0];
+
+  const isTeamNum = /^\d+$/.test(String(teamPublicId).trim());
+  const teamRows = await db.query(
+    `SELECT tm.*, s.name as sport_name, s.slug as sport_slug,
+            tt.group_name, tt.seed_number, tt.registration_status,
+            u.full_name as captain_user_name
+     FROM teams tm
+     LEFT JOIN tournament_teams tt ON (tt.team_id = tm.id AND tt.tournament_id = ?)
+     LEFT JOIN sports s ON tm.sport_id = s.id
+     LEFT JOIN users u ON tm.captain_id = u.id
+     WHERE tm.uuid = ? OR tm.id = ?`,
+    [tournament.id, teamPublicId, isTeamNum ? parseInt(teamPublicId, 10) : -1]
+  );
+
+  if (!teamRows || teamRows.length === 0) {
+    throw { statusCode: 404, message: 'Team not found.' };
+  }
+  const team = teamRows[0];
+
+  const members = await db.query(
+    `SELECT tm.id as member_id, tm.team_id, tm.user_id, tm.role, tm.jersey_number, tm.position,
+            tm.is_captain, tm.is_vice_captain, tm.joined_at,
+            COALESCE(u.full_name, tm.player_name, 'Player') as name,
+            COALESCE(u.profile_photo, tm.photo_url) as avatar,
+            u.username,
+            u.batting_style,
+            u.bowling_style,
+            u.preferred_hand_foot,
+            u.primary_position,
+            u.experience_level
+     FROM team_members tm
+     LEFT JOIN users u ON tm.user_id = u.id
+     WHERE tm.team_id = ?
+     ORDER BY 
+       (CASE WHEN tm.is_captain = 1 THEN 0
+             WHEN tm.role = 'CAPTAIN' OR (tm.user_id IS NOT NULL AND tm.user_id = ?) THEN 1
+             WHEN tm.is_vice_captain = 1 THEN 2
+             WHEN tm.role = 'VICE_CAPTAIN' THEN 3
+             ELSE 4 END),
+       tm.jersey_number IS NULL, tm.jersey_number ASC,
+       tm.id ASC`,
+    [team.id, team.captain_id || -1]
+  );
+
+  let captainAssigned = false;
+  let viceCaptainAssigned = false;
+
+  const formattedPlayers = members.map((m) => {
+    let isCap = false;
+    let isViceCap = false;
+
+    if (!captainAssigned && (m.is_captain === 1 || m.role === 'CAPTAIN' || (team.captain_id && m.user_id === team.captain_id))) {
+      isCap = true;
+      captainAssigned = true;
+    } else if (!viceCaptainAssigned && (m.is_vice_captain === 1 || m.role === 'VICE_CAPTAIN')) {
+      isViceCap = true;
+      viceCaptainAssigned = true;
+    }
+
+    const roleCaption = m.position || m.primary_position || 'Player';
+
+    return {
+      id: m.member_id,
+      userId: m.user_id,
+      name: m.name,
+      username: m.username || null,
+      avatar: m.avatar || null,
+      jerseyNumber: m.jersey_number != null ? m.jersey_number : null,
+      role: roleCaption,
+      leadershipRole: isCap ? 'CAPTAIN' : isViceCap ? 'VICE_CAPTAIN' : 'PLAYER',
+      isCaptain: isCap,
+      isViceCaptain: isViceCap,
+      battingStyle: m.batting_style || null,
+      bowlingStyle: m.bowling_style || null,
+      preferredHandFoot: m.preferred_hand_foot || null,
+      experienceLevel: m.experience_level || 'Club',
+      joinedAt: m.joined_at
+    };
+  });
+
+  // Sort: Captain first, Vice-Captain second, then by jersey or name
+  formattedPlayers.sort((a, b) => {
+    if (a.isCaptain && !b.isCaptain) return -1;
+    if (!a.isCaptain && b.isCaptain) return 1;
+    if (a.isViceCaptain && !b.isViceCaptain) return -1;
+    if (!a.isViceCaptain && b.isViceCaptain) return 1;
+    if (a.jerseyNumber != null && b.jerseyNumber != null) return a.jerseyNumber - b.jerseyNumber;
+    if (a.jerseyNumber != null) return -1;
+    if (b.jerseyNumber != null) return 1;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+
+  const capPlayer = formattedPlayers.find(p => p.isCaptain);
+  const vcPlayer = formattedPlayers.find(p => p.isViceCaptain);
+
+  let canManage = false;
+  if (user) {
+    if (user.role === 'ADMIN') {
+      canManage = true;
+    } else if (user.id === team.owner_id || user.id === team.captain_id) {
+      canManage = true;
+    } else if (tournament.created_by === user.id || tournament.venue_owner_id === user.id) {
+      canManage = true;
+    }
+  }
+
+  return {
+    tournament: {
+      id: tournament.uuid,
+      name: tournament.name,
+      sportSlug: tournament.sport_slug || 'cricket',
+      sportName: tournament.sport_name || 'Cricket'
+    },
+    team: {
+      id: team.uuid,
+      internalId: team.id,
+      name: team.name,
+      logoUrl: team.logo_url,
+      groupName: team.group_name || 'Group 1',
+      totalPlayers: formattedPlayers.length,
+      captainName: capPlayer ? capPlayer.name : (team.captain_user_name || null),
+      viceCaptainName: vcPlayer ? vcPlayer.name : null
+    },
+    canManage,
+    players: formattedPlayers
+  };
+};
+
+/**
+ * Adds a player to a team's squad in a tournament.
+ */
+const addPlayerToTournamentTeamRoster = async (tournamentPublicId, teamPublicId, playerData, user) => {
+  const isTournNum = /^\d+$/.test(String(tournamentPublicId).trim());
+  const tournamentRows = await db.query(
+    `SELECT t.*, s.slug as sport_slug, v.owner_id as venue_owner_id
+     FROM tournaments t
+     LEFT JOIN sports s ON t.sport_id = s.id
+     LEFT JOIN venues v ON t.venue_id = v.id
+     WHERE t.uuid = ? OR t.id = ?`,
+    [tournamentPublicId, isTournNum ? parseInt(tournamentPublicId, 10) : -1]
+  );
+  if (!tournamentRows || tournamentRows.length === 0) {
+    throw { statusCode: 404, message: 'Tournament not found.' };
+  }
+  const tournament = tournamentRows[0];
+
+  const isTeamNum = /^\d+$/.test(String(teamPublicId).trim());
+  const teamRows = await db.query(
+    'SELECT * FROM teams WHERE uuid = ? OR id = ?',
+    [teamPublicId, isTeamNum ? parseInt(teamPublicId, 10) : -1]
+  );
+  if (!teamRows || teamRows.length === 0) {
+    throw { statusCode: 404, message: 'Team not found.' };
+  }
+  const team = teamRows[0];
+
+  const canManage = user?.role === 'ADMIN' ||
+    user?.id === team.owner_id ||
+    user?.id === team.captain_id ||
+    tournament.created_by === user?.id ||
+    tournament.venue_owner_id === user?.id;
+
+  if (!canManage) {
+    throw { statusCode: 403, message: 'Forbidden. You do not have permission to manage this team squad.' };
+  }
+
+  const {
+    name,
+    jerseyNumber,
+    role = 'Player',
+    isCaptain = false,
+    isViceCaptain = false,
+    battingStyle,
+    bowlingStyle,
+    preferredHandFoot
+  } = playerData;
+
+  if (!name || !name.trim()) {
+    throw { statusCode: 400, message: 'Player name is required.' };
+  }
+
+  const cleanName = name.trim();
+  const parsedJersey = jerseyNumber != null && String(jerseyNumber).trim() !== '' ? parseInt(jerseyNumber, 10) : null;
+  const isCap = Boolean(isCaptain);
+  const isViceCap = Boolean(!isCap && isViceCaptain);
+
+  if (isCap) {
+    await db.query(
+      `UPDATE team_members SET is_captain = 0, role = (CASE WHEN role = 'CAPTAIN' THEN 'PLAYER' ELSE role END) WHERE team_id = ?`,
+      [team.id]
+    );
+  }
+  if (isViceCap) {
+    await db.query(
+      `UPDATE team_members SET is_vice_captain = 0, role = (CASE WHEN role = 'VICE_CAPTAIN' THEN 'PLAYER' ELSE role END) WHERE team_id = ?`,
+      [team.id]
+    );
+  }
+
+  const leadershipRole = isCap ? 'CAPTAIN' : isViceCap ? 'VICE_CAPTAIN' : 'PLAYER';
+
+  const insertResult = await db.query(
+    `INSERT INTO team_members (
+      team_id, user_id, player_name, role, jersey_number, position, is_captain, is_vice_captain
+    ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?)`,
+    [team.id, cleanName, leadershipRole, parsedJersey, role || 'Player', isCap ? 1 : 0, isViceCap ? 1 : 0]
+  );
+
+  return {
+    id: insertResult.insertId,
+    name: cleanName,
+    jerseyNumber: parsedJersey,
+    role: role || 'Player',
+    isCaptain: isCap,
+    isViceCaptain: isViceCap,
+    battingStyle: battingStyle || null,
+    bowlingStyle: bowlingStyle || null,
+    preferredHandFoot: preferredHandFoot || null
+  };
 };
 
 /**
@@ -575,5 +836,7 @@ module.exports = {
   getTournamentLiveMatches,
   getTournamentFixtures,
   getTournamentTeams,
+  getTournamentTeamRoster,
+  addPlayerToTournamentTeamRoster,
   createTournament
 };

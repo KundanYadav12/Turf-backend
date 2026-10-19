@@ -117,19 +117,18 @@ async function computeTournamentAwards(tournamentId) {
   else if (sportSlug === 'cricket') {
     // 1. Most Runs (Orange Cap)
     const topRuns = await db.query(
-      `SELECT b.batter_id as player_id, u.full_name as player_name, tm.name as team_name, tm.id as team_id,
-              SUM(b.runs_batter) as total_runs,
-              SUM(CASE WHEN b.runs_batter = 6 THEN 1 ELSE 0 END) as total_sixes,
-              SUM(CASE WHEN b.runs_batter = 4 THEN 1 ELSE 0 END) as total_fours
+      `SELECT b.striker_id as player_id, COALESCE(u.full_name, 'Player') as player_name, tm.name as team_name, tm.id as team_id,
+              SUM(b.runs_scored) as total_runs,
+              SUM(CASE WHEN b.runs_scored = 6 THEN 1 ELSE 0 END) as total_sixes,
+              SUM(CASE WHEN b.runs_scored = 4 THEN 1 ELSE 0 END) as total_fours
        FROM cricket_balls b
        JOIN cricket_innings inn ON b.innings_id = inn.id
-       JOIN cricket_matches cm ON inn.cricket_match_id = cm.id
-       JOIN tournament_matches m ON cm.match_id = m.id
-       JOIN users u ON b.batter_id = u.id
+       JOIN tournament_matches m ON inn.match_id = m.id
+       LEFT JOIN users u ON b.striker_id = u.id
        LEFT JOIN team_members mem ON mem.user_id = u.id
        LEFT JOIN teams tm ON mem.team_id = tm.id
        WHERE m.tournament_id = ?
-       GROUP BY b.batter_id, u.full_name, tm.name, tm.id
+       GROUP BY b.striker_id, u.full_name, tm.name, tm.id
        ORDER BY total_runs DESC
        LIMIT 1`,
       [tournament.id]
@@ -165,16 +164,15 @@ async function computeTournamentAwards(tournamentId) {
 
     // 2. Most Wickets (Purple Cap)
     const topWickets = await db.query(
-      `SELECT b.bowler_id as player_id, u.full_name as player_name, tm.name as team_name, tm.id as team_id,
+      `SELECT b.bowler_id as player_id, COALESCE(u.full_name, 'Player') as player_name, tm.name as team_name, tm.id as team_id,
               COUNT(*) as total_wickets
        FROM cricket_balls b
        JOIN cricket_innings inn ON b.innings_id = inn.id
-       JOIN cricket_matches cm ON inn.cricket_match_id = cm.id
-       JOIN tournament_matches m ON cm.match_id = m.id
-       JOIN users u ON b.bowler_id = u.id
+       JOIN tournament_matches m ON inn.match_id = m.id
+       LEFT JOIN users u ON b.bowler_id = u.id
        LEFT JOIN team_members mem ON mem.user_id = u.id
        LEFT JOIN teams tm ON mem.team_id = tm.id
-       WHERE m.tournament_id = ? AND b.is_wicket = 1 AND b.dismissal_type NOT IN ('run out', 'retired hurt')
+       WHERE m.tournament_id = ? AND b.is_wicket = 1 AND (b.wicket_type IS NULL OR b.wicket_type NOT IN ('run out', 'retired hurt'))
        GROUP BY b.bowler_id, u.full_name, tm.name, tm.id
        ORDER BY total_wickets DESC
        LIMIT 1`,
