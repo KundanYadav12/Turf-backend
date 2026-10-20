@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
+    "migrate": "node database/run_all_migrations.js",
     "db:init": "node database/initDb.js",
     "test": "node test_gitignore_rules.js",
     "test:gitignore": "node test_gitignore_rules.js"
