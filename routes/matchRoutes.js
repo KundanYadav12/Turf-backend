@@ -4,6 +4,7 @@ const matchService = require('../services/matchService');
 const cricketScorerService = require('../services/cricketScorerService');
 const universalUndoService = require('../services/universalUndoService');
 const { authenticateUser, optionalAuthenticateUser } = require('../middleware/authMiddleware');
+const { requireScorerForMatch } = require('../middleware/scorerAuthMiddleware');
 
 // 1. GET /api/matches/:id - Single Match Detailed State (Public / Viewers)
 router.get('/:id', async (req, res, next) => {
@@ -86,7 +87,7 @@ router.get('/:id/ads', async (req, res, next) => {
 });
 
 // 4. GET /api/matches/:id/scorer - Full Scorer Console State (Protected: Scorer / Owner / Admin)
-router.get('/:id/scorer', authenticateUser, async (req, res, next) => {
+router.get('/:id/scorer', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const state = await cricketScorerService.getScorerState(req.params.id);
     if (!state) {
@@ -99,7 +100,7 @@ router.get('/:id/scorer', authenticateUser, async (req, res, next) => {
 });
 
 // 5. POST /api/matches/:id/toss - Initialize Match with Toss & Opening Lineups (Protected)
-router.post('/:id/toss', authenticateUser, async (req, res, next) => {
+router.post('/:id/toss', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const {
       tossWinnerTeamId,
@@ -131,7 +132,7 @@ router.post('/:id/toss', authenticateUser, async (req, res, next) => {
 });
 
 // 6. POST /api/matches/:id/deliveries - Record a Ball Delivery (Protected)
-router.post('/:id/deliveries', authenticateUser, async (req, res, next) => {
+router.post('/:id/deliveries', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const rawRuns = req.body.runs !== undefined ? req.body.runs : req.body.batRuns;
     const runs = rawRuns !== undefined ? parseInt(rawRuns, 10) : 0;
@@ -168,7 +169,7 @@ router.post('/:id/deliveries', authenticateUser, async (req, res, next) => {
 });
 
 // 7. POST /api/matches/:id/bowler - Switch / Assign Bowler at Over End (Protected)
-router.post('/:id/bowler', authenticateUser, async (req, res, next) => {
+router.post('/:id/bowler', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const { nextBowlerId } = req.body;
     const result = await cricketScorerService.switchBowler({
@@ -224,7 +225,7 @@ router.post('/:id/cricket/undo', authenticateUser, async (req, res, next) => {
 });
 
 // 9. POST /api/matches/:id/innings/second - Start 2nd Innings (Protected)
-router.post('/:id/innings/second', authenticateUser, async (req, res, next) => {
+router.post('/:id/innings/second', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const { strikerId, nonStrikerId, bowlerId } = req.body;
     const result = await cricketScorerService.startSecondInnings({
@@ -242,7 +243,7 @@ router.post('/:id/innings/second', authenticateUser, async (req, res, next) => {
 });
 
 // 10. POST /api/matches/:id/complete - Complete Match & Finalize Tournament Standings (Protected)
-router.post('/:id/complete', authenticateUser, async (req, res, next) => {
+router.post('/:id/complete', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const { winnerTeamId, resultSummary } = req.body;
     const result = await cricketScorerService.completeMatch({

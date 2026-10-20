@@ -50,6 +50,8 @@ async function getDisplayData(req, res, next) {
           name: `${tournaments[0].name} TV Display`,
           tournament_id: tournamentId,
           layout_type: 'AUTO',
+          orientation: 'AUTO',
+          sidebars_mode: 'STRIP',
           match_count: 4,
           rotation_enabled: true,
           rotation_interval: 15,
@@ -72,6 +74,8 @@ async function getDisplayData(req, res, next) {
             name: `${defaultTourns[0].name} Live TV`,
             tournament_id: tournamentId,
             layout_type: 'AUTO',
+            orientation: 'AUTO',
+            sidebars_mode: 'STRIP',
             match_count: 4,
             rotation_enabled: true,
             rotation_interval: 15,
@@ -105,8 +109,9 @@ async function getDisplayData(req, res, next) {
 
     const tournament = tourRows[0] || null;
 
-    // 3. Fetch Live Matches
+    // 3. Fetch Live Matches (Respect showOnDisplay filter)
     let liveMatches = await tournamentService.getTournamentLiveMatches(tournamentId);
+    liveMatches = (liveMatches || []).filter(m => m.showOnDisplay !== false);
 
     // If show_completed_matches is enabled or there are fewer live matches than match_count,
     // fetch upcoming or recently completed matches to provide a populated TV grid
@@ -115,6 +120,7 @@ async function getDisplayData(req, res, next) {
       const extraRows = await db.query(`
         SELECT 
           tm.id as match_id, tm.uuid as match_uuid, tm.match_number, tm.status,
+          tm.show_on_display, tm.category,
           tm.live_score_summary, tm.live_subtext, tm.sport_state,
           c.name as court_name, v.name as venue_name,
           ta.uuid as team_a_id, ta.name as team_a_name, ta.logo_url as team_a_logo,
@@ -127,7 +133,7 @@ async function getDisplayData(req, res, next) {
         LEFT JOIN venues v ON tm.venue_id = v.id
         JOIN teams ta ON tm.team_a_id = ta.id
         JOIN teams tb ON tm.team_b_id = tb.id
-        WHERE tm.tournament_id = ? AND tm.status != 'LIVE'
+        WHERE tm.tournament_id = ? AND tm.status != 'LIVE' AND (tm.show_on_display = 1 OR tm.show_on_display IS NULL)
         ORDER BY 
           CASE 
             WHEN tm.status = 'COMPLETED' THEN 1
@@ -173,8 +179,9 @@ async function getDisplayData(req, res, next) {
       }
     }
 
-    // 5. Fetch Fixtures / Upcoming Matches
-    const fixtures = await tournamentService.getTournamentFixtures(tournamentId);
+    // 5. Fetch Fixtures / Upcoming Matches (Respect showOnDisplay)
+    const allFixtures = await tournamentService.getTournamentFixtures(tournamentId);
+    const displayFixtures = (allFixtures || []).filter(m => m.showOnDisplay !== false);
 
     // 6. Fetch Standings / Points Table
     const standingsRows = await db.query(`
@@ -202,7 +209,7 @@ async function getDisplayData(req, res, next) {
     }));
 
     // 7. Fetch Completed Matches (Results)
-    const results = fixtures.filter(m => m.status === 'COMPLETED').slice(0, 8);
+    const results = displayFixtures.filter(m => m.status === 'COMPLETED').slice(0, 8);
 
     // 8. Fetch Advertisements for Signage / TV
     let adsData = {
@@ -286,6 +293,8 @@ async function getDisplayData(req, res, next) {
           uuid: tvConfig.uuid,
           name: tvConfig.name,
           layoutType: tvConfig.layout_type || 'AUTO',
+          orientation: tvConfig.orientation || 'AUTO',
+          sidebarsMode: tvConfig.sidebars_mode || 'STRIP',
           matchCount: tvConfig.match_count || 4,
           featuredMatchId: tvConfig.featured_match_id || null,
           showCompletedMatches: Boolean(tvConfig.show_completed_matches),
@@ -306,10 +315,11 @@ async function getDisplayData(req, res, next) {
           sportSlug: tournament?.sport_slug || 'cricket',
           sportName: tournament?.sport_name || 'Cricket',
           venueName: tournament?.venue_name || 'Stadium Court',
-          city: tournament?.venue_city || tournament?.city || 'Sports Arena'
+          city: tournament?.venue_city || tournament?.city || 'Sports Arena',
+          courtColor: tournament?.court_color || '#0d5c3a'
         },
         matches: liveMatches,
-        fixtures: fixtures.slice(0, 10),
+        fixtures: displayFixtures.slice(0, 10),
         standings: formattedStandings,
         results,
         ads: adsData,
@@ -495,6 +505,8 @@ async function listDisplays(req, res, next) {
         tournamentId: r.tournament_id,
         tournamentName: r.tournament_name,
         layoutType: r.layout_type,
+        orientation: r.orientation || 'AUTO',
+        sidebarsMode: r.sidebars_mode || 'STRIP',
         matchCount: r.match_count,
         featuredMatchId: r.featured_match_id,
         showCompletedMatches: Boolean(r.show_completed_matches),
@@ -533,6 +545,8 @@ async function saveDisplayConfig(req, res, next) {
       tournamentId,
       venueId,
       layoutType = 'AUTO',
+      orientation = 'AUTO',
+      sidebarsMode = 'STRIP',
       matchCount = 4,
       featuredMatchId = null,
       showCompletedMatches = false,
@@ -556,6 +570,8 @@ async function saveDisplayConfig(req, res, next) {
             tournament_id = COALESCE(?, tournament_id),
             venue_id = COALESCE(?, venue_id),
             layout_type = ?,
+            orientation = ?,
+            sidebars_mode = ?,
             match_count = ?,
             featured_match_id = ?,
             show_completed_matches = ?,
@@ -572,7 +588,7 @@ async function saveDisplayConfig(req, res, next) {
         WHERE id = ?
       `, [
         name || null, tournamentId || null, venueId || null,
-        layoutType, matchCount, featuredMatchId || null, Boolean(showCompletedMatches),
+        layoutType, orientation, sidebarsMode, matchCount, featuredMatchId || null, Boolean(showCompletedMatches),
         Boolean(rotationEnabled), rotationInterval, scenesJson,
         Boolean(adTopEnabled), Boolean(adBottomEnabled),
         Boolean(adSidebarsEnabled), Boolean(adCenterEnabled), theme,
@@ -587,6 +603,8 @@ async function saveDisplayConfig(req, res, next) {
         displayUuid: updatedDisplay.uuid,
         config: {
           layoutType,
+          orientation,
+          sidebarsMode,
           matchCount,
           featuredMatchId,
           showCompletedMatches: Boolean(showCompletedMatches),
@@ -613,13 +631,13 @@ async function saveDisplayConfig(req, res, next) {
     const tvUuid = `tv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     const result = await db.query(`
       INSERT INTO tv_displays (
-        uuid, name, tournament_id, venue_id, layout_type, match_count,
+        uuid, name, tournament_id, venue_id, layout_type, orientation, sidebars_mode, match_count,
         featured_match_id, show_completed_matches,
         rotation_enabled, rotation_interval, active_scenes,
         ad_top_enabled, ad_bottom_enabled, ad_sidebars_enabled, ad_center_enabled,
         theme, animation_speed, created_by, is_paired
       ) VALUES (
-        ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?,
         ?, ?,
         ?, ?, ?,
         ?, ?, ?, ?,
@@ -627,7 +645,7 @@ async function saveDisplayConfig(req, res, next) {
       )
     `, [
       tvUuid, name || 'New Smart TV Display', tournamentId || null, venueId || null,
-      layoutType, matchCount, featuredMatchId || null, Boolean(showCompletedMatches),
+      layoutType, orientation, sidebarsMode, matchCount, featuredMatchId || null, Boolean(showCompletedMatches),
       Boolean(rotationEnabled), rotationInterval, scenesJson,
       Boolean(adTopEnabled), Boolean(adBottomEnabled),
       Boolean(adSidebarsEnabled), Boolean(adCenterEnabled), theme,

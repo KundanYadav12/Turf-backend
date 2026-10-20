@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const tournamentService = require('../services/tournamentService');
+const scorerAccessService = require('../services/scorerAccessService');
+const fixtureService = require('../services/fixtureService');
 const auctionController = require('../controllers/auctionController');
 const { authenticateUser, optionalAuthenticateUser } = require('../middleware/authMiddleware');
 const { authorizeRoles } = require('../middleware/rbacMiddleware');
@@ -19,6 +21,27 @@ router.get('/', async (req, res, next) => {
       limit
     });
     res.json({ success: true, data: result.items, pagination: result.pagination });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// MODULE I: Search users for scorer assignment
+router.get('/scorers/search', authenticateUser, async (req, res, next) => {
+  try {
+    const { q } = req.query;
+    const users = await scorerAccessService.searchUsers(q);
+    res.json({ success: true, data: users });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// MODULE I: Shortcut to fetch matches assigned to current user for scoring
+router.get('/scorers/my-matches', authenticateUser, async (req, res, next) => {
+  try {
+    const matches = await scorerAccessService.getUserScoringMatches(req.user.id);
+    res.json({ success: true, data: matches });
   } catch (error) {
     next(error);
   }
@@ -57,6 +80,51 @@ router.get('/:id/matches', async (req, res, next) => {
   }
 });
 
+// 4a. PUT /api/tournaments/:id/matches/display-bulk - Bulk Match Display Selection (Protected)
+router.put('/:id/matches/display-bulk', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await tournamentService.bulkUpdateTournamentMatchesDisplay(
+      req.params.id,
+      req.body,
+      req.user
+    );
+    res.json({ success: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 4b. PUT /api/tournaments/:id/matches/:matchId/display - Toggle Single Match Display (Protected)
+router.put('/:id/matches/:matchId/display', authenticateUser, async (req, res, next) => {
+  try {
+    const { showOnDisplay } = req.body;
+    const result = await tournamentService.updateTournamentMatchDisplay(
+      req.params.id,
+      req.params.matchId,
+      showOnDisplay,
+      req.user
+    );
+    res.json({ success: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 4c. PUT /api/tournaments/:id/court-color - Set Court Color (Protected)
+router.put('/:id/court-color', authenticateUser, async (req, res, next) => {
+  try {
+    const { courtColor } = req.body;
+    const result = await tournamentService.updateTournamentCourtColor(
+      req.params.id,
+      courtColor,
+      req.user
+    );
+    res.json({ success: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // 5. GET /api/tournaments/:id/teams - Registered Teams
 router.get('/:id/teams', async (req, res, next) => {
   try {
@@ -82,6 +150,37 @@ router.post('/:id/teams/:teamId/players', authenticateUser, async (req, res, nex
   try {
     const data = await tournamentService.addPlayerToTournamentTeamRoster(req.params.id, req.params.teamId, req.body, req.user);
     res.status(201).json({ success: true, message: 'Player added to squad successfully!', data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 5c. PUT /api/tournaments/:id/teams/:teamId/players/:playerId - Edit Player in Team Squad
+router.put('/:id/teams/:teamId/players/:playerId', authenticateUser, async (req, res, next) => {
+  try {
+    const data = await tournamentService.updatePlayerInTournamentTeamRoster(
+      req.params.id,
+      req.params.teamId,
+      req.params.playerId,
+      req.body,
+      req.user
+    );
+    res.json({ success: true, message: 'Squad player details updated successfully!', data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 5d. DELETE /api/tournaments/:id/teams/:teamId/players/:playerId - Remove Player from Team Squad
+router.delete('/:id/teams/:teamId/players/:playerId', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await tournamentService.removePlayerFromTournamentTeamRoster(
+      req.params.id,
+      req.params.teamId,
+      req.params.playerId,
+      req.user
+    );
+    res.json({ success: true, ...result });
   } catch (error) {
     next(error);
   }
@@ -192,6 +291,47 @@ router.post('/:id/teams', authenticateUser, authorizeTournamentOrganizer, async 
   try {
     const data = await pickleballService.addTeamToTournament(req.params.id, req.body, req.user);
     res.status(201).json({ success: true, message: 'Team added to tournament successfully!', data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 11a. GET /api/tournaments/:id/teams/:teamId/impact - Impact analysis before removing team
+router.get('/:id/teams/:teamId/impact', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
+  try {
+    const impact = await tournamentService.getTeamRemovalImpact(req.params.id, req.params.teamId);
+    res.json({ success: true, data: impact });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 11b. DELETE /api/tournaments/:id/teams/:teamId - Remove team from tournament
+router.delete('/:id/teams/:teamId', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
+  try {
+    const { mode, confirmWord } = req.body || {};
+    const result = await tournamentService.removeTeamFromTournament(
+      req.params.id,
+      req.params.teamId,
+      { mode, confirmWord },
+      req.user
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 11c. POST /api/tournaments/:id/teams/bulk - Bulk add teams to tournament
+router.post('/:id/teams/bulk', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
+  try {
+    const { teamIds, groupName } = req.body || {};
+    const result = await tournamentService.bulkAddTeamsToTournament(
+      req.params.id,
+      { teamIds, groupName },
+      req.user
+    );
+    res.status(201).json(result);
   } catch (error) {
     next(error);
   }
@@ -323,5 +463,297 @@ router.post('/:id/register', authenticateUser, async (req, res, next) => {
   }
 });
 
+// =====================================================
+// MODULE B: PLAYER REGISTRATION ENDPOINTS
+// =====================================================
+const playerRegistrationService = require('../services/playerRegistrationService');
+
+// B1 & B2: Get registration config (public, used by registration form & organizer view)
+router.get('/:id/registration-config', async (req, res, next) => {
+  try {
+    const config = await playerRegistrationService.getRegistrationConfig(req.params.id);
+    res.json({ success: true, data: config });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// B1 & B2: Update registration config (Organizer & Super Admin)
+router.put('/:id/registration-config', authenticateUser, async (req, res, next) => {
+  try {
+    const updated = await playerRegistrationService.updateRegistrationConfig(req.params.id, req.user, req.body);
+    res.json({ success: true, message: 'Registration configuration updated.', data: updated });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// B2 & B3: Submit player registration request
+router.post(
+  '/:id/player-registrations',
+  authenticateUser,
+  (req, res, next) => {
+    // Optional photo upload support
+    upload.single('photo')(req, res, (err) => {
+      if (err) return res.status(400).json({ success: false, message: err.message });
+      next();
+    });
+  },
+  async (req, res, next) => {
+    try {
+      const data = { ...req.body };
+      if (req.file) {
+        data.photoUrl = `/uploads/${req.file.filename}`;
+      }
+      // If customFieldsData was sent as JSON string in multipart form, parse it
+      if (typeof data.customFieldsData === 'string') {
+        try {
+          data.customFieldsData = JSON.parse(data.customFieldsData);
+        } catch (e) {
+          data.customFieldsData = {};
+        }
+      }
+      const result = await playerRegistrationService.submitPlayerRegistration(req.params.id, req.user, data);
+      res.status(201).json({
+        success: true,
+        message: result.message,
+        data: result
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// B3: Get player registrations list for organizer
+router.get('/:id/player-registrations', authenticateUser, async (req, res, next) => {
+  try {
+    const registrations = await playerRegistrationService.getTournamentPlayerRegistrations(
+      req.params.id,
+      req.user,
+      req.query
+    );
+    res.json({ success: true, data: registrations });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// B3: Get current user's registration status in this tournament
+router.get('/:id/my-registration', authenticateUser, async (req, res, next) => {
+  try {
+    const registration = await playerRegistrationService.getMyTournamentRegistration(req.params.id, req.user);
+    res.json({ success: true, data: registration });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// B3: Withdraw current user's pending registration
+router.delete('/:id/my-registration', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await playerRegistrationService.withdrawMyRegistration(req.params.id, req.user);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// B3: Update registration status (Approve, Deny, Waitlist, Confirm)
+router.put('/:id/player-registrations/:regId/status', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await playerRegistrationService.updateRegistrationStatus(
+      req.params.id,
+      req.params.regId,
+      req.user,
+      req.body
+    );
+    res.json({ success: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// B3: Bulk update registration statuses
+router.post('/:id/player-registrations/bulk-status', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await playerRegistrationService.bulkUpdateRegistrationStatus(
+      req.params.id,
+      req.user,
+      req.body
+    );
+    res.json({ success: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// B2: Reveal sensitive data (Aadhaar, unmasked address) with access logging
+router.post('/:id/player-registrations/:regId/reveal-sensitive', authenticateUser, async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+    const sensitiveData = await playerRegistrationService.revealSensitiveData(
+      req.params.id,
+      req.params.regId,
+      req.user,
+      reason
+    );
+    res.json({ success: true, data: sensitiveData });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// MODULE I: List assigned scorers for tournament
+router.get('/:id/scorers', authenticateUser, async (req, res, next) => {
+  try {
+    const scorers = await scorerAccessService.getTournamentScorers(req.params.id);
+    res.json({ success: true, data: scorers });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// MODULE I: Assign user as scorer
+router.post('/:id/scorers', authenticateUser, async (req, res, next) => {
+  try {
+    const { userId, matchId } = req.body;
+    const result = await scorerAccessService.assignScorer({
+      tournamentId: req.params.id,
+      userId,
+      matchId: matchId || null,
+      assignedBy: req.user.id,
+      assignedByRole: req.user.role
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// MODULE I: Remove scorer assignment
+router.delete('/:id/scorers/:assignmentId', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await scorerAccessService.removeScorer({
+      tournamentId: req.params.id,
+      assignmentId: req.params.assignmentId,
+      removedBy: req.user.id,
+      removedByRole: req.user.role
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// =====================================================
+// MODULE J: FIXTURE MANAGEMENT, CATEGORIES, BRACKET & CONFLICTS
+// =====================================================
+
+// J1. GET /api/tournaments/:id/fixtures/bracket - Get structured knockout bracket tree
+router.get('/:id/fixtures/bracket', async (req, res, next) => {
+  try {
+    const bracket = await fixtureService.getBracketTree(req.params.id);
+    res.json({ success: true, data: bracket });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// J2. POST /api/tournaments/:id/fixtures/check-conflicts - Pre-flight conflict check
+router.post('/:id/fixtures/check-conflicts', authenticateUser, async (req, res, next) => {
+  try {
+    const { matchId, matchDate, startTime, endTime, courtId, venueId, teamAId, teamBId } = req.body;
+    const result = await fixtureService.checkSchedulingConflicts({
+      tournamentId: req.params.id,
+      matchId,
+      matchDate,
+      startTime,
+      endTime,
+      courtId,
+      venueId,
+      teamAId,
+      teamBId
+    });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// J3. POST /api/tournaments/:id/fixtures - Create Fixture
+router.post('/:id/fixtures', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await fixtureService.createFixture({
+      tournamentId: req.params.id,
+      user: req.user,
+      fixtureData: req.body
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// J4. PUT /api/tournaments/:id/fixtures/:matchId - Update / Reschedule Fixture
+router.put('/:id/fixtures/:matchId', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await fixtureService.updateFixture({
+      tournamentId: req.params.id,
+      matchId: req.params.matchId,
+      user: req.user,
+      updates: req.body
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// J5. DELETE /api/tournaments/:id/fixtures/:matchId - Delete Fixture
+router.delete('/:id/fixtures/:matchId', authenticateUser, async (req, res, next) => {
+  try {
+    const force = req.query.force === 'true' || req.body?.force === true;
+    const result = await fixtureService.deleteFixture({
+      tournamentId: req.params.id,
+      matchId: req.params.matchId,
+      user: req.user,
+      force
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// J6. POST /api/tournaments/:id/fixtures/auto-league - Auto-generate League fixtures
+router.post('/:id/fixtures/auto-league', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await fixtureService.autoGenerateLeague({
+      tournamentId: req.params.id,
+      user: req.user,
+      options: req.body || {}
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// J7. POST /api/tournaments/:id/fixtures/auto-knockout - Generate Knockout bracket
+router.post('/:id/fixtures/auto-knockout', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await fixtureService.generateKnockoutBracket({
+      tournamentId: req.params.id,
+      user: req.user,
+      options: req.body || {}
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;
+
 

@@ -830,17 +830,23 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored' }, user) =
     await recalculateStandings(m.tournament_id);
   }
 
+  const state = await getScorerState(m.uuid);
+
   // Broadcast real-time
   broadcastPickleballScore(m.uuid, m.tournament_uuid, {
     status: newStatus,
+    type: 'POINT',
+    eventSeq: nextSeq,
     teamAScore: newScoreA,
     teamBScore: newScoreB,
+    scoreSummary: `${newScoreA} - ${newScoreB}`,
     winnerTeamId,
     resultSummary,
-    isCompleted
+    isCompleted,
+    state
   });
 
-  return await getScorerState(m.uuid);
+  return state;
 };
 
 /**
@@ -891,16 +897,22 @@ const undoPoint = async (matchId, user) => {
     await recalculateStandings(m.tournament_id);
   }
 
+  const state = await getScorerState(m.uuid);
+
   broadcastPickleballScore(m.uuid, m.tournament_uuid, {
     status: 'LIVE',
+    type: 'UNDO',
+    eventSeq: Date.now(),
     teamAScore: revertedA,
     teamBScore: revertedB,
+    scoreSummary: liveScoreSummary,
     winnerTeamId: null,
     resultSummary: null,
-    isCompleted: false
+    isCompleted: false,
+    state
   });
 
-  return await getScorerState(m.uuid);
+  return state;
 };
 
 /**

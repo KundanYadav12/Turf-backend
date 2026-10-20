@@ -8,31 +8,10 @@ const { broadcastTournamentMatchUpdate, broadcastMatchBallEvent, getIO } = requi
  * SCORER: Allowed if explicitly assigned (tm.scorer_id = userId).
  */
 const checkScorerAuthorization = async (userId, userRole, matchInternalId) => {
-  if (userRole === 'ADMIN') return true;
-
-  const [match] = await db.query(
-    `SELECT tm.id, tm.scorer_id, tm.venue_id, t.created_by as tournament_creator_id, v.owner_id as venue_owner_id
-     FROM tournament_matches tm
-     JOIN tournaments t ON tm.tournament_id = t.id
-     LEFT JOIN venues v ON tm.venue_id = v.id
-     WHERE tm.id = ?`,
-    [matchInternalId]
-  );
-
-  if (!match) return false;
-
-  if (userRole === 'VENUE_OWNER') {
-    if (match.venue_owner_id === userId || match.tournament_creator_id === userId) {
-      return true;
-    }
-  }
-
-  // Explicitly assigned scorer
-  if (match.scorer_id === userId) {
-    return true;
-  }
-
-  return false;
+  const roleUpper = String(userRole || '').toUpperCase();
+  if (roleUpper === 'ADMIN' || roleUpper === 'SUPER_ADMIN') return true;
+  const { checkUserCanScoreMatch } = require('./scorerAccessService');
+  return await checkUserCanScoreMatch({ userId, userRole, matchPublicOrInternalId: matchInternalId });
 };
 
 /**
@@ -1399,45 +1378,18 @@ const completeMatch = async ({ matchPublicId, winnerTeamId, resultSummary, userI
       [winnerTeamId || null, resultSummary || 'Match Completed', matchInfo.id]
     );
 
-    // Update Tournament points_table if tournament is league format
+    // Update Tournament points_table & recalculate authoritative standings (NRR, points, etc.)
     if (m && m.tournament_id) {
-      const isTeamAWinner = winnerTeamId === m.team_a_id;
-      const isTeamBWinner = winnerTeamId === m.team_b_id;
-      const isTie = !winnerTeamId;
-
-      // Update Team A points
-      await conn.query(
-        `INSERT INTO points_table (tournament_id, team_id, matches_played, won, lost, tied, points)
-         VALUES (?, ?, 1, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE 
-           matches_played = matches_played + 1,
-           won = won + ?,
-           lost = lost + ?,
-           tied = tied + ?,
-           points = points + ?`,
-        [
-          m.tournament_id, m.team_a_id,
-          isTeamAWinner ? 1 : 0, isTeamBWinner ? 1 : 0, isTie ? 1 : 0, isTeamAWinner ? 2 : (isTie ? 1 : 0),
-          isTeamAWinner ? 1 : 0, isTeamBWinner ? 1 : 0, isTie ? 1 : 0, isTeamAWinner ? 2 : (isTie ? 1 : 0)
-        ]
-      );
-
-      // Update Team B points
-      await conn.query(
-        `INSERT INTO points_table (tournament_id, team_id, matches_played, won, lost, tied, points)
-         VALUES (?, ?, 1, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE 
-           matches_played = matches_played + 1,
-           won = won + ?,
-           lost = lost + ?,
-           tied = tied + ?,
-           points = points + ?`,
-        [
-          m.tournament_id, m.team_b_id,
-          isTeamBWinner ? 1 : 0, isTeamAWinner ? 1 : 0, isTie ? 1 : 0, isTeamBWinner ? 2 : (isTie ? 1 : 0),
-          isTeamBWinner ? 1 : 0, isTeamAWinner ? 1 : 0, isTie ? 1 : 0, isTeamBWinner ? 2 : (isTie ? 1 : 0)
-        ]
-      );
+      try {
+        const { recalculateStandings, advanceKnockoutWinner } = require('./tournamentEngineService');
+        await recalculateStandings(m.tournament_id);
+        if (winnerTeamId) {
+          const loserTeamId = m.team_a_id === winnerTeamId ? m.team_b_id : m.team_a_id;
+          await advanceKnockoutWinner(matchInfo.id, winnerTeamId, loserTeamId);
+        }
+      } catch (err) {
+        console.error('Error recalculating standings on cricket match complete:', err);
+      }
     }
 
     const io = getIO();

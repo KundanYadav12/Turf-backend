@@ -158,18 +158,30 @@ function broadcastAuctionEvent(auctionPublicId, eventName, data) {
 function broadcastPickleballScore(matchPublicId, tournamentPublicId, payload) {
   if (!ioInstance) return;
   const matchRoom = `match:${matchPublicId}`;
-  ioInstance.to(matchRoom).emit('match:pickleballScore', payload);
+  const eventSeq = payload.eventSeq || (payload.state?.eventSeq || Date.now());
+  const enrichedPayload = {
+    matchId: matchPublicId,
+    eventSeq,
+    type: payload.type || 'POINT',
+    scoreSummary: payload.scoreSummary || `${payload.teamAScore} - ${payload.teamBScore}`,
+    ...payload
+  };
+  ioInstance.to(matchRoom).emit('match:pickleballScore', enrichedPayload);
 
   if (tournamentPublicId) {
     const tourneyRoom = `tournament:${tournamentPublicId}`;
     ioInstance.to(tourneyRoom).emit('tournament:matchUpdated', {
       matchId: matchPublicId,
       status: payload.status,
-      liveScoreSummary: `${payload.teamAScore} - ${payload.teamBScore}`,
+      liveScoreSummary: enrichedPayload.scoreSummary,
+      liveSubtext: payload.liveSubtext,
       teamAScore: payload.teamAScore,
       teamBScore: payload.teamBScore,
       winnerTeamId: payload.winnerTeamId,
-      resultSummary: payload.resultSummary
+      resultSummary: payload.resultSummary,
+      state: payload.state,
+      eventSeq,
+      type: enrichedPayload.type
     });
 
     if (payload.isCompleted) {

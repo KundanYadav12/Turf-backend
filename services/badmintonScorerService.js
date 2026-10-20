@@ -193,6 +193,8 @@ async function startMatch(matchPublicId, user) {
   const scoreSummary = `Game 1: 0 - 0`;
   const liveSubtext = `Serving: ${match.team_a_name} (Right)`;
 
+  state.eventSeq = 1;
+
   await db.query(
     `UPDATE tournament_matches 
      SET status = 'LIVE',
@@ -210,7 +212,8 @@ async function startMatch(matchPublicId, user) {
     status: 'LIVE',
     scoreSummary,
     liveSubtext,
-    state
+    state,
+    eventSeq: state.eventSeq
   });
 
   return { success: true, message: 'Badminton match started live!', state };
@@ -261,6 +264,8 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
     state.currentServer = 'B';
     state.serverCourt = currentGame.teamB % 2 === 0 ? 'RIGHT' : 'LEFT';
   }
+  state.servingTeam = state.currentServer === 'A' ? 'teamA' : 'teamB';
+  state.serverSide = state.currentServer;
 
   // Check Game Win Condition
   // Standard BWF: 21 pts, must win by 2; cap at 30 (30-29 wins)
@@ -361,6 +366,8 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
 
   const newStatus = matchCompleted ? 'COMPLETED' : 'LIVE';
 
+  state.eventSeq = (state.eventSeq || 0) + 1;
+
   await db.query(
     `UPDATE tournament_matches 
      SET status = ?,
@@ -402,7 +409,8 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
     isGamePoint: state.isGamePoint,
     isMatchPoint: state.isMatchPoint,
     status: newStatus,
-    state
+    state,
+    eventSeq: state.eventSeq
   });
 
   return {
@@ -456,24 +464,73 @@ async function undoPoint(matchPublicId, user) {
   state.gamesWonA = 0;
   state.gamesWonB = 0;
   state.currentGame = 1;
+  state.currentServer = 'A';
+  state.serverCourt = 'RIGHT';
 
   for (const ev of remainingEvents) {
     const payload = typeof ev.payload === 'string' ? JSON.parse(ev.payload) : ev.payload;
     const gIdx = (payload.game || 1) - 1;
+    const evScoringSide = ev.team_id === match.team_a_id ? 'A' : 'B';
+    state.currentServer = evScoringSide;
     if (state.gameScores[gIdx]) {
       state.gameScores[gIdx].teamA = payload.scoreA;
       state.gameScores[gIdx].teamB = payload.scoreB;
+      const sScore = evScoringSide === 'A' ? payload.scoreA : payload.scoreB;
+      state.serverCourt = sScore % 2 === 0 ? 'RIGHT' : 'LEFT';
       if (payload.gameWinner) {
         state.gameScores[gIdx].winner = payload.gameWinner;
         if (payload.gameWinner === 'A') state.gamesWonA++;
         else state.gamesWonB++;
         state.currentGame = Math.min(3, gIdx + 2);
+        state.currentServer = payload.gameWinner;
+        state.serverCourt = 'RIGHT';
       }
     }
   }
 
   const curG = state.gameScores[(state.currentGame || 1) - 1] || { teamA: 0, teamB: 0 };
-  const scoreSummary = `G${state.currentGame}: ${curG.teamA} - ${curG.teamB}`;
+  if (curG.teamA === 0 && curG.teamB === 0) {
+    if (state.currentGame === 1) {
+      state.currentServer = 'A';
+    } else {
+      const prevG = state.gameScores[state.currentGame - 2];
+      state.currentServer = prevG?.winner || 'A';
+    }
+    state.serverCourt = 'RIGHT';
+  } else {
+    const sScore = state.currentServer === 'A' ? curG.teamA : curG.teamB;
+    state.serverCourt = sScore % 2 === 0 ? 'RIGHT' : 'LEFT';
+  }
+
+  state.servingTeam = state.currentServer === 'A' ? 'teamA' : 'teamB';
+  state.serverSide = state.currentServer;
+
+  // Re-evaluate game point / match point flags
+  const target = state.targetPoints || 21;
+  const isLeadA = curG.teamA >= target - 1 && curG.teamA > curG.teamB;
+  const isLeadB = curG.teamB >= target - 1 && curG.teamB > curG.teamA;
+  state.isGamePoint = false;
+  state.isMatchPoint = false;
+  if (isLeadA || isLeadB) {
+    const leader = isLeadA ? 'A' : 'B';
+    const gamesWonByLeader = leader === 'A' ? state.gamesWonA : state.gamesWonB;
+    if (gamesWonByLeader === (state.gamesToWin || 2) - 1) {
+      state.isMatchPoint = true;
+    } else {
+      state.isGamePoint = true;
+    }
+  }
+
+  const completedGamesStr = state.gameScores
+    .filter(g => g.winner)
+    .map(g => `${g.teamA}-${g.teamB}`)
+    .join(', ');
+
+  const currentScoreStr = `G${state.currentGame}: ${curG.teamA} - ${curG.teamB}`;
+  const scoreSummary = completedGamesStr ? `${completedGamesStr} (${currentScoreStr})` : currentScoreStr;
+  const liveSubtext = `Serving: ${state.currentServer === 'A' ? match.team_a_name : match.team_b_name} (${state.serverCourt})`;
+
+  state.eventSeq = (state.eventSeq || 0) + 1;
 
   await db.query(
     `UPDATE tournament_matches 
@@ -481,17 +538,21 @@ async function undoPoint(matchPublicId, user) {
          team_a_score = ?,
          team_b_score = ?,
          live_score_summary = ?,
+         live_subtext = ?,
          sport_state = ?,
          winner_team_id = NULL,
          result_summary = NULL
      WHERE id = ?`,
-    [state.gamesWonA, state.gamesWonB, scoreSummary, JSON.stringify(state), match.id]
+    [state.gamesWonA, state.gamesWonB, scoreSummary, liveSubtext, JSON.stringify(state), match.id]
   );
 
   broadcastBadmintonEvent(match, {
     type: 'UNDO',
     scoreSummary,
-    state
+    liveSubtext,
+    state,
+    eventSeq: state.eventSeq,
+    scoringSide: null
   });
 
   return { success: true, message: 'Point undone.', state };
@@ -507,14 +568,25 @@ function broadcastBadmintonEvent(match, payload) {
   const matchRoom = `match:${match.uuid}`;
   const tourneyRoom = `tournament:${match.tournament_public_id}`;
 
-  io.to(matchRoom).emit('match:badmintonEvent', payload);
-  io.to(matchRoom).emit('match:ballEvent', payload);
+  const eventSeq = payload.eventSeq || (payload.state?.eventSeq || Date.now());
+  const enrichedPayload = {
+    matchId: match.uuid,
+    eventSeq,
+    ...payload
+  };
+
+  io.to(matchRoom).emit('match:badmintonEvent', enrichedPayload);
+  io.to(matchRoom).emit('match:ballEvent', enrichedPayload);
 
   io.to(tourneyRoom).emit('tournament:matchUpdated', {
     matchId: match.uuid,
     status: payload.status || match.status,
     liveScoreSummary: payload.scoreSummary || match.live_score_summary,
     liveSubtext: payload.liveSubtext || match.live_subtext,
+    state: payload.state,
+    eventSeq,
+    type: payload.type || 'POINT',
+    scoringSide: payload.scoringSide,
     celebration: payload.celebration || (payload.isMatchPoint ? 'MATCH_POINT' : (payload.isGamePoint ? 'GAME_POINT' : null))
   });
 }

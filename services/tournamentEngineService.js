@@ -606,6 +606,20 @@ async function initializePointsTable(tournamentId, teams) {
 }
 
 /**
+ * Converts cricket overs notation (e.g. 17.1, 19.5, 20.0) into decimal overs.
+ * In cricket notation, the fractional part represents legal balls (balls / 6).
+ */
+function oversToDecimal(overs) {
+  if (overs === null || overs === undefined) return 0;
+  const str = String(overs).trim();
+  if (!str) return 0;
+  const parts = str.split('.');
+  const wholeOvers = parseInt(parts[0], 10) || 0;
+  const balls = parts.length > 1 ? parseInt(parts[1], 10) || 0 : 0;
+  return wholeOvers + (balls / 6);
+}
+
+/**
  * Authoritative Standings Recalculation Engine
  * Calculates sport-specific points, GD, NRR, game/point differentials and rankings.
  */
@@ -614,9 +628,9 @@ async function recalculateStandings(tournamentId) {
   if (!tournament) return;
 
   const sportConfig = getSportConfig(tournament.sport_slug);
-  const winPts = sportConfig.standingsFormula.winPoints ?? 2;
-  const drawPts = sportConfig.standingsFormula.drawPoints ?? (sportConfig.standingsFormula.tiePoints ?? 1);
-  const lossPts = sportConfig.standingsFormula.lossPoints ?? 0;
+  const winPts = sportConfig.standingsFormula?.winPoints ?? 2;
+  const drawPts = sportConfig.standingsFormula?.drawPoints ?? (sportConfig.standingsFormula?.tiePoints ?? 1);
+  const lossPts = sportConfig.standingsFormula?.lossPoints ?? 0;
 
   // 1. Fetch all registered teams
   const teams = await db.query(
@@ -634,9 +648,27 @@ async function recalculateStandings(tournamentId) {
      FROM tournament_matches tm
      WHERE tm.tournament_id = ? 
        AND tm.status = 'COMPLETED'
-       AND (tm.stage = 'GROUP' OR tm.stage IS NULL)`,
+       AND (tm.counts_in_standings = 1 OR (tm.counts_in_standings IS NULL AND (tm.category = 'League' OR tm.category IS NULL)))`,
     [tournament.id]
   );
+
+  // Fetch cricket innings for completed matches if sport is cricket
+  const cricketInningsMap = {};
+  if (tournament.sport_slug === 'cricket') {
+    const inningsRows = await db.query(
+      `SELECT ci.*, cm.total_overs as match_quota_overs
+       FROM cricket_innings ci
+       JOIN tournament_matches tm ON ci.match_id = tm.id
+       LEFT JOIN cricket_matches cm ON cm.match_id = tm.id
+       WHERE tm.tournament_id = ? AND tm.status = 'COMPLETED'
+       ORDER BY ci.match_id ASC, ci.innings_number ASC`,
+      [tournament.id]
+    );
+    for (const inn of inningsRows) {
+      if (!cricketInningsMap[inn.match_id]) cricketInningsMap[inn.match_id] = [];
+      cricketInningsMap[inn.match_id].push(inn);
+    }
+  }
 
   // Initialize team aggregates
   const statsMap = {};
@@ -688,14 +720,55 @@ async function recalculateStandings(tournamentId) {
     tB.pf += scoreB;
     tB.pa += scoreA;
 
-    // Cricket Innings data for Net Run Rate (if available)
-    if (tournament.sport_slug === 'cricket' && m.sport_state) {
-      try {
-        const state = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : m.sport_state;
-        if (state.innings1 && state.innings2) {
-          // Add overs & runs
+    // Cricket Innings data for Net Run Rate
+    if (tournament.sport_slug === 'cricket') {
+      const innings = cricketInningsMap[m.id];
+      if (innings && innings.length > 0) {
+        for (const inn of innings) {
+          const tBat = statsMap[inn.batting_team_id];
+          const tBowl = statsMap[inn.bowling_team_id];
+          const matchQuota = inn.match_quota_overs || 20;
+          // All-out rule: if 10 or more wickets lost, credited with full match quota overs
+          const isAllOut = Number(inn.total_wickets) >= 10;
+          const decOvers = oversToDecimal(inn.total_overs_bowled);
+          const effectiveOvers = isAllOut ? matchQuota : decOvers;
+
+          if (tBat) {
+            tBat.runsScored += Number(inn.total_runs) || 0;
+            tBat.oversFaced += effectiveOvers;
+          }
+          if (tBowl) {
+            tBowl.runsConceded += Number(inn.total_runs) || 0;
+            tBowl.oversBowled += effectiveOvers;
+          }
         }
-      } catch (e) {}
+      } else if (m.sport_state) {
+        try {
+          const state = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : m.sport_state;
+          if (state.innings1 && state.innings2) {
+            const processInnings = (innObj, defaultBatId, defaultBowlId) => {
+              const batId = innObj.battingTeamId || defaultBatId;
+              const bowlId = innObj.bowlingTeamId || defaultBowlId;
+              const tBat = statsMap[batId];
+              const tBowl = statsMap[bowlId];
+              const matchQuota = state.totalOvers || 20;
+              const isAllOut = Number(innObj.wickets) >= 10;
+              const decOvers = oversToDecimal(innObj.overs);
+              const effectiveOvers = isAllOut ? matchQuota : decOvers;
+              if (tBat) {
+                tBat.runsScored += Number(innObj.runs || innObj.totalRuns) || 0;
+                tBat.oversFaced += effectiveOvers;
+              }
+              if (tBowl) {
+                tBowl.runsConceded += Number(innObj.runs || innObj.totalRuns) || 0;
+                tBowl.oversBowled += effectiveOvers;
+              }
+            };
+            processInnings(state.innings1, m.team_a_id, m.team_b_id);
+            processInnings(state.innings2, m.team_b_id, m.team_a_id);
+          }
+        } catch (e) {}
+      }
     }
 
     // Win, Loss, Draw determination
@@ -718,20 +791,27 @@ async function recalculateStandings(tournamentId) {
     }
   }
 
-  // Compute differentials
+  // Compute differentials and sport-specific metrics
   for (const t of Object.values(statsMap)) {
     t.gd = t.gf - t.ga;
     t.pdiff = t.pf - t.pa;
+
+    if (tournament.sport_slug === 'cricket') {
+      const runRateFor = t.oversFaced > 0 ? (t.runsScored / t.oversFaced) : 0;
+      const runRateAgainst = t.oversBowled > 0 ? (t.runsConceded / t.oversBowled) : 0;
+      const rawNrr = runRateFor - runRateAgainst;
+      t.nrr = Math.abs(rawNrr) < 0.0001 ? 0 : parseFloat(rawNrr.toFixed(3));
+    }
   }
 
-  // Update points_table in database
+  // Update points_table in database with net_run_rate included
   for (const s of Object.values(statsMap)) {
     await db.query(
       `INSERT INTO points_table (
         tournament_id, team_id, matches_played, won, lost, tied, drawn,
         points, points_scored, points_conceded, point_difference,
-        goals_for, goals_against, goal_difference, sets_won, sets_lost, group_name
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        goals_for, goals_against, goal_difference, sets_won, sets_lost, net_run_rate, group_name
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         matches_played = VALUES(matches_played),
         won = VALUES(won),
@@ -746,11 +826,12 @@ async function recalculateStandings(tournamentId) {
         goals_against = VALUES(goals_against),
         goal_difference = VALUES(goal_difference),
         sets_won = VALUES(sets_won),
-        sets_lost = VALUES(sets_lost)`,
+        sets_lost = VALUES(sets_lost),
+        net_run_rate = VALUES(net_run_rate)`,
       [
         tournament.id, s.teamId, s.played, s.won, s.lost, s.drawn, s.drawn,
         s.points, s.pf, s.pa, s.pdiff,
-        s.gf, s.ga, s.gd, s.setsWon, s.setsLost, s.groupName
+        s.gf, s.ga, s.gd, s.setsWon, s.setsLost, s.nrr, s.groupName
       ]
     );
   }
@@ -776,12 +857,12 @@ async function getTournamentStandings(tournamentId) {
 
   const sportSlug = tournament.sport_slug || 'cricket';
 
-  // Order criteria by sport
-  let orderByClause = 'pt.points DESC, pt.won DESC, pt.point_difference DESC';
+  // Order criteria by sport: Points DESC, then NRR/Diff DESC (highest first, positive above negative), then won DESC
+  let orderByClause = 'pt.points DESC, pt.point_difference DESC, pt.won DESC';
   if (sportSlug === 'football') {
-    orderByClause = 'pt.points DESC, pt.goal_difference DESC, pt.goals_for DESC, pt.won DESC';
+    orderByClause = 'pt.points DESC, pt.goal_difference DESC, pt.won DESC, pt.goals_for DESC';
   } else if (sportSlug === 'cricket') {
-    orderByClause = 'pt.points DESC, pt.won DESC, pt.net_run_rate DESC';
+    orderByClause = 'pt.points DESC, pt.net_run_rate DESC, pt.won DESC';
   }
 
   const rows = await db.query(
@@ -848,7 +929,7 @@ async function getTournamentStandings(tournamentId) {
  */
 async function advanceKnockoutWinner(matchId, winnerTeamId, loserTeamId = null) {
   const [match] = await db.query(
-    `SELECT tm.*, t.third_place_playoff 
+    `SELECT tm.*, t.third_place_playoff, t.uuid as tournament_uuid 
      FROM tournament_matches tm
      JOIN tournaments t ON tm.tournament_id = t.id
      WHERE tm.id = ?`,
@@ -857,42 +938,92 @@ async function advanceKnockoutWinner(matchId, winnerTeamId, loserTeamId = null) 
 
   if (!match || !winnerTeamId) return;
 
-  const currentRound = match.round_number || 1;
-  const nextRound = currentRound + 1;
+  let targetMatchId = null;
+  let isTeamA = true;
 
-  // Find next round matches
-  const nextRoundMatches = await db.query(
-    `SELECT tm.id, tm.match_number, tm.team_a_id, tm.team_b_id, tm.stage
-     FROM tournament_matches tm
-     WHERE tm.tournament_id = ? 
-       AND tm.round_number = ?
-       AND tm.stage != 'THIRD_PLACE'
-     ORDER BY tm.match_number ASC`,
-    [match.tournament_id, nextRound]
-  );
+  // 1. Direct next_match_id link if present
+  if (match.next_match_id) {
+    targetMatchId = match.next_match_id;
+    isTeamA = match.bracket_target_team !== 'TEAM_B';
+  } else {
+    // 2. Category-based advancement: Quarter-Final -> Semi-Final -> Final
+    if (match.category === 'Quarter-Final' || match.category === 'Semi-Final') {
+      const nextCategory = match.category === 'Quarter-Final' ? 'Semi-Final' : 'Final';
+      const nextMatches = await db.query(
+        `SELECT id, match_number, team_a_id, team_b_id, bracket_slot 
+         FROM tournament_matches 
+         WHERE tournament_id = ? AND category = ? 
+         ORDER BY match_number ASC`,
+        [match.tournament_id, nextCategory]
+      );
 
-  if (!nextRoundMatches || nextRoundMatches.length === 0) return;
+      if (nextMatches.length > 0) {
+        const curMatches = await db.query(
+          `SELECT id, match_number, bracket_slot 
+           FROM tournament_matches 
+           WHERE tournament_id = ? AND category = ? 
+           ORDER BY match_number ASC`,
+          [match.tournament_id, match.category]
+        );
+        const matchIdx = curMatches.findIndex(m => m.id === match.id);
+        if (matchIdx !== -1) {
+          const tIdx = Math.floor(matchIdx / 2);
+          if (nextMatches[tIdx]) {
+            targetMatchId = nextMatches[tIdx].id;
+            isTeamA = matchIdx % 2 === 0;
+          }
+        }
+      }
+    }
 
-  // Determine slot index in next round based on match sequence
-  const currentRoundMatches = await db.query(
-    `SELECT id FROM tournament_matches 
-     WHERE tournament_id = ? AND round_number = ? AND stage != 'THIRD_PLACE'
-     ORDER BY match_number ASC`,
-    [match.tournament_id, currentRound]
-  );
+    // 3. Round-based fallback
+    if (!targetMatchId) {
+      const currentRound = match.round_number || 1;
+      const nextRound = currentRound + 1;
+      const nextRoundMatches = await db.query(
+        `SELECT tm.id, tm.match_number, tm.team_a_id, tm.team_b_id, tm.stage
+         FROM tournament_matches tm
+         WHERE tm.tournament_id = ? 
+           AND tm.round_number = ?
+           AND tm.stage != 'THIRD_PLACE'
+         ORDER BY tm.match_number ASC`,
+        [match.tournament_id, nextRound]
+      );
 
-  const matchIdx = currentRoundMatches.findIndex(m => m.id === match.id);
-  if (matchIdx === -1) return;
+      if (nextRoundMatches && nextRoundMatches.length > 0) {
+        const currentRoundMatches = await db.query(
+          `SELECT id FROM tournament_matches 
+           WHERE tournament_id = ? AND round_number = ? AND stage != 'THIRD_PLACE'
+           ORDER BY match_number ASC`,
+          [match.tournament_id, currentRound]
+        );
+        const matchIdx = currentRoundMatches.findIndex(m => m.id === match.id);
+        if (matchIdx !== -1) {
+          const tIdx = Math.floor(matchIdx / 2);
+          if (nextRoundMatches[tIdx]) {
+            targetMatchId = nextRoundMatches[tIdx].id;
+            isTeamA = matchIdx % 2 === 0;
+          }
+        }
+      }
+    }
+  }
 
-  const targetMatchIdx = Math.floor(matchIdx / 2);
-  const targetMatch = nextRoundMatches[targetMatchIdx];
-
-  if (targetMatch) {
-    const isTeamA = matchIdx % 2 === 0;
+  // Update target match with advancing team
+  if (targetMatchId) {
     if (isTeamA) {
-      await db.query(`UPDATE tournament_matches SET team_a_id = ? WHERE id = ?`, [winnerTeamId, targetMatch.id]);
+      await db.query(`UPDATE tournament_matches SET team_a_id = ? WHERE id = ?`, [winnerTeamId, targetMatchId]);
     } else {
-      await db.query(`UPDATE tournament_matches SET team_b_id = ? WHERE id = ?`, [winnerTeamId, targetMatch.id]);
+      await db.query(`UPDATE tournament_matches SET team_b_id = ? WHERE id = ?`, [winnerTeamId, targetMatchId]);
+    }
+
+    const io = getIO();
+    if (io) {
+      io.to(`tournament:${match.tournament_uuid || match.tournament_id}`).emit('tournament:matchesUpdated', {
+        tournamentId: match.tournament_uuid || match.tournament_id,
+        advancedWinnerId: winnerTeamId,
+        targetMatchId
+      });
     }
   }
 

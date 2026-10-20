@@ -27,4 +27,15 @@ const accountDeletionController = require('../controllers/accountDeletionControl
 router.post('/me/delete-request', authenticateUser, accountDeletionController.requestSelfDeletion);
 router.get('/me/deletion-status', authenticateUser, accountDeletionController.getSelfDeletionStatus);
 
+// 8. Player Tournament Registrations (Protected: Self)
+const playerRegService = require('../services/playerRegistrationService');
+router.get('/my-registrations', authenticateUser, async (req, res, next) => {
+  try {
+    const data = await playerRegService.getMyRegistrationsAcrossTournaments(req.user);
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;

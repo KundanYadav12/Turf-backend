@@ -32,20 +32,11 @@ async function resolveMatch(matchPublicId) {
  */
 async function checkScorerAuth(match, user) {
   if (!user) return false;
-  if (user.role === 'ADMIN') return true;
+  const roleUpper = String(user.role || '').toUpperCase();
+  if (roleUpper === 'ADMIN' || roleUpper === 'SUPER_ADMIN') return true;
 
-  // Venue Owner
-  if (user.role === 'VENUE_OWNER') {
-    const [venue] = await db.query('SELECT owner_id FROM venues WHERE id = ?', [match.venue_id]);
-    if (venue && venue.owner_id === user.id) return true;
-    const [tournament] = await db.query('SELECT created_by FROM tournaments WHERE id = ?', [match.tournament_id]);
-    if (tournament && tournament.created_by === user.id) return true;
-  }
-
-  // Assigned Scorer
-  if (match.scorer_id === user.id) return true;
-
-  return false;
+  const { checkUserCanScoreMatch } = require('./scorerAccessService');
+  return await checkUserCanScoreMatch({ userId: user.id, userRole: user.role, matchPublicOrInternalId: match.id });
 }
 
 /**
