@@ -263,10 +263,17 @@ async function generateFixtures(tournamentId, options = {}, user) {
   const venueId = tournament.venue_id;
   let courts = [];
   if (venueId) {
-    courts = await db.query(
-      `SELECT id, name FROM courts WHERE venue_id = ? AND is_active = 1 ORDER BY id ASC`,
-      [venueId]
-    );
+    try {
+      courts = await db.query(
+        `SELECT id, name FROM courts WHERE venue_id = ? AND (status = 'ACTIVE' OR status IS NULL) ORDER BY id ASC`,
+        [venueId]
+      );
+    } catch (courtErr) {
+      courts = await db.query(
+        `SELECT id, name FROM courts WHERE venue_id = ? ORDER BY id ASC`,
+        [venueId]
+      );
+    }
   }
   if (!courts || courts.length === 0) {
     courts = [{ id: null, name: 'Main Court' }];
