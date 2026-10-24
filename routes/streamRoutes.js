@@ -150,4 +150,14 @@ router.get('/youtube/auth-url', authenticateUser, (req, res) => {
   res.json({ success: true, authUrl });
 });
 
+// 10. GET /api/streams/health & /api/matches/:matchId/stream/health - Super Admin Streaming Health Diagnostics
+router.get(['/health', '/:matchId/stream/health'], optionalAuthenticateUser, async (req, res, next) => {
+  try {
+    const health = await streamService.getStreamingHealth(req.user);
+    res.json({ success: true, data: health });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;

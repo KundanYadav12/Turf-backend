@@ -200,7 +200,15 @@ async function getTournamentStreamPermissions(tournamentId, user = null) {
 
   query += ` ORDER BY tsp.status ASC, tsp.id DESC`;
 
-  const rows = await db.query(query, params);
+  let rows = [];
+  try {
+    rows = await db.query(query, params);
+  } catch (err) {
+    if (err && (err.code === 'ER_NO_SUCH_TABLE' || String(err.message).includes("doesn't exist"))) {
+      return [];
+    }
+    throw err;
+  }
 
   return rows.map(r => {
     const isSelf = currentUserId && Number(currentUserId) === Number(r.user_id);
@@ -619,34 +627,69 @@ async function getTournamentStreamingOverview(tournamentId, user = null) {
   const tournament = await getAuthoritativeTournament(tournamentId);
   if (!tournament) return [];
 
-  const matches = await db.query(
-    `SELECT 
-       tm.id as internal_id,
-       tm.uuid as match_id,
-       tm.match_number,
-       tm.status as match_status,
-       tm.court_id,
-       tm.has_live_stream,
-       ta.name as team_a_name,
-       ta.logo_url as team_a_logo,
-       tb.name as team_b_name,
-       tb.logo_url as team_b_logo,
-       ms.uuid as stream_uuid,
-       ms.streaming_method,
-       ms.status as stream_status,
-       ms.viewer_count,
-       ms.title as stream_title,
-       ms.actual_start,
-       u.full_name as streamer_name
-     FROM tournament_matches tm
-     LEFT JOIN teams ta ON tm.team_a_id = ta.id
-     LEFT JOIN teams tb ON tm.team_b_id = tb.id
-     LEFT JOIN match_streams ms ON tm.id = ms.match_id
-     LEFT JOIN users u ON ms.user_id = u.id
-     WHERE tm.tournament_id = ?
-     ORDER BY tm.match_number ASC`,
-    [tournament.id]
-  );
+  let matches = [];
+  try {
+    matches = await db.query(
+      `SELECT 
+         tm.id as internal_id,
+         tm.uuid as match_id,
+         tm.match_number,
+         tm.status as match_status,
+         tm.court_id,
+         tm.has_live_stream,
+         ta.name as team_a_name,
+         ta.logo_url as team_a_logo,
+         tb.name as team_b_name,
+         tb.logo_url as team_b_logo,
+         ms.uuid as stream_uuid,
+         ms.streaming_method,
+         ms.status as stream_status,
+         ms.viewer_count,
+         ms.title as stream_title,
+         ms.actual_start,
+         u.full_name as streamer_name
+       FROM tournament_matches tm
+       LEFT JOIN teams ta ON tm.team_a_id = ta.id
+       LEFT JOIN teams tb ON tm.team_b_id = tb.id
+       LEFT JOIN match_streams ms ON tm.id = ms.match_id
+       LEFT JOIN users u ON ms.user_id = u.id
+       WHERE tm.tournament_id = ?
+       ORDER BY tm.match_number ASC`,
+      [tournament.id]
+    );
+  } catch (err) {
+    // Resilient fallback if table or column is missing before migrations
+    try {
+      matches = await db.query(
+        `SELECT 
+           tm.id as internal_id,
+           tm.uuid as match_id,
+           tm.match_number,
+           tm.status as match_status,
+           tm.court_id,
+           0 as has_live_stream,
+           ta.name as team_a_name,
+           ta.logo_url as team_a_logo,
+           tb.name as team_b_name,
+           tb.logo_url as team_b_logo,
+           NULL as stream_uuid,
+           'MOBILE_CAMERA' as streaming_method,
+           'IDLE' as stream_status,
+           0 as viewer_count,
+           NULL as stream_title,
+           NULL as actual_start,
+           NULL as streamer_name
+         FROM tournament_matches tm
+         LEFT JOIN teams ta ON tm.team_a_id = ta.id
+         LEFT JOIN teams tb ON tm.team_b_id = tb.id
+         WHERE tm.tournament_id = ?
+         ORDER BY tm.match_number ASC`,
+        [tournament.id]
+      );
+    } catch (fallbackErr) {
+      matches = [];
+    }
+  }
 
   // Determine user permission per match
   let isSuperAdmin = false;

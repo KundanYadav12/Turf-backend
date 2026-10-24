@@ -1,52 +1,255 @@
 const crypto = require('crypto');
 const db = require('../config/database');
-const { RTMP_BASE_URL, HLS_BASE_URL, DEFAULT_ICE_SERVERS, DEFAULT_OVERLAY_CONFIG } = require('../config/streamingConfig');
+const {
+  RTMP_BASE_URL,
+  HLS_BASE_URL,
+  DEFAULT_ICE_SERVERS,
+  getIceServers,
+  DEFAULT_OVERLAY_CONFIG
+} = require('../config/streamingConfig');
 const { extractYouTubeVideoId, getYouTubeEmbedUrl } = require('./youtubeStreamService');
 const { getIO } = require('./socketService');
 
 /**
- * Helper to fetch match and tournament entities
+ * Self-healing schema validation: ensures streaming tables & columns exist
+ * Runs automatically on startup to prevent 500 crashes if manual migrations were delayed.
  */
-async function getMatchAndTournament(matchPublicOrInternalId) {
-  const isNum = /^\d+$/.test(String(matchPublicOrInternalId).trim());
-  const rows = await db.query(
-    `SELECT 
-      tm.id, tm.uuid as public_id, tm.match_number, tm.status as match_status,
-      tm.tournament_id, tm.venue_id, tm.court_id, tm.scorer_id,
-      tm.live_score_summary, tm.live_subtext, tm.sport_state,
-      tm.has_live_stream, tm.live_stream_id,
-      t.id as t_id, t.uuid as tournament_uuid, t.name as tournament_name,
-      t.created_by, t.sport_id,
-      s.slug as sport_slug, s.name as sport_name,
-      v.owner_id as venue_owner_id,
-      ta.id as team_a_id, ta.name as team_a_name, ta.logo_url as team_a_logo,
-      tb.id as team_b_id, tb.name as team_b_name, tb.logo_url as team_b_logo
-     FROM tournament_matches tm
-     JOIN tournaments t ON tm.tournament_id = t.id
-     JOIN sports s ON t.sport_id = s.id
-     LEFT JOIN venues v ON tm.venue_id = v.id
-     LEFT JOIN teams ta ON tm.team_a_id = ta.id
-     LEFT JOIN teams tb ON tm.team_b_id = tb.id
-     WHERE tm.uuid = ? OR tm.id = ?`,
-    [String(matchPublicOrInternalId), isNum ? parseInt(matchPublicOrInternalId, 10) : -1]
-  );
-  return rows && rows.length > 0 ? rows[0] : null;
+let tablesInitialized = false;
+async function ensureStreamingTables() {
+  if (tablesInitialized) return;
+  try {
+    // 1. Create match_streams table if not exists
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS match_streams (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        uuid VARCHAR(64) NOT NULL UNIQUE,
+        match_id BIGINT NOT NULL,
+        tournament_id BIGINT NULL,
+        user_id INT NOT NULL,
+        streaming_method ENUM('MOBILE_CAMERA', 'EXTERNAL_RTMP', 'YOUTUBE_LIVE') NOT NULL DEFAULT 'MOBILE_CAMERA',
+        status ENUM('IDLE', 'PREVIEW', 'LIVE', 'PAUSED', 'ENDED', 'ERROR') NOT NULL DEFAULT 'IDLE',
+        stream_key VARCHAR(128) NULL,
+        ingest_url VARCHAR(255) NULL,
+        playback_url VARCHAR(500) NULL,
+        youtube_broadcast_id VARCHAR(100) NULL,
+        youtube_video_id VARCHAR(100) NULL,
+        youtube_live_url VARCHAR(500) NULL,
+        title VARCHAR(255) NULL,
+        description TEXT NULL,
+        privacy_status ENUM('PUBLIC', 'UNLISTED', 'PRIVATE') NOT NULL DEFAULT 'PUBLIC',
+        overlay_config JSON NULL,
+        viewer_count INT NOT NULL DEFAULT 0,
+        peak_viewers INT NOT NULL DEFAULT 0,
+        actual_start DATETIME NULL,
+        actual_end DATETIME NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_streams_match (match_id),
+        INDEX idx_streams_tournament (tournament_id),
+        INDEX idx_streams_status (status),
+        INDEX idx_streams_key (stream_key),
+        INDEX idx_streams_method (streaming_method)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+    // 2. Create tournament_stream_permissions table if not exists
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS tournament_stream_permissions (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        uuid VARCHAR(64) NOT NULL UNIQUE,
+        tournament_id INT NOT NULL,
+        user_id INT NOT NULL,
+        match_id BIGINT NULL,
+        granted_by INT NOT NULL,
+        scope ENUM('TOURNAMENT', 'MATCH') NOT NULL DEFAULT 'TOURNAMENT',
+        status ENUM('ACTIVE', 'REVOKED') NOT NULL DEFAULT 'ACTIVE',
+        expires_at DATETIME NULL,
+        revoked_at DATETIME NULL,
+        revoked_by INT NULL,
+        notes VARCHAR(255) NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_tsp_tournament (tournament_id),
+        INDEX idx_tsp_user (user_id),
+        INDEX idx_tsp_match (match_id),
+        INDEX idx_tsp_status (status),
+        INDEX idx_tsp_scope (scope),
+        INDEX idx_tsp_lookup (tournament_id, user_id, status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+    // 3. Verify additive columns on tournament_matches
+    const cols = await db.query('DESCRIBE tournament_matches');
+    const colNames = (cols || []).map((c) => c.Field);
+
+    if (!colNames.includes('has_live_stream')) {
+      await db.query('ALTER TABLE tournament_matches ADD COLUMN has_live_stream TINYINT(1) NOT NULL DEFAULT 0');
+      console.log('✅ Added has_live_stream column to tournament_matches.');
+    }
+    if (!colNames.includes('live_stream_id')) {
+      await db.query('ALTER TABLE tournament_matches ADD COLUMN live_stream_id BIGINT NULL');
+      console.log('✅ Added live_stream_id column to tournament_matches.');
+    }
+
+    tablesInitialized = true;
+  } catch (err) {
+    console.warn('[Streaming] Auto-table verification warning:', err.message);
+  }
+}
+
+// Auto-run schema check asynchronously on startup
+setImmediate(() => {
+  ensureStreamingTables()
+    .then(() => cleanupStaleStreamsOnStartup())
+    .catch((e) => console.warn('[Streaming] Startup init warning:', e.message));
+});
+
+/**
+ * Clean up dangling LIVE sessions after server restart
+ */
+async function cleanupStaleStreamsOnStartup() {
+  try {
+    const staleStreams = await db.query(
+      `SELECT id, match_id, uuid FROM match_streams WHERE status IN ('LIVE', 'PREVIEW')`
+    );
+    if (staleStreams && staleStreams.length > 0) {
+      console.log(`[Streaming] Cleaning up ${staleStreams.length} stale stream(s) from previous server run.`);
+      await db.query(
+        `UPDATE match_streams SET status = 'ENDED', actual_end = NOW() WHERE status IN ('LIVE', 'PREVIEW')`
+      );
+      for (const s of staleStreams) {
+        try {
+          await db.query('UPDATE tournament_matches SET has_live_stream = 0 WHERE id = ?', [s.match_id]);
+        } catch (e) {}
+      }
+    }
+  } catch (err) {
+    // Non-fatal if table doesn't exist yet
+  }
 }
 
 /**
- * Checks whether user has permission to manage the match stream
- * (Superadmin, Tournament Creator/Venue Owner, or Active Delegated Streaming Permission)
+ * Structured audit logging for stream actions (start, stop, regenerate key, overlay changes)
+ */
+async function recordStreamAudit({ match, user, actionType, previousState = null, newState = null, notes = '' }) {
+  try {
+    const roleUpper = String(user?.role || '').toUpperCase();
+    console.log('[STREAM_AUDIT]', JSON.stringify({
+      action: actionType,
+      matchId: match?.public_id || match?.id,
+      matchNumber: match?.match_number,
+      userId: user?.id,
+      userRole: roleUpper,
+      notes,
+      timestamp: new Date().toISOString()
+    }));
+
+    await db.query(
+      `INSERT INTO tournament_audit_logs (tournament_id, match_id, action_type, user_id, user_role, previous_state, new_state, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        match.tournament_id || match.t_id,
+        match.id,
+        actionType,
+        user?.id || null,
+        roleUpper || 'STREAMER',
+        previousState ? JSON.stringify(previousState) : null,
+        newState ? JSON.stringify(newState) : null,
+        notes
+      ]
+    );
+  } catch (err) {
+    // Non-fatal if audit table does not exist or insert fails
+  }
+}
+
+/**
+ * Helper to fetch match and tournament entities with resilient fallback if columns are missing
+ */
+async function getMatchAndTournament(matchPublicOrInternalId) {
+  const isNum = /^\d+$/.test(String(matchPublicOrInternalId).trim());
+  const baseParams = [String(matchPublicOrInternalId), isNum ? parseInt(matchPublicOrInternalId, 10) : -1];
+
+  try {
+    const rows = await db.query(
+      `SELECT 
+        tm.id, tm.uuid as public_id, tm.match_number, tm.status as match_status,
+        tm.tournament_id, tm.venue_id, tm.court_id, tm.scorer_id,
+        tm.live_score_summary, tm.live_subtext, tm.sport_state,
+        tm.has_live_stream, tm.live_stream_id,
+        t.id as t_id, t.uuid as tournament_uuid, t.name as tournament_name,
+        t.created_by, t.sport_id,
+        s.slug as sport_slug, s.name as sport_name,
+        v.owner_id as venue_owner_id,
+        ta.id as team_a_id, ta.name as team_a_name, ta.logo_url as team_a_logo,
+        tb.id as team_b_id, tb.name as team_b_name, tb.logo_url as team_b_logo
+       FROM tournament_matches tm
+       JOIN tournaments t ON tm.tournament_id = t.id
+       JOIN sports s ON t.sport_id = s.id
+       LEFT JOIN venues v ON tm.venue_id = v.id
+       LEFT JOIN teams ta ON tm.team_a_id = ta.id
+       LEFT JOIN teams tb ON tm.team_b_id = tb.id
+       WHERE tm.uuid = ? OR tm.id = ?`,
+      baseParams
+    );
+    return rows && rows.length > 0 ? rows[0] : null;
+  } catch (err) {
+    // Fallback if has_live_stream column does not exist in database yet
+    if (err && (err.code === 'ER_BAD_FIELD_ERROR' || String(err.message).includes('has_live_stream'))) {
+      const rows = await db.query(
+        `SELECT 
+          tm.id, tm.uuid as public_id, tm.match_number, tm.status as match_status,
+          tm.tournament_id, tm.venue_id, tm.court_id, tm.scorer_id,
+          tm.live_score_summary, tm.live_subtext, tm.sport_state,
+          0 as has_live_stream, NULL as live_stream_id,
+          t.id as t_id, t.uuid as tournament_uuid, t.name as tournament_name,
+          t.created_by, t.sport_id,
+          s.slug as sport_slug, s.name as sport_name,
+          v.owner_id as venue_owner_id,
+          ta.id as team_a_id, ta.name as team_a_name, ta.logo_url as team_a_logo,
+          tb.id as team_b_id, tb.name as team_b_name, tb.logo_url as team_b_logo
+         FROM tournament_matches tm
+         JOIN tournaments t ON tm.tournament_id = t.id
+         JOIN sports s ON t.sport_id = s.id
+         LEFT JOIN venues v ON tm.venue_id = v.id
+         LEFT JOIN teams ta ON tm.team_a_id = ta.id
+         LEFT JOIN teams tb ON tm.team_b_id = tb.id
+         WHERE tm.uuid = ? OR tm.id = ?`,
+        baseParams
+      );
+      return rows && rows.length > 0 ? rows[0] : null;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Authoritative check whether user has permission to manage the match stream.
+ * UNCONDITIONAL ACCESS FOR SUPER ADMIN across any match, tournament, or venue.
+ * Also grants access to:
+ * - Tournament Organizer / Venue Owner
+ * - Assigned Match Scorer
+ * - Authorized Delegated Streamers
  */
 async function canManageStream(user, matchData) {
   if (!user || !user.id) return false;
   const role = (user.role || '').toUpperCase();
-  if (role === 'ADMIN' || role === 'SUPER_ADMIN') return true;
+
+  // 1. Super Admin unconditionally allowed for all matches
+  if (role === 'ADMIN' || role === 'SUPER_ADMIN') {
+    return true;
+  }
 
   const userId = Number(user.id);
+
+  // 2. Tournament Creator or Venue Owner
   if (matchData.created_by && Number(matchData.created_by) === userId) return true;
   if (matchData.venue_owner_id && Number(matchData.venue_owner_id) === userId) return true;
 
-  // Check active delegated streaming permissions in tournament_stream_permissions
+  // 3. Assigned Match Scorer
+  if (matchData.scorer_id && Number(matchData.scorer_id) === userId) return true;
+
+  // 4. Delegated Streamer in tournament_stream_permissions
   const tournamentId = matchData.t_id || matchData.tournament_id;
   const matchInternalId = matchData.id;
   if (tournamentId) {
@@ -63,7 +266,7 @@ async function canManageStream(user, matchData) {
       );
       if (rows && rows.length > 0) return true;
     } catch (err) {
-      console.error('Error checking delegated streaming permission:', err);
+      // Non-fatal if table not yet migrated
     }
   }
 
@@ -77,10 +280,23 @@ async function getMatchStream(matchId, user = null) {
   const match = await getMatchAndTournament(matchId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
-  const rows = await db.query(
-    `SELECT * FROM match_streams WHERE match_id = ? ORDER BY id DESC LIMIT 1`,
-    [match.id]
-  );
+  const isAuthorized = await canManageStream(user, match);
+
+  let rows = [];
+  try {
+    rows = await db.query(
+      `SELECT * FROM match_streams WHERE match_id = ? ORDER BY id DESC LIMIT 1`,
+      [match.id]
+    );
+  } catch (err) {
+    if (err && (err.code === 'ER_NO_SUCH_TABLE' || String(err.message).includes("doesn't exist"))) {
+      rows = [];
+      // Trigger background table creation
+      ensureStreamingTables().catch(() => {});
+    } else {
+      throw err;
+    }
+  }
 
   if (!rows || rows.length === 0) {
     return {
@@ -95,13 +311,13 @@ async function getMatchStream(matchId, user = null) {
         teamBName: match.team_b_name,
         matchStatus: match.match_status
       },
-      canManage: await canManageStream(user, match),
-      stream: null
+      canManage: isAuthorized,
+      stream: null,
+      iceServers: isAuthorized ? getIceServers() : undefined
     };
   }
 
   const s = rows[0];
-  const isAuthorized = await canManageStream(user, match);
 
   let parsedOverlay = DEFAULT_OVERLAY_CONFIG;
   if (s.overlay_config) {
@@ -110,7 +326,7 @@ async function getMatchStream(matchId, user = null) {
     } catch {}
   }
 
-  // Sanitized viewer payload
+  // Sanitized viewer payload (never exposes broadcaster keys or ingest tokens)
   const publicStream = {
     id: s.uuid,
     matchId: match.public_id,
@@ -130,13 +346,13 @@ async function getMatchStream(matchId, user = null) {
     createdAt: s.created_at
   };
 
-  // If authorized manager, append private ingest parameters & OBS browser source overlay URL
+  // If authorized manager, append private ingest parameters & ICE servers
   if (isAuthorized) {
     publicStream.streamKey = s.stream_key;
     publicStream.ingestUrl = s.ingest_url || RTMP_BASE_URL;
     publicStream.youtubeBroadcastId = s.youtube_broadcast_id;
     publicStream.obsOverlayUrl = `/matches/${match.public_id}/overlay`;
-    publicStream.iceServers = DEFAULT_ICE_SERVERS;
+    publicStream.iceServers = getIceServers();
   }
 
   return {
@@ -160,6 +376,8 @@ async function getMatchStream(matchId, user = null) {
  * Initialize or configure a stream for a match
  */
 async function initializeStream(matchId, user, payload = {}) {
+  await ensureStreamingTables();
+
   const match = await getMatchAndTournament(matchId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
@@ -174,8 +392,7 @@ async function initializeStream(matchId, user, payload = {}) {
     youtubeLiveUrl,
     youtubeUrl,
     privacyStatus = 'PUBLIC',
-    overlayConfig = {},
-    overlaySettings
+    overlayConfig = {}
   } = payload;
 
   if (streamingMethod === 'YOUTUBE') {
@@ -188,7 +405,6 @@ async function initializeStream(matchId, user, payload = {}) {
     throw { statusCode: 400, message: `Invalid streaming method. Must be one of: ${validMethods.join(', ')}` };
   }
 
-  // Handle YouTube Live URL parsing if method is YOUTUBE_LIVE
   let ytVideoId = null;
   let ytLiveUrl = null;
   if (streamingMethod === 'YOUTUBE_LIVE') {
@@ -201,7 +417,6 @@ async function initializeStream(matchId, user, payload = {}) {
     }
   }
 
-  // Check if stream record already exists
   const existingRows = await db.query(
     'SELECT * FROM match_streams WHERE match_id = ? ORDER BY id DESC LIMIT 1',
     [match.id]
@@ -219,7 +434,6 @@ async function initializeStream(matchId, user, payload = {}) {
 
   const streamTitle = title || `${match.team_a_name} vs ${match.team_b_name} - Match #${match.match_number} Live`;
   const streamDescription = description || `Official Live Match Stream for ${match.tournament_name}`;
-
   const mergedOverlay = { ...DEFAULT_OVERLAY_CONFIG, ...overlayConfig };
 
   if (existingRows.length > 0) {
@@ -256,7 +470,7 @@ async function initializeStream(matchId, user, payload = {}) {
       [
         streamUuid,
         match.id,
-        match.tournament_id,
+        match.tournament_id || match.t_id,
         user.id,
         streamingMethod,
         streamKey,
@@ -272,11 +486,19 @@ async function initializeStream(matchId, user, payload = {}) {
     );
   }
 
-  // Update match flag
-  await db.query(
-    'UPDATE tournament_matches SET has_live_stream = 1 WHERE id = ?',
-    [match.id]
-  );
+  // Update match flag safely
+  try {
+    await db.query('UPDATE tournament_matches SET has_live_stream = 1 WHERE id = ?', [match.id]);
+  } catch (err) {}
+
+  // Audit log entry
+  await recordStreamAudit({
+    match,
+    user,
+    actionType: 'STREAM_INITIALIZED',
+    newState: { streamingMethod, streamTitle },
+    notes: `Configured ${streamingMethod} stream for Match #${match.match_number}`
+  });
 
   // Broadcast socket event
   const io = getIO();
@@ -296,6 +518,8 @@ async function initializeStream(matchId, user, payload = {}) {
  * Update stream status (PREVIEW, LIVE, PAUSED, ENDED)
  */
 async function updateStreamStatus(matchId, user, { status }) {
+  await ensureStreamingTables();
+
   const match = await getMatchAndTournament(matchId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
@@ -336,36 +560,23 @@ async function updateStreamStatus(matchId, user, { status }) {
     [status, actualStart, actualEnd, stream.id]
   );
 
-  // If stream ended, update match flag
-  if (status === 'ENDED') {
-    await db.query('UPDATE tournament_matches SET has_live_stream = 0 WHERE id = ?', [match.id]);
-  } else if (status === 'LIVE') {
-    await db.query('UPDATE tournament_matches SET has_live_stream = 1 WHERE id = ?', [match.id]);
-  }
+  // Update match flag
+  try {
+    const liveFlag = status === 'LIVE' ? 1 : 0;
+    await db.query('UPDATE tournament_matches SET has_live_stream = ? WHERE id = ?', [liveFlag, match.id]);
+  } catch (err) {}
 
-    // Audit trail entry
-    try {
-      const roleUpper = String(user?.role || '').toUpperCase();
-      const actionType = status === 'LIVE' ? 'STREAM_STARTED' : status === 'ENDED' ? 'STREAM_ENDED' : 'STREAM_STATUS_UPDATED';
-      await db.query(
-        `INSERT INTO tournament_audit_logs (tournament_id, match_id, action_type, user_id, user_role, previous_state, new_state, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          match.tournament_id || match.t_id,
-          match.id,
-          actionType,
-          user?.id || null,
-          roleUpper || 'STREAMER',
-          JSON.stringify({ status: stream.status }),
-          JSON.stringify({ status }),
-          `Live stream status changed from ${stream.status} to ${status} for Match #${match.match_number}`
-        ]
-      );
-    } catch (err) {
-      console.warn('Audit log insert note:', err.message);
-    }
+  // Audit trail entry
+  await recordStreamAudit({
+    match,
+    user,
+    actionType: status === 'LIVE' ? 'STREAM_STARTED' : status === 'ENDED' ? 'STREAM_ENDED' : `STREAM_STATUS_${status}`,
+    previousState: { status: stream.status },
+    newState: { status },
+    notes: `Stream status changed from ${stream.status} to ${status} for Match #${match.match_number}`
+  });
 
-  // Socket notification to viewers
+  // Real-time socket notification to viewers, tournament subscribers, and display monitors
   const io = getIO();
   if (io) {
     const payload = {
@@ -387,7 +598,9 @@ async function updateStreamStatus(matchId, user, { status }) {
     io.to(`stream:${match.public_id}`).emit('stream:status_changed', payload);
     io.to(`match:${match.public_id}`).emit('stream:status', payload);
     io.to(`match:${match.public_id}`).emit('stream:status_changed', payload);
-    io.to(`tournament:${match.tournament_uuid}`).emit('tournament:stream_status', payload);
+    if (match.tournament_uuid) {
+      io.to(`tournament:${match.tournament_uuid}`).emit('tournament:stream_status', payload);
+    }
   }
 
   return getMatchStream(match.public_id, user);
@@ -397,6 +610,8 @@ async function updateStreamStatus(matchId, user, { status }) {
  * Regenerate stream key for external RTMP broadcasting
  */
 async function regenerateStreamKey(matchId, user) {
+  await ensureStreamingTables();
+
   const match = await getMatchAndTournament(matchId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
@@ -415,6 +630,13 @@ async function regenerateStreamKey(matchId, user) {
     [newKey, newPlaybackUrl, match.id]
   );
 
+  await recordStreamAudit({
+    match,
+    user,
+    actionType: 'STREAM_KEY_REGENERATED',
+    notes: `Regenerated external RTMP stream key for Match #${match.match_number}`
+  });
+
   return {
     success: true,
     message: 'Stream key regenerated successfully.',
@@ -428,6 +650,8 @@ async function regenerateStreamKey(matchId, user) {
  * Update overlay settings
  */
 async function updateOverlayConfig(matchId, user, config) {
+  await ensureStreamingTables();
+
   const match = await getMatchAndTournament(matchId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
@@ -456,7 +680,14 @@ async function updateOverlayConfig(matchId, user, config) {
     [JSON.stringify(updated), rows[0].id]
   );
 
-  // Notify active overlays (OBS / Viewers)
+  await recordStreamAudit({
+    match,
+    user,
+    actionType: 'STREAM_OVERLAY_UPDATED',
+    newState: updated,
+    notes: `Updated broadcast overlay configuration for Match #${match.match_number}`
+  });
+
   const io = getIO();
   if (io) {
     io.to(`match:${match.public_id}`).emit('stream:overlay_updated', {
@@ -475,19 +706,18 @@ async function getOBSOverlayData(matchId) {
   const match = await getMatchAndTournament(matchId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
-  const streamRows = await db.query(
-    'SELECT * FROM match_streams WHERE match_id = ? ORDER BY id DESC LIMIT 1',
-    [match.id]
-  );
-
   let overlayConfig = DEFAULT_OVERLAY_CONFIG;
-  if (streamRows.length > 0 && streamRows[0].overlay_config) {
-    try {
+  try {
+    const streamRows = await db.query(
+      'SELECT * FROM match_streams WHERE match_id = ? ORDER BY id DESC LIMIT 1',
+      [match.id]
+    );
+    if (streamRows.length > 0 && streamRows[0].overlay_config) {
       overlayConfig = typeof streamRows[0].overlay_config === 'string'
         ? JSON.parse(streamRows[0].overlay_config)
         : streamRows[0].overlay_config;
-    } catch {}
-  }
+    }
+  } catch (err) {}
 
   let parsedSportState = null;
   if (match.sport_state) {
@@ -524,44 +754,48 @@ async function getOBSOverlayData(matchId) {
  * List all active streams across the platform (for Live Now tab)
  */
 async function getActiveLiveStreams() {
-  const rows = await db.query(
-    `SELECT 
-      ms.uuid as stream_id, ms.streaming_method, ms.status, ms.title,
-      ms.youtube_video_id, ms.viewer_count, ms.actual_start,
-      tm.uuid as match_id, tm.match_number, tm.live_score_summary, tm.live_subtext,
-      t.uuid as tournament_id, t.name as tournament_name,
-      s.slug as sport_slug, s.name as sport_name,
-      ta.name as team_a_name, ta.logo_url as team_a_logo,
-      tb.name as team_b_name, tb.logo_url as team_b_logo
-     FROM match_streams ms
-     JOIN tournament_matches tm ON ms.match_id = tm.id
-     JOIN tournaments t ON tm.tournament_id = t.id
-     JOIN sports s ON t.sport_id = s.id
-     LEFT JOIN teams ta ON tm.team_a_id = ta.id
-     LEFT JOIN teams tb ON tm.team_b_id = tb.id
-     WHERE ms.status IN ('LIVE', 'PREVIEW')
-     ORDER BY ms.status = 'LIVE' DESC, ms.viewer_count DESC, ms.actual_start DESC`
-  );
+  try {
+    const rows = await db.query(
+      `SELECT 
+        ms.uuid as stream_id, ms.streaming_method, ms.status, ms.title,
+        ms.youtube_video_id, ms.viewer_count, ms.actual_start,
+        tm.uuid as match_id, tm.match_number, tm.live_score_summary, tm.live_subtext,
+        t.uuid as tournament_id, t.name as tournament_name,
+        s.slug as sport_slug, s.name as sport_name,
+        ta.name as team_a_name, ta.logo_url as team_a_logo,
+        tb.name as team_b_name, tb.logo_url as team_b_logo
+       FROM match_streams ms
+       JOIN tournament_matches tm ON ms.match_id = tm.id
+       JOIN tournaments t ON tm.tournament_id = t.id
+       JOIN sports s ON t.sport_id = s.id
+       LEFT JOIN teams ta ON tm.team_a_id = ta.id
+       LEFT JOIN teams tb ON tm.team_b_id = tb.id
+       WHERE ms.status IN ('LIVE', 'PREVIEW')
+       ORDER BY ms.status = 'LIVE' DESC, ms.viewer_count DESC, ms.actual_start DESC`
+    );
 
-  return rows.map(r => ({
-    streamId: r.stream_id,
-    matchId: r.match_id,
-    matchNumber: r.match_number,
-    streamingMethod: r.streaming_method,
-    status: r.status,
-    title: r.title,
-    tournamentId: r.tournament_id,
-    tournamentName: r.tournament_name,
-    sportSlug: r.sport_slug,
-    sportName: r.sport_name,
-    teamAName: r.team_a_name,
-    teamBName: r.team_b_name,
-    scoreSummary: r.live_score_summary,
-    subtext: r.live_subtext,
-    youtubeVideoId: r.youtube_video_id,
-    viewerCount: r.viewer_count || 0,
-    startedAt: r.actual_start
-  }));
+    return rows.map((r) => ({
+      streamId: r.stream_id,
+      matchId: r.match_id,
+      matchNumber: r.match_number,
+      streamingMethod: r.streaming_method,
+      status: r.status,
+      title: r.title,
+      tournamentId: r.tournament_id,
+      tournamentName: r.tournament_name,
+      sportSlug: r.sport_slug,
+      sportName: r.sport_name,
+      teamAName: r.team_a_name,
+      teamBName: r.team_b_name,
+      scoreSummary: r.live_score_summary,
+      subtext: r.live_subtext,
+      youtubeVideoId: r.youtube_video_id,
+      viewerCount: r.viewer_count || 0,
+      startedAt: r.actual_start
+    }));
+  } catch (err) {
+    return [];
+  }
 }
 
 /**
@@ -585,7 +819,9 @@ async function autoEndStreamOnDisconnect(matchId) {
       `UPDATE match_streams SET status = 'ENDED', actual_end = ? WHERE id = ?`,
       [actualEnd, stream.id]
     );
-    await db.query('UPDATE tournament_matches SET has_live_stream = 0 WHERE id = ?', [match.id]);
+    try {
+      await db.query('UPDATE tournament_matches SET has_live_stream = 0 WHERE id = ?', [match.id]);
+    } catch (e) {}
 
     const io = getIO();
     if (io) {
@@ -603,14 +839,103 @@ async function autoEndStreamOnDisconnect(matchId) {
       io.to(`stream:${match.public_id}`).emit('stream:status_changed', payload);
       io.to(`match:${match.public_id}`).emit('stream:status', payload);
       io.to(`match:${match.public_id}`).emit('stream:status_changed', payload);
-      io.to(`tournament:${match.tournament_uuid}`).emit('tournament:stream_status', payload);
+      if (match.tournament_uuid) {
+        io.to(`tournament:${match.tournament_uuid}`).emit('tournament:stream_status', payload);
+      }
     }
   } catch (err) {
     console.warn('autoEndStreamOnDisconnect error:', err.message);
   }
 }
 
+/**
+ * Super Admin Streaming Health Diagnostics Check
+ * Authoritative system check covering DB, WebRTC/STUN, Ingest, and Environment.
+ */
+async function getStreamingHealth(user = null) {
+  const role = (user?.role || '').toUpperCase();
+  const isSuperAdmin = role === 'ADMIN' || role === 'SUPER_ADMIN';
+
+  let matchStreamsTable = false;
+  let tournamentStreamPermissionsTable = false;
+  let hasLiveStreamCol = false;
+  let liveStreamIdCol = false;
+  let totalStreamsCount = 0;
+  let activeLiveCount = 0;
+
+  try {
+    const [t1] = await db.query(`SHOW TABLES LIKE 'match_streams'`);
+    matchStreamsTable = Boolean(t1);
+
+    const [t2] = await db.query(`SHOW TABLES LIKE 'tournament_stream_permissions'`);
+    tournamentStreamPermissionsTable = Boolean(t2);
+
+    const cols = await db.query('DESCRIBE tournament_matches');
+    const colNames = (cols || []).map((c) => c.Field);
+    hasLiveStreamCol = colNames.includes('has_live_stream');
+    liveStreamIdCol = colNames.includes('live_stream_id');
+
+    if (matchStreamsTable) {
+      const [cnt] = await db.query('SELECT COUNT(*) as total, SUM(CASE WHEN status = "LIVE" THEN 1 ELSE 0 END) as active FROM match_streams');
+      totalStreamsCount = cnt?.total || 0;
+      activeLiveCount = cnt?.active || 0;
+    }
+  } catch (err) {
+    console.warn('[StreamingHealth] DB check note:', err.message);
+  }
+
+  const iceServers = getIceServers();
+  const hasStun = iceServers.some((s) => String(s.urls).startsWith('stun:'));
+  const hasTurn = iceServers.some((s) => String(s.urls).startsWith('turn:') || String(s.urls).startsWith('turns:'));
+
+  const envChecks = {
+    APP_URL: Boolean(process.env.APP_URL),
+    API_PUBLIC_URL: Boolean(process.env.API_PUBLIC_URL),
+    STREAMING_RTMP_INGEST_URL: Boolean(process.env.STREAMING_RTMP_INGEST_URL || process.env.RTMP_INGEST_URL),
+    STREAMING_HLS_PLAYBACK_URL: Boolean(process.env.STREAMING_HLS_PLAYBACK_URL || process.env.HLS_PLAYBACK_URL),
+    STUN_CONFIGURED: hasStun,
+    TURN_CONFIGURED: hasTurn,
+    YOUTUBE_OAUTH_CONFIGURED: Boolean(process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET)
+  };
+
+  const allPassed =
+    matchStreamsTable &&
+    tournamentStreamPermissionsTable &&
+    hasLiveStreamCol &&
+    hasStun;
+
+  return {
+    status: allPassed ? 'HEALTHY' : 'DEGRADED',
+    timestamp: new Date().toISOString(),
+    isSuperAdmin,
+    database: {
+      matchStreamsTable,
+      tournamentStreamPermissionsTable,
+      hasLiveStreamColumn: hasLiveStreamCol,
+      liveStreamIdColumn: liveStreamIdCol,
+      totalStreamsRecorded: totalStreamsCount,
+      currentlyLiveStreams: activeLiveCount
+    },
+    networking: {
+      rtmpIngestUrlConfigured: RTMP_BASE_URL,
+      hlsPlaybackUrlConfigured: HLS_BASE_URL,
+      iceServersConfiguredCount: iceServers.length,
+      stunAvailable: hasStun,
+      turnAvailable: hasTurn,
+      // Pass clean names only without credentials
+      iceServersSummary: iceServers.map((s) => ({
+        urls: s.urls,
+        hasAuth: Boolean(s.username)
+      }))
+    },
+    environment: envChecks
+  };
+}
+
 module.exports = {
+  ensureStreamingTables,
+  cleanupStaleStreamsOnStartup,
+  recordStreamAudit,
   getMatchAndTournament,
   canManageStream,
   getMatchStream,
@@ -620,5 +945,6 @@ module.exports = {
   updateOverlayConfig,
   getOBSOverlayData,
   getActiveLiveStreams,
-  autoEndStreamOnDisconnect
+  autoEndStreamOnDisconnect,
+  getStreamingHealth
 };
