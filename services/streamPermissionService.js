@@ -148,7 +148,7 @@ async function checkUserStreamPermission(userId, tournamentId, matchId = null) {
  */
 async function getTournamentStreamPermissions(tournamentId, user = null) {
   const tournament = await getAuthoritativeTournament(tournamentId);
-  if (!tournament) throw { statusCode: 404, message: 'Tournament not found' };
+  if (!tournament) return [];
 
   const isOwnerOrAdmin = isTournamentOwnerOrAdmin(user, tournament);
   const currentUserId = user?.id ? Number(user.id) : null;
@@ -617,7 +617,7 @@ async function getUserStreamingAssignments(userId) {
  */
 async function getTournamentStreamingOverview(tournamentId, user = null) {
   const tournament = await getAuthoritativeTournament(tournamentId);
-  if (!tournament) throw { statusCode: 404, message: 'Tournament not found' };
+  if (!tournament) return [];
 
   const matches = await db.query(
     `SELECT 
