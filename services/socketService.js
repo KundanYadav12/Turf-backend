@@ -208,6 +208,9 @@ function initSocket(server) {
       if (matchId) {
         const streamRoom = `stream:${matchId}`;
         socket.leave(streamRoom);
+        if (socket.isBroadcaster) {
+          socket.to(streamRoom).emit('stream:broadcaster_disconnected', { matchId });
+        }
         const actualViewerCount = getRoomViewerCount(matchId);
         io.to(streamRoom).emit('stream:viewer_count', {
           matchId,
