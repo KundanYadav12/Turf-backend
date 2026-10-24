@@ -539,16 +539,33 @@ function broadcastFootballEvent(match, payload) {
   const matchRoom = `match:${match.uuid}`;
   const tourneyRoom = `tournament:${match.tournament_public_id}`;
 
-  io.to(matchRoom).emit('match:footballEvent', payload);
-  io.to(matchRoom).emit('match:ballEvent', payload);
+  const enriched = {
+    matchId: match.uuid,
+    timestamp: Date.now(),
+    eventSeq: payload.eventSeq || Date.now(),
+    ...payload
+  };
 
-  io.to(tourneyRoom).emit('tournament:matchUpdated', {
+  io.to(matchRoom).emit('match:footballEvent', enriched);
+  io.to(matchRoom).emit('match:ballEvent', enriched);
+  io.to(matchRoom).emit('score:updated', enriched);
+  io.to(matchRoom).emit('match:pointScored', enriched);
+
+  const summaryPayload = {
     matchId: match.uuid,
     status: payload.status || match.status,
     liveScoreSummary: payload.scoreSummary || match.live_score_summary,
     liveSubtext: payload.commentary || payload.period || match.live_subtext,
-    celebration: payload.celebration || null
-  });
+    celebration: payload.celebration || null,
+    eventSeq: enriched.eventSeq,
+    timestamp: enriched.timestamp
+  };
+
+  io.to(tourneyRoom).emit('tournament:matchUpdated', summaryPayload);
+  io.emit('signage:matchUpdate', summaryPayload);
+  if (payload.celebration || payload.type === 'GOAL') {
+    io.emit('signage:pointScored', enriched);
+  }
 }
 
 module.exports = {

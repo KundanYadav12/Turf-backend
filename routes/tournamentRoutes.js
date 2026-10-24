@@ -2,11 +2,17 @@ const express = require('express');
 const router = express.Router();
 const tournamentService = require('../services/tournamentService');
 const scorerAccessService = require('../services/scorerAccessService');
+const streamPermissionService = require('../services/streamPermissionService');
 const fixtureService = require('../services/fixtureService');
 const auctionController = require('../controllers/auctionController');
 const { authenticateUser, optionalAuthenticateUser } = require('../middleware/authMiddleware');
 const { authorizeRoles } = require('../middleware/rbacMiddleware');
 const upload = require('../middleware/multerMiddleware');
+const tournamentAnalyticsController = require('../controllers/tournamentAnalyticsController');
+
+// 0. Tournament View Tracking & Public Summary (Deduped, non-blocking)
+router.post('/:id/view', optionalAuthenticateUser, tournamentAnalyticsController.recordTournamentView);
+router.get('/:id/analytics/summary', tournamentAnalyticsController.getPublicTournamentAnalyticsSummary);
 
 // 1. GET /api/tournaments - Discovery listing (cursor-based pagination, minimal summary)
 router.get('/', async (req, res, next) => {
@@ -55,6 +61,31 @@ router.get('/:id', async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Tournament not found.' });
     }
     res.json({ success: true, data: tournament });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 2a. GET /api/tournaments/:id/delete-impact - Check impact before tournament deletion
+router.get('/:id/delete-impact', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await tournamentService.getTournamentDeleteImpact(req.params.id, req.user);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 2b. DELETE /api/tournaments/:id - Delete Tournament (Superadmin or Organizer creator only)
+router.delete('/:id', authenticateUser, async (req, res, next) => {
+  try {
+    const force = req.query.force === 'true' || req.body?.force === true;
+    const result = await tournamentService.deleteTournament({
+      tournamentId: req.params.id,
+      user: req.user,
+      force
+    });
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -525,8 +556,8 @@ router.post(
   }
 );
 
-// B3: Get player registrations list for organizer
-router.get('/:id/player-registrations', authenticateUser, async (req, res, next) => {
+// B3: Get player registrations list (full for organizer, sanitized for public visitors)
+router.get('/:id/player-registrations', optionalAuthenticateUser, async (req, res, next) => {
   try {
     const registrations = await playerRegistrationService.getTournamentPlayerRegistrations(
       req.params.id,
@@ -605,9 +636,9 @@ router.post('/:id/player-registrations/:regId/reveal-sensitive', authenticateUse
 });
 
 // MODULE I: List assigned scorers for tournament
-router.get('/:id/scorers', authenticateUser, async (req, res, next) => {
+router.get('/:id/scorers', optionalAuthenticateUser, async (req, res, next) => {
   try {
-    const scorers = await scorerAccessService.getTournamentScorers(req.params.id);
+    const scorers = await scorerAccessService.getTournamentScorers(req.params.id, req.user);
     res.json({ success: true, data: scorers });
   } catch (error) {
     next(error);
@@ -641,6 +672,97 @@ router.delete('/:id/scorers/:assignmentId', authenticateUser, async (req, res, n
       removedByRole: req.user.role
     });
     res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// =====================================================
+// LIVE STREAMING PERMISSIONS & DELEGATED ACCESS
+// =====================================================
+
+// Search users for streaming permission delegation
+router.get('/streaming/search-users', authenticateUser, async (req, res, next) => {
+  try {
+    const { q } = req.query;
+    const users = await streamPermissionService.searchUsers(q);
+    res.json({ success: true, data: users });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Shortcut for user's own streaming assignments across tournaments
+router.get('/streaming/my-assignments', authenticateUser, async (req, res, next) => {
+  try {
+    const data = await streamPermissionService.getUserStreamingAssignments(req.user.id);
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// List streaming permissions for tournament (Creator/Admin sees all; User sees own)
+router.get('/:id/streaming-permissions', optionalAuthenticateUser, async (req, res, next) => {
+  try {
+    const permissions = await streamPermissionService.getTournamentStreamPermissions(req.params.id, req.user);
+    res.json({ success: true, data: permissions });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Check current user's specific streaming permission for this tournament
+router.get('/:id/streaming-permissions/me', authenticateUser, async (req, res, next) => {
+  try {
+    const matchId = req.query.matchId || null;
+    const permission = await streamPermissionService.checkUserStreamPermission(req.user.id, req.params.id, matchId);
+    res.json({ success: true, data: permission });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Grant live streaming permission to another user
+router.post('/:id/streaming-permissions', authenticateUser, async (req, res, next) => {
+  try {
+    const { userId, matchId, scope, expiresAt, notes } = req.body;
+    const result = await streamPermissionService.grantStreamPermission({
+      tournamentId: req.params.id,
+      userId,
+      matchId: matchId || null,
+      scope: scope || 'TOURNAMENT',
+      expiresAt: expiresAt || null,
+      notes: notes || null,
+      grantedBy: req.user.id,
+      grantedByRole: req.user.role
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Revoke live streaming permission
+router.delete('/:id/streaming-permissions/:permId', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await streamPermissionService.revokeStreamPermission({
+      tournamentId: req.params.id,
+      permissionIdOrUuid: req.params.permId,
+      revokedBy: req.user.id,
+      revokedByRole: req.user.role
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Tournament Streaming Overview (all matches, live stream status, viewer count, and canManageStream for viewer)
+router.get('/:id/streaming-overview', optionalAuthenticateUser, async (req, res, next) => {
+  try {
+    const data = await streamPermissionService.getTournamentStreamingOverview(req.params.id, req.user);
+    res.json({ success: true, data });
   } catch (error) {
     next(error);
   }
@@ -703,6 +825,25 @@ router.put('/:id/fixtures/:matchId', authenticateUser, async (req, res, next) =>
       matchId: req.params.matchId,
       user: req.user,
       updates: req.body
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// J4a. PUT /api/tournaments/:id/fixtures/:matchId/status - Quick Toggle Match Status (SCHEDULED / LIVE / COMPLETED)
+router.put('/:id/fixtures/:matchId/status', authenticateUser, async (req, res, next) => {
+  try {
+    const { status } = req.body;
+    if (!status || !['SCHEDULED', 'LIVE', 'COMPLETED', 'CANCELLED', 'PAUSED'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'Invalid status. Must be SCHEDULED, LIVE, or COMPLETED.' });
+    }
+    const result = await fixtureService.updateFixture({
+      tournamentId: req.params.id,
+      matchId: req.params.matchId,
+      user: req.user,
+      updates: { status, allowConflictOverride: true }
     });
     res.json(result);
   } catch (error) {

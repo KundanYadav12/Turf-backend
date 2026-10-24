@@ -93,6 +93,9 @@ app.use('/api/account', accountDeletionRoutes);
 app.use('/api/account-deletion', accountDeletionRoutes);
 const tvDisplayRoutes = require('./routes/tvDisplayRoutes');
 app.use('/api/tv', tvDisplayRoutes);
+const streamRoutes = require('./routes/streamRoutes');
+app.use('/api/matches', streamRoutes);
+app.use('/api/streams', streamRoutes);
 
 
 // 404 Route Handler

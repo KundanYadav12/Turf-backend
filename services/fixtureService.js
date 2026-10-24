@@ -344,7 +344,9 @@ async function updateFixture({ tournamentId, matchId, user, updates }) {
          match_number = ?,
          round_number = ?,
          scorer_id = ?,
-         status = COALESCE(?, status)
+         status = COALESCE(?, status),
+         show_on_display = CASE WHEN ? = 'LIVE' THEN 1 ELSE show_on_display END,
+         live_score_summary = CASE WHEN ? = 'LIVE' AND (live_score_summary IS NULL OR live_score_summary = 'Yet to Start') THEN '0 - 0' ELSE live_score_summary END
      WHERE id = ?`,
     [
       newCategory,
@@ -361,6 +363,8 @@ async function updateFixture({ tournamentId, matchId, user, updates }) {
       matchNumber !== undefined ? matchNumber : match.match_number,
       roundNumber !== undefined ? roundNumber : match.round_number,
       scorerId !== undefined ? scorerId : match.scorer_id,
+      status || null,
+      status || null,
       status || null,
       match.id
     ]
@@ -387,13 +391,26 @@ async function updateFixture({ tournamentId, matchId, user, updates }) {
   if (io) {
     io.to(`tournament:${tournament.uuid}`).emit('tournament:matchesUpdated', {
       tournamentId: tournament.uuid,
-      updatedMatchId: match.id
+      updatedMatchId: match.id,
+      newStatus: status || match.status
+    });
+    io.to(`tv:${tournament.uuid}`).emit('display:matchesUpdated', {
+      tournamentId: tournament.uuid
+    });
+    io.to(`signage:${tournament.uuid}`).emit('display:matchesUpdated', {
+      tournamentId: tournament.uuid
     });
   }
 
   return {
     success: true,
-    message: `Match #${matchNumber || match.match_number} updated successfully.`
+    message: `Match #${matchNumber || match.match_number} updated successfully.`,
+    data: {
+      id: match.id,
+      uuid: match.uuid,
+      status: status || match.status,
+      show_on_display: status === 'LIVE' ? 1 : match.show_on_display
+    }
   };
 }
 

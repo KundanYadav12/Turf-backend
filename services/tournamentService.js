@@ -65,6 +65,9 @@ const getTournamentsPaginated = async ({
       s.name as sport_name,
       s.slug as sport_slug,
       s.icon as sport_icon,
+      COALESCE(t.total_views, 0) as total_views,
+      COALESCE(t.unique_viewers, 0) as unique_viewers,
+      t.last_viewed_at,
       (SELECT COUNT(*) FROM tournament_matches tm WHERE tm.tournament_id = t.id AND tm.status = 'LIVE') as live_match_count,
       (SELECT COUNT(*) FROM tournament_teams tt WHERE tt.tournament_id = t.id AND tt.registration_status = 'APPROVED') as registered_teams_count
     FROM tournaments t
@@ -106,6 +109,9 @@ const getTournamentsPaginated = async ({
       startDate: item.start_date,
       endDate: item.end_date,
       status: item.status,
+      totalViews: parseInt(item.total_views, 10) || 0,
+      uniqueViewers: parseInt(item.unique_viewers, 10) || 0,
+      lastViewedAt: item.last_viewed_at || null,
       liveMatchCount: parseInt(item.live_match_count, 10) || 0,
       sport: {
         name: item.sport_name,
@@ -133,7 +139,11 @@ const getTournamentByPublicId = async (publicId) => {
       t.id, t.uuid as public_id, t.name, t.description, t.format,
       t.banner_url, t.max_teams, t.court_color,
       t.start_date, t.end_date, t.status, t.rules, t.has_auction,
+      t.created_by, t.venue_id, v.owner_id as venue_owner_id,
       t.match_format, t.target_score, t.win_by_two, t.max_score, t.roster_size, t.groups_count,
+      COALESCE(t.total_views, 0) as total_views,
+      COALESCE(t.unique_viewers, 0) as unique_viewers,
+      t.last_viewed_at,
       COALESCE(v.city, 'Mumbai') as city,
       s.name as sport_name, s.slug as sport_slug,
       v.name as venue_name, v.address as venue_address,
@@ -170,8 +180,13 @@ const getTournamentByPublicId = async (publicId) => {
     registeredTeams: parseInt(t.registered_teams_count, 10) || 0,
     registeredTeamsCount: parseInt(t.registered_teams_count, 10) || 0,
     teamsCount: parseInt(t.registered_teams_count, 10) || 0,
+    totalViews: parseInt(t.total_views, 10) || 0,
+    uniqueViewers: parseInt(t.unique_viewers, 10) || 0,
+    lastViewedAt: t.last_viewed_at || null,
     status: t.status,
     rules: t.rules,
+    createdBy: t.created_by,
+    venueOwnerId: t.venue_owner_id,
     hasAuction: Boolean(t.has_auction || t.auction_id),
     auctionId: t.auction_id || null,
     auctionStatus: t.auction_status || null,
@@ -1548,6 +1563,206 @@ const bulkAddTeamsToTournament = async (tournamentPublicId, { teamIds = [], grou
   };
 };
 
+/**
+ * 16. Get Tournament Deletion Impact Summary
+ */
+/**
+ * 16. Get Tournament Deletion Impact Summary
+ */
+const getTournamentDeleteImpact = async (tournamentId, user) => {
+  const isTournNum = /^\d+$/.test(String(tournamentId).trim());
+  const rows = await db.query(
+    'SELECT t.*, v.owner_id as venue_owner_id FROM tournaments t LEFT JOIN venues v ON t.venue_id = v.id WHERE t.uuid = ? OR (t.id = ? AND ? > 0)',
+    [tournamentId, isTournNum ? parseInt(tournamentId, 10) : -1, isTournNum ? parseInt(tournamentId, 10) : -1]
+  );
+  if (!rows || rows.length === 0) {
+    throw { statusCode: 404, message: 'Tournament not found' };
+  }
+  const tournament = rows[0];
+
+  const isSuperAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+  const isCreator = (tournament.created_by && String(tournament.created_by) === String(user.id)) ||
+                    (tournament.venue_owner_id && String(tournament.venue_owner_id) === String(user.id));
+
+  if (!isSuperAdmin && !isCreator) {
+    throw { statusCode: 403, message: 'Access denied. Only the tournament creator or a superadmin can delete this tournament.' };
+  }
+
+  // Count matches
+  const matchRows = await db.query(
+    `SELECT 
+       COUNT(*) as total_matches,
+       SUM(CASE WHEN status = 'LIVE' THEN 1 ELSE 0 END) as live_matches,
+       SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed_matches,
+       SUM(CASE WHEN status = 'SCHEDULED' THEN 1 ELSE 0 END) as scheduled_matches
+     FROM tournament_matches WHERE tournament_id = ?`,
+    [tournament.id]
+  );
+  const matchStats = matchRows[0] || {};
+
+  // Count teams
+  const teamRows = await db.query(
+    'SELECT COUNT(*) as registered_teams FROM tournament_teams WHERE tournament_id = ?',
+    [tournament.id]
+  );
+
+  // Count player registrations
+  const playerRows = await db.query(
+    'SELECT COUNT(*) as registered_players FROM tournament_player_registrations WHERE tournament_id = ?',
+    [tournament.id]
+  );
+
+  // Count auction items if any
+  const auctionRows = await db.query(
+    'SELECT COUNT(*) as auction_count FROM tournament_auctions WHERE tournament_id = ?',
+    [tournament.id]
+  );
+
+  const impactData = {
+    tournament: {
+      id: tournament.uuid,
+      name: tournament.name,
+      status: tournament.status,
+      startDate: tournament.start_date,
+      format: tournament.format
+    },
+    matches: {
+      total: parseInt(matchStats.total_matches, 10) || 0,
+      live: parseInt(matchStats.live_matches, 10) || 0,
+      completed: parseInt(matchStats.completed_matches, 10) || 0,
+      scheduled: parseInt(matchStats.scheduled_matches, 10) || 0
+    },
+    teamsCount: parseInt(teamRows[0]?.registered_teams, 10) || 0,
+    playerRegistrationsCount: parseInt(playerRows[0]?.registered_players, 10) || 0,
+    auctionCount: parseInt(auctionRows[0]?.auction_count, 10) || 0,
+    hasActiveMatches: (parseInt(matchStats.live_matches, 10) || 0) > 0,
+    hasCompletedRecords: (parseInt(matchStats.completed_matches, 10) || 0) > 0
+  };
+
+  return {
+    success: true,
+    data: impactData,
+    ...impactData
+  };
+};
+
+/**
+ * 17. Safely delete tournament and all dependent child records in a transaction
+ */
+const deleteTournament = async ({ tournamentId, user, force = false }) => {
+  const isTournNum = /^\d+$/.test(String(tournamentId).trim());
+  const rows = await db.query(
+    'SELECT t.*, v.owner_id as venue_owner_id FROM tournaments t LEFT JOIN venues v ON t.venue_id = v.id WHERE t.uuid = ? OR (t.id = ? AND ? > 0)',
+    [tournamentId, isTournNum ? parseInt(tournamentId, 10) : -1, isTournNum ? parseInt(tournamentId, 10) : -1]
+  );
+  if (!rows || rows.length === 0) {
+    throw { statusCode: 404, message: 'Tournament not found' };
+  }
+  const tournament = rows[0];
+
+  const isSuperAdmin = user.role === 'ADMIN' || user.role === 'SUPER_ADMIN';
+  const isCreator = (tournament.created_by && String(tournament.created_by) === String(user.id)) ||
+                    (tournament.venue_owner_id && String(tournament.venue_owner_id) === String(user.id));
+
+  if (!isSuperAdmin && !isCreator) {
+    throw { statusCode: 403, message: 'Access denied. Only the tournament creator or a superadmin can delete this tournament.' };
+  }
+
+  // Safety safeguard if live matches exist and force is not set
+  const [liveCheck] = await db.query(
+    "SELECT COUNT(*) as live_count FROM tournament_matches WHERE tournament_id = ? AND status = 'LIVE'",
+    [tournament.id]
+  );
+  if (liveCheck?.live_count > 0 && !force) {
+    return {
+      success: false,
+      requiresConfirmation: true,
+      message: `Tournament "${tournament.name}" currently has ${liveCheck.live_count} active LIVE match(es). Ending live matches is required or confirm force deletion to proceed.`
+    };
+  }
+
+  // Run full deletion cascade inside db.transaction
+  await db.transaction(async (conn) => {
+    const tId = tournament.id;
+
+    // 1. Get all matches belonging to tournament
+    const matchesRes = await conn.query('SELECT id FROM tournament_matches WHERE tournament_id = ?', [tId]);
+    const matchesList = Array.isArray(matchesRes[0]) ? matchesRes[0] : matchesRes;
+    const matchIds = Array.isArray(matchesList) ? matchesList.map(m => m.id).filter(Boolean) : [];
+
+    if (matchIds.length > 0) {
+      const matchInClause = matchIds.join(',');
+      await conn.query(`DELETE FROM cricket_balls WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM cricket_innings WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM cricket_matches WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM match_players WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM score_events WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM score_corrections WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM pickleball_score_logs WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM sport_match_events WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM scoring_undo_audit WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM match_mentions WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM tournament_scorers WHERE tournament_id = ? OR match_id IN (${matchInClause})`, [tId]);
+      await conn.query('DELETE FROM tournament_matches WHERE tournament_id = ?', [tId]);
+    } else {
+      await conn.query('DELETE FROM tournament_scorers WHERE tournament_id = ?', [tId]);
+      await conn.query('DELETE FROM tournament_matches WHERE tournament_id = ?', [tId]);
+    }
+
+    // 2. Clean up auction records if any
+    const auctionsRes = await conn.query('SELECT id FROM tournament_auctions WHERE tournament_id = ?', [tId]);
+    const auctionsList = Array.isArray(auctionsRes[0]) ? auctionsRes[0] : auctionsRes;
+    const auctionIds = Array.isArray(auctionsList) ? auctionsList.map(a => a.id).filter(Boolean) : [];
+    if (auctionIds.length > 0) {
+      const auctionInClause = auctionIds.join(',');
+      await conn.query(`DELETE FROM auction_audit_logs WHERE auction_id IN (${auctionInClause})`);
+      await conn.query(`DELETE FROM auction_bids WHERE auction_id IN (${auctionInClause})`);
+      await conn.query(`DELETE FROM auction_squads WHERE auction_id IN (${auctionInClause})`);
+      await conn.query(`DELETE FROM auction_players WHERE auction_id IN (${auctionInClause})`);
+      await conn.query(`DELETE FROM auction_teams WHERE auction_id IN (${auctionInClause})`);
+      await conn.query(`DELETE FROM auction_categories WHERE auction_id IN (${auctionInClause})`);
+      await conn.query('DELETE FROM tournament_auctions WHERE tournament_id = ?', [tId]);
+    }
+
+    // 3. Clean up points table, rounds, awards, registrations
+    await conn.query('DELETE FROM points_table WHERE tournament_id = ?', [tId]);
+    await conn.query('DELETE FROM tournament_rounds WHERE tournament_id = ?', [tId]);
+    await conn.query('DELETE FROM tournament_awards WHERE tournament_id = ?', [tId]);
+    await conn.query('DELETE FROM tournament_player_registrations WHERE tournament_id = ?', [tId]);
+    await conn.query('DELETE FROM tournament_player_registration_configs WHERE tournament_id = ?', [tId]);
+    await conn.query('DELETE FROM tournament_teams WHERE tournament_id = ?', [tId]);
+    await conn.query('DELETE FROM tv_displays WHERE tournament_id = ?', [tId]);
+    await conn.query('DELETE FROM tournament_audit_logs WHERE tournament_id = ?', [tId]);
+
+    // 4. Safely unlink advertisements and teams without deleting the teams themselves
+    await conn.query('UPDATE advertisements SET tournament_id = NULL WHERE tournament_id = ?', [tId]);
+    await conn.query('UPDATE teams SET tournament_id = NULL WHERE tournament_id = ?', [tId]);
+
+    // 5. Delete tournament record
+    await conn.query('DELETE FROM tournaments WHERE id = ?', [tId]);
+  });
+
+  // Real-time broadcast
+  try {
+    const { getIO } = require('./socketService');
+    const io = getIO();
+    if (io) {
+      io.emit('tournament:deleted', {
+        tournamentId: tournament.uuid,
+        id: tournament.id,
+        name: tournament.name
+      });
+    }
+  } catch (wsErr) {
+    console.warn('WebSocket broadcast error on delete:', wsErr);
+  }
+
+  return {
+    success: true,
+    message: `Tournament "${tournament.name}" deleted successfully.`
+  };
+};
+
 module.exports = {
   getTournamentsPaginated,
   getTournamentByPublicId,
@@ -1564,5 +1779,7 @@ module.exports = {
   removePlayerFromTournamentTeamRoster,
   updateTournamentMatchDisplay,
   bulkUpdateTournamentMatchesDisplay,
-  updateTournamentCourtColor
+  updateTournamentCourtColor,
+  getTournamentDeleteImpact,
+  deleteTournament
 };

@@ -22,9 +22,9 @@ async function searchUsers(query) {
 /**
  * Get all assigned scorers for a tournament
  */
-async function getTournamentScorers(tournamentId) {
+async function getTournamentScorers(tournamentId, user = null) {
   const [tournament] = await db.query(
-    'SELECT id, uuid, name FROM tournaments WHERE uuid = ? OR id = ?',
+    'SELECT id, uuid, name, created_by FROM tournaments WHERE uuid = ? OR id = ?',
     [tournamentId, isNaN(tournamentId) ? -1 : parseInt(tournamentId, 10)]
   );
   if (!tournament) throw { statusCode: 404, message: 'Tournament not found' };
@@ -56,24 +56,39 @@ async function getTournamentScorers(tournamentId) {
     [tournament.id]
   );
 
-  return rows.map(r => ({
-    assignmentId: r.assignment_id,
-    tournamentId: r.tournament_id,
-    userId: r.user_id,
-    userPublicId: r.user_public_id,
-    fullName: r.full_name,
-    email: r.email,
-    phone: r.phone,
-    avatarUrl: r.avatar_url,
-    matchId: r.match_id,
-    matchPublicId: r.match_public_id,
-    matchNumber: r.match_number,
-    matchCategory: r.match_category,
-    teamAName: r.team_a_name,
-    teamBName: r.team_b_name,
-    scope: r.match_id ? `Match #${r.match_number}: ${r.team_a_name || 'Team A'} vs ${r.team_b_name || 'Team B'}` : 'All Matches (Tournament-Wide)',
-    assignedAt: r.created_at
-  }));
+  const userRole = (user?.role || '').toUpperCase();
+  const isSuperAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
+  const isOrganizer = Boolean(
+    user && (
+      isSuperAdmin ||
+      Number(user.id) === Number(tournament.created_by) ||
+      Number(user.id) === Number(tournament.creator_id)
+    )
+  );
+
+  return rows.map(r => {
+    const isSelf = user && Number(user.id) === Number(r.user_id);
+    const canSeeContact = isOrganizer || isSelf;
+
+    return {
+      assignmentId: r.assignment_id,
+      tournamentId: r.tournament_id,
+      userId: r.user_id,
+      userPublicId: r.user_public_id,
+      fullName: r.full_name,
+      email: canSeeContact ? r.email : null,
+      phone: canSeeContact ? r.phone : null,
+      avatarUrl: r.avatar_url,
+      matchId: r.match_id,
+      matchPublicId: r.match_public_id,
+      matchNumber: r.match_number,
+      matchCategory: r.match_category,
+      teamAName: r.team_a_name,
+      teamBName: r.team_b_name,
+      scope: r.match_id ? `Match #${r.match_number}: ${r.team_a_name || 'Team A'} vs ${r.team_b_name || 'Team B'}` : 'All Matches (Tournament-Wide)',
+      assignedAt: r.created_at
+    };
+  });
 }
 
 /**

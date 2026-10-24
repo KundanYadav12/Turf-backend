@@ -572,13 +572,18 @@ function broadcastBadmintonEvent(match, payload) {
   const enrichedPayload = {
     matchId: match.uuid,
     eventSeq,
+    timestamp: Date.now(),
     ...payload
   };
 
   io.to(matchRoom).emit('match:badmintonEvent', enrichedPayload);
+  io.to(matchRoom).emit('match:badmintonPoint', enrichedPayload);
   io.to(matchRoom).emit('match:ballEvent', enrichedPayload);
+  io.to(matchRoom).emit('score:updated', enrichedPayload);
+  io.to(matchRoom).emit('match:pointScored', enrichedPayload);
+  io.emit('signage:pointScored', enrichedPayload);
 
-  io.to(tourneyRoom).emit('tournament:matchUpdated', {
+  const summaryPayload = {
     matchId: match.uuid,
     status: payload.status || match.status,
     liveScoreSummary: payload.scoreSummary || match.live_score_summary,
@@ -587,8 +592,12 @@ function broadcastBadmintonEvent(match, payload) {
     eventSeq,
     type: payload.type || 'POINT',
     scoringSide: payload.scoringSide,
-    celebration: payload.celebration || (payload.isMatchPoint ? 'MATCH_POINT' : (payload.isGamePoint ? 'GAME_POINT' : null))
-  });
+    celebration: payload.celebration || (payload.isMatchPoint ? 'MATCH_POINT' : (payload.isGamePoint ? 'GAME_POINT' : null)),
+    timestamp: enrichedPayload.timestamp
+  };
+
+  io.to(tourneyRoom).emit('tournament:matchUpdated', summaryPayload);
+  io.emit('signage:matchUpdate', summaryPayload);
 }
 
 module.exports = {

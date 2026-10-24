@@ -17,6 +17,14 @@ const DEFAULT_PORTRAIT_ZONE_SETTINGS = {
   sidebarsMode: 'STRIP'    // 'STRIP' or 'HIDDEN'
 };
 
+// Sensible defaults for mobile live viewer ad strips (backward-compatible)
+const DEFAULT_MOBILE_ZONE_SETTINGS = {
+  topHeight: 64,           // in px (range: 36-150)
+  bottomHeight: 56,        // in px (range: 36-120)
+  topSpeed: 50,            // in px/sec (range: 15-150)
+  bottomSpeed: 40          // in px/sec (range: 15-150)
+};
+
 // Authoritative real-time playback state
 let playbackState = {
   adsEnabled: true,
@@ -30,6 +38,8 @@ let playbackState = {
   venueZoneSettings: {}, // venueId -> { topHeight, leftWidth, rightWidth, bottomHeight }
   portraitZoneSettings: { ...DEFAULT_PORTRAIT_ZONE_SETTINGS },
   venuePortraitZoneSettings: {}, // venueId -> { topHeight, bottomHeight, sidebarStripHeight, sidebarsMode }
+  mobileZoneSettings: { ...DEFAULT_MOBILE_ZONE_SETTINGS },
+  venueMobileZoneSettings: {}, // venueId -> { topHeight, bottomHeight, topSpeed, bottomSpeed }
   updatedAt: new Date().toISOString()
 };
 
@@ -126,13 +136,29 @@ const controlPlayback = (action, payload = {}) => {
     case 'UPDATE_ZONE_SIZES':
     case 'SET_ZONE_SIZES': {
       const venueId = payload.venueId;
+      const isMobile = Boolean(payload.isMobile || payload.orientation === 'MOBILE');
       const isPortrait = Boolean(payload.isPortrait || payload.orientation === 'PORTRAIT');
       const targetSizes = payload.sizes || { ...payload };
       delete targetSizes.venueId;
       delete targetSizes.isPortrait;
+      delete targetSizes.isMobile;
       delete targetSizes.orientation;
 
-      if (isPortrait) {
+      if (isMobile) {
+        if (venueId && venueId !== 'ALL' && venueId !== 'GLOBAL') {
+          const vKey = String(venueId);
+          playbackState.venueMobileZoneSettings[vKey] = {
+            ...DEFAULT_MOBILE_ZONE_SETTINGS,
+            ...(playbackState.venueMobileZoneSettings[vKey] || {}),
+            ...targetSizes
+          };
+        } else {
+          playbackState.mobileZoneSettings = {
+            ...playbackState.mobileZoneSettings,
+            ...targetSizes
+          };
+        }
+      } else if (isPortrait) {
         if (venueId && venueId !== 'ALL' && venueId !== 'GLOBAL') {
           const vKey = String(venueId);
           playbackState.venuePortraitZoneSettings[vKey] = {
@@ -168,8 +194,29 @@ const controlPlayback = (action, payload = {}) => {
     }
 
     case 'RESET_ZONE_SIZE': {
-      const { venueId, zone, isPortrait } = payload;
-      if (isPortrait) {
+      const { venueId, zone, isPortrait, isMobile, orientation } = payload;
+      const checkMobile = Boolean(isMobile || orientation === 'MOBILE');
+      const checkPortrait = Boolean(isPortrait || orientation === 'PORTRAIT');
+
+      if (checkMobile) {
+        if (venueId && venueId !== 'ALL' && venueId !== 'GLOBAL') {
+          const vKey = String(venueId);
+          if (zone && zone !== 'ALL' && playbackState.venueMobileZoneSettings[vKey]) {
+            delete playbackState.venueMobileZoneSettings[vKey][zone];
+            if (Object.keys(playbackState.venueMobileZoneSettings[vKey]).length === 0) {
+              delete playbackState.venueMobileZoneSettings[vKey];
+            }
+          } else {
+            delete playbackState.venueMobileZoneSettings[vKey];
+          }
+        } else {
+          if (zone && zone !== 'ALL' && DEFAULT_MOBILE_ZONE_SETTINGS[zone] !== undefined) {
+            playbackState.mobileZoneSettings[zone] = DEFAULT_MOBILE_ZONE_SETTINGS[zone];
+          } else {
+            playbackState.mobileZoneSettings = { ...DEFAULT_MOBILE_ZONE_SETTINGS };
+          }
+        }
+      } else if (checkPortrait) {
         if (venueId && venueId !== 'ALL' && venueId !== 'GLOBAL') {
           const vKey = String(venueId);
           if (zone && zone !== 'ALL' && playbackState.venuePortraitZoneSettings[vKey]) {
@@ -252,28 +299,53 @@ const formatAd = (row) => {
     tournamentIds = [row.tournament_id];
   }
 
-  const validPositions = ['TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS', 'COURT'];
-  const position = validPositions.includes(row.position) ? row.position : 'TOP';
+  let devices = ['MOBILE', 'TV', 'SIGNAGE'];
+  if (row.devices) {
+    if (typeof row.devices === 'string') {
+      try {
+        devices = JSON.parse(row.devices);
+      } catch (e) {
+        devices = ['MOBILE', 'TV', 'SIGNAGE'];
+      }
+    } else if (Array.isArray(row.devices)) {
+      devices = row.devices;
+    }
+  } else if (row.device_target && row.device_target !== 'ALL') {
+    devices = [row.device_target];
+  }
+
+  const validPositions = ['TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS', 'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM'];
+  const rawPos = (row.position || '').toUpperCase();
+  const position = validPositions.includes(rawPos) ? rawPos : 'TOP';
 
   return {
     id: row.id,
     title: row.title || row.name,
+    description: row.description || '',
+    linkUrl: row.link_url || '',
     imageUrl: row.image_url,
     position,
-    width: row.width || (position === 'LEFT' || position === 'RIGHT' ? '240px' : '100%'),
-    height: row.height || (position === 'TOP' ? '80px' : position === 'BOTTOM' ? '48px' : 'auto'),
+    width: row.width || (position === 'LEFT' || position === 'RIGHT' ? '240px' : position === 'COURT_MIDDLE' ? '80px' : '100%'),
+    height: row.height || (
+      position === 'TOP' ? '80px' :
+      position === 'BOTTOM' ? '48px' :
+      position === 'COURT_MIDDLE' ? '240px' :
+      position === 'MOBILE_TOP' ? '64px' :
+      position === 'MOBILE_BOTTOM' ? '56px' : 'auto'
+    ),
     sizePreset: row.size_preset || 'RESPONSIVE',
-    imageFit: row.image_fit || 'contain',
+    imageFit: row.image_fit || (position === 'COURT_MIDDLE' ? 'cover' : 'contain'),
     motionType: row.motion_type || (row.display_mode === 'MOTION' ? 'SCROLL' : 'STATIC'),
     movementDirection: row.movement_direction || (row.scroll_direction === 'LEFT_TO_RIGHT' ? 'LEFT_TO_RIGHT' : 'RIGHT_TO_LEFT'),
     displayMode: row.display_mode || (position === 'TOP' ? 'STATIC' : 'MOTION'),
     status: row.status || 'ACTIVE',
     sortOrder: row.sort_order ?? row.priority ?? 0,
-    speed: parseInt(row.speed || row.scroll_speed || 25, 10),
+    speed: parseInt(row.speed || row.scroll_speed || (position === 'MOBILE_TOP' ? 50 : position === 'MOBILE_BOTTOM' ? 40 : 25), 10),
     slideInterval: parseInt(row.slide_interval || 6, 10),
     pauseOnHover: row.pause_on_hover === 1 || row.pause_on_hover === true || row.pause_on_hover === undefined,
     targetPage: row.target_page || 'ALL',
     deviceTarget: row.device_target || 'ALL',
+    devices: Array.isArray(devices) && devices.length > 0 ? devices : ['MOBILE', 'TV', 'SIGNAGE'],
     venueIds: Array.isArray(venueIds) ? venueIds.map(Number).filter(n => !isNaN(n)) : [],
     tournamentIds: Array.isArray(tournamentIds) ? tournamentIds.map(Number).filter(n => !isNaN(n)) : [],
     startDate: row.start_date,
@@ -286,11 +358,11 @@ const formatAd = (row) => {
 };
 
 /**
- * Get active ads for signage display and other pages.
+ * Get active ads for signage display, mobile live viewer, and other pages.
  * Resolves tournament-specific vs global ad priority:
  * Tournament-specific ad -> Global ad -> No advertisement
  */
-const getActiveAds = async ({ tournamentId, venueId } = {}) => {
+const getActiveAds = async ({ tournamentId, venueId, device } = {}) => {
   let resolvedTournId = null;
   let resolvedVenueId = venueId ? parseInt(venueId, 10) : null;
 
@@ -327,21 +399,31 @@ const getActiveAds = async ({ tournamentId, venueId } = {}) => {
 
   let activeAds = allActiveRows.map(formatAd);
 
+  // Filter by device if specified (MOBILE, TV, SIGNAGE)
+  if (device && device !== 'ALL') {
+    const devUpper = device.toUpperCase();
+    activeAds = activeAds.filter(a => {
+      if (!a.devices || a.devices.length === 0 || a.devices.includes('ALL')) return true;
+      return a.devices.includes(devUpper);
+    });
+  }
+
   // Filter by venueId if resolvedVenueId is present
   if (resolvedVenueId) {
     activeAds = activeAds.filter(a => !a.venueIds || a.venueIds.length === 0 || a.venueIds.includes(resolvedVenueId));
   }
 
-  // Display rule (Module H): show an ad only if (tournamentIds is empty OR includes current tournament)
+  // Display rule: match current tournament OR all tournaments
   if (resolvedTournId) {
     activeAds = activeAds.filter(a => !a.tournamentIds || a.tournamentIds.length === 0 || a.tournamentIds.includes(resolvedTournId));
   }
 
-  // Helper to prioritize tournament-specific ads over global ads
+  // Resolution rule: show tournament-specific ads first, then rotate in the rest by display order
   const resolvePositionPriority = (ads) => {
     if (resolvedTournId) {
       const tournAds = ads.filter(a => a.tournamentIds && a.tournamentIds.includes(resolvedTournId));
-      return tournAds.length > 0 ? tournAds : ads.filter(a => !a.tournamentIds || a.tournamentIds.length === 0);
+      const allTournAds = ads.filter(a => !a.tournamentIds || a.tournamentIds.length === 0);
+      return [...tournAds, ...allTournAds];
     }
     return ads.filter(a => !a.tournamentIds || a.tournamentIds.length === 0);
   };
@@ -352,6 +434,9 @@ const getActiveAds = async ({ tournamentId, venueId } = {}) => {
   let leftAds = resolvePositionPriority(activeAds.filter(a => a.position === 'LEFT' || a.position === 'BOTH_SIDEBARS'));
   let rightAds = resolvePositionPriority(activeAds.filter(a => a.position === 'RIGHT' || a.position === 'BOTH_SIDEBARS'));
   let courtAds = resolvePositionPriority(activeAds.filter(a => a.position === 'COURT'));
+  let courtMiddleAds = resolvePositionPriority(activeAds.filter(a => a.position === 'COURT_MIDDLE'));
+  let mobileTopAds = resolvePositionPriority(activeAds.filter(a => a.position === 'MOBILE_TOP'));
+  let mobileBottomAds = resolvePositionPriority(activeAds.filter(a => a.position === 'MOBILE_BOTTOM'));
 
   const vKey = resolvedVenueId ? String(resolvedVenueId) : null;
   const resolvedZoneSettings = vKey && playbackState.venueZoneSettings[vKey]
@@ -362,17 +447,26 @@ const getActiveAds = async ({ tournamentId, venueId } = {}) => {
     ? { ...DEFAULT_PORTRAIT_ZONE_SETTINGS, ...playbackState.portraitZoneSettings, ...playbackState.venuePortraitZoneSettings[vKey] }
     : { ...DEFAULT_PORTRAIT_ZONE_SETTINGS, ...playbackState.portraitZoneSettings };
 
+  const resolvedMobileZoneSettings = vKey && playbackState.venueMobileZoneSettings?.[vKey]
+    ? { ...DEFAULT_MOBILE_ZONE_SETTINGS, ...playbackState.mobileZoneSettings, ...playbackState.venueMobileZoneSettings[vKey] }
+    : { ...DEFAULT_MOBILE_ZONE_SETTINGS, ...playbackState.mobileZoneSettings };
+
   return {
     state: getPlaybackState(),
     zoneSettings: resolvedZoneSettings,
     venueZoneSettings: playbackState.venueZoneSettings,
     portraitZoneSettings: resolvedPortraitZoneSettings,
     venuePortraitZoneSettings: playbackState.venuePortraitZoneSettings,
+    mobileZoneSettings: resolvedMobileZoneSettings,
+    venueMobileZoneSettings: playbackState.venueMobileZoneSettings,
     topAds,
     bottomAds,
     leftAds,
     rightAds,
     courtAds,
+    courtMiddleAds,
+    mobileTopAds,
+    mobileBottomAds,
     allActiveAds: activeAds
   };
 };
@@ -393,7 +487,10 @@ const getAllAds = async () => {
         WHEN 'BOTH_SIDEBARS' THEN 4
         WHEN 'BOTTOM' THEN 5
         WHEN 'COURT' THEN 6
-        ELSE 7
+        WHEN 'COURT_MIDDLE' THEN 7
+        WHEN 'MOBILE_TOP' THEN 8
+        WHEN 'MOBILE_BOTTOM' THEN 9
+        ELSE 10
       END,
       a.sort_order ASC, a.id DESC
   `);
@@ -408,32 +505,56 @@ const getAllAds = async () => {
  */
 const createAd = async (adData, userId = null) => {
   const title = adData.title || adData.name || 'Advertisement';
+  const description = adData.description || null;
+  const linkUrl = adData.linkUrl || adData.link_url || null;
   const imageUrl = adData.imageUrl || adData.image_url;
   
-  const validPositions = ['TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS', 'COURT'];
-  const position = validPositions.includes(adData.position) ? adData.position : 'TOP';
+  const validPositions = ['TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS', 'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM'];
+  const posUpper = (adData.position || '').toUpperCase();
+  const position = validPositions.includes(posUpper) ? posUpper : 'TOP';
 
-  const width = adData.width || (position === 'LEFT' || position === 'RIGHT' ? '240px' : position === 'COURT' ? '50%' : '100%');
-  const height = adData.height || (position === 'TOP' ? '80px' : position === 'BOTTOM' ? '48px' : position === 'COURT' ? '80%' : 'auto');
+  const width = adData.width || (position === 'LEFT' || position === 'RIGHT' ? '240px' : position === 'COURT' ? '50%' : position === 'COURT_MIDDLE' ? '80px' : '100%');
+  const height = adData.height || (
+    position === 'TOP' ? '80px' :
+    position === 'BOTTOM' ? '48px' :
+    position === 'COURT' ? '80%' :
+    position === 'COURT_MIDDLE' ? '240px' :
+    position === 'MOBILE_TOP' ? '64px' :
+    position === 'MOBILE_BOTTOM' ? '56px' : 'auto'
+  );
   const sizePreset = adData.sizePreset || adData.size_preset || 'RESPONSIVE';
-  const imageFit = ['contain', 'cover', 'fill', 'scale-down'].includes(adData.imageFit) ? adData.imageFit : 'contain';
+  const imageFit = ['contain', 'cover', 'fill', 'scale-down'].includes(adData.imageFit) ? adData.imageFit : (position === 'COURT_MIDDLE' ? 'cover' : 'contain');
 
   const validMotionTypes = ['STATIC', 'SCROLL', 'SLIDE', 'CAROUSEL', 'MARQUEE', 'CROSSFADE'];
   const motionType = validMotionTypes.includes(adData.motionType)
     ? adData.motionType
-    : (position === 'BOTTOM' ? 'SCROLL' : 'STATIC');
+    : (position === 'BOTTOM' || position === 'MOBILE_TOP' || position === 'MOBILE_BOTTOM' ? 'SCROLL' : 'STATIC');
 
   const validDirections = ['RIGHT_TO_LEFT', 'LEFT_TO_RIGHT', 'BOTTOM_TO_TOP', 'TOP_TO_BOTTOM'];
   const movementDirection = validDirections.includes(adData.movementDirection)
     ? adData.movementDirection
-    : (position === 'LEFT' || position === 'RIGHT' ? 'BOTTOM_TO_TOP' : 'RIGHT_TO_LEFT');
+    : (position === 'LEFT' || position === 'RIGHT' ? 'BOTTOM_TO_TOP' :
+       position === 'MOBILE_BOTTOM' ? 'LEFT_TO_RIGHT' : 'RIGHT_TO_LEFT');
 
   const displayMode = motionType === 'STATIC' ? 'STATIC' : 'MOTION';
-  const speed = parseInt(adData.speed || adData.scrollSpeed || 25, 10);
+  const speed = parseInt(adData.speed || adData.scrollSpeed || (position === 'MOBILE_TOP' ? 50 : position === 'MOBILE_BOTTOM' ? 40 : 25), 10);
   const slideInterval = parseInt(adData.slideInterval || 6, 10);
   const pauseOnHover = adData.pauseOnHover === false || adData.pauseOnHover === 'false' || adData.pauseOnHover === 0 ? 0 : 1;
   const targetPage = adData.targetPage || 'ALL';
   const deviceTarget = adData.deviceTarget || 'ALL';
+
+  let devices = ['MOBILE', 'TV', 'SIGNAGE'];
+  if (adData.devices) {
+    if (typeof adData.devices === 'string') {
+      try { devices = JSON.parse(adData.devices); }
+      catch (e) { devices = adData.devices.split(',').map(s => s.trim().toUpperCase()); }
+    } else if (Array.isArray(adData.devices)) {
+      devices = adData.devices;
+    }
+  } else if (adData.deviceTarget && adData.deviceTarget !== 'ALL') {
+    devices = [adData.deviceTarget];
+  }
+  const devicesJson = JSON.stringify(devices);
 
   let venueIds = [];
   if (adData.venueIds) {
@@ -473,9 +594,9 @@ const createAd = async (adData, userId = null) => {
 
   const result = await db.query(
     `INSERT INTO advertisements 
-     (title, name, image_url, width, height, size_preset, image_fit, position, display_mode, motion_type, movement_direction, speed, scroll_speed, slide_interval, pause_on_hover, venue_ids, tournament_ids, target_page, device_target, status, sort_order, priority, start_date, end_date, tournament_id, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [title, title, imageUrl, width, height, sizePreset, imageFit, position, displayMode, motionType, movementDirection, speed, speed, slideInterval, pauseOnHover, venueIdsJson, tournamentIdsJson, targetPage, deviceTarget, status, sortOrder, sortOrder, startDate, endDate, tournamentId, userId]
+     (title, name, description, link_url, image_url, width, height, size_preset, image_fit, position, display_mode, motion_type, movement_direction, speed, scroll_speed, slide_interval, pause_on_hover, venue_ids, tournament_ids, target_page, device_target, devices, status, sort_order, priority, start_date, end_date, tournament_id, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [title, title, description, linkUrl, imageUrl, width, height, sizePreset, imageFit, position, displayMode, motionType, movementDirection, speed, speed, slideInterval, pauseOnHover, venueIdsJson, tournamentIdsJson, targetPage, deviceTarget, devicesJson, status, sortOrder, sortOrder, startDate, endDate, tournamentId, userId]
   );
 
   const insertedId = result.insertId;
@@ -499,13 +620,18 @@ const updateAd = async (id, adData) => {
   }
 
   const title = adData.title !== undefined ? adData.title : (existing.title || existing.name);
+  const description = adData.description !== undefined ? adData.description : existing.description;
+  const linkUrl = (adData.linkUrl !== undefined || adData.link_url !== undefined)
+    ? (adData.linkUrl !== undefined ? adData.linkUrl : adData.link_url)
+    : existing.link_url;
   const imageUrl = adData.imageUrl || adData.image_url || existing.image_url;
-  const validPositions = ['TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS', 'COURT'];
-  const position = adData.position && validPositions.includes(adData.position) ? adData.position : (existing.position || 'TOP');
-  const width = adData.width !== undefined ? adData.width : (existing.width || '100%');
-  const height = adData.height !== undefined ? adData.height : (existing.height || 'auto');
+  const validPositions = ['TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS', 'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM'];
+  const posUpper = (adData.position || '').toUpperCase();
+  const position = posUpper && validPositions.includes(posUpper) ? posUpper : (existing.position || 'TOP');
+  const width = adData.width !== undefined ? adData.width : (existing.width || (position === 'COURT_MIDDLE' ? '80px' : '100%'));
+  const height = adData.height !== undefined ? adData.height : (existing.height || (position === 'COURT_MIDDLE' ? '240px' : 'auto'));
   const sizePreset = adData.sizePreset || adData.size_preset || existing.size_preset || 'RESPONSIVE';
-  const imageFit = adData.imageFit || adData.image_fit || existing.image_fit || 'contain';
+  const imageFit = adData.imageFit || adData.image_fit || existing.image_fit || (position === 'COURT_MIDDLE' ? 'cover' : 'contain');
   const motionType = adData.motionType || adData.motion_type || existing.motion_type || 'STATIC';
   const movementDirection = adData.movementDirection || adData.movement_direction || existing.movement_direction || 'RIGHT_TO_LEFT';
   const displayMode = motionType === 'STATIC' ? 'STATIC' : 'MOTION';
@@ -514,6 +640,18 @@ const updateAd = async (id, adData) => {
   const pauseOnHover = adData.pauseOnHover !== undefined ? (adData.pauseOnHover ? 1 : 0) : (existing.pause_on_hover ?? 1);
   const targetPage = adData.targetPage !== undefined ? adData.targetPage : (existing.target_page || 'ALL');
   const deviceTarget = adData.deviceTarget !== undefined ? adData.deviceTarget : (existing.device_target || 'ALL');
+
+  let devicesJson = existing.devices;
+  if (adData.devices !== undefined) {
+    let devices = ['MOBILE', 'TV', 'SIGNAGE'];
+    if (typeof adData.devices === 'string') {
+      try { devices = JSON.parse(adData.devices); }
+      catch (e) { devices = adData.devices.split(',').map(s => s.trim().toUpperCase()); }
+    } else if (Array.isArray(adData.devices)) {
+      devices = adData.devices;
+    }
+    devicesJson = JSON.stringify(devices);
+  }
 
   let venueIdsJson = existing.venue_ids;
   if (adData.venueIds !== undefined) {
@@ -557,12 +695,12 @@ const updateAd = async (id, adData) => {
 
   await db.query(
     `UPDATE advertisements
-     SET title = ?, name = ?, image_url = ?, width = ?, height = ?, size_preset = ?, image_fit = ?,
+     SET title = ?, name = ?, description = ?, link_url = ?, image_url = ?, width = ?, height = ?, size_preset = ?, image_fit = ?,
          position = ?, display_mode = ?, motion_type = ?, movement_direction = ?, speed = ?, scroll_speed = ?,
-         slide_interval = ?, pause_on_hover = ?, venue_ids = ?, tournament_ids = ?, target_page = ?, device_target = ?, status = ?,
+         slide_interval = ?, pause_on_hover = ?, venue_ids = ?, tournament_ids = ?, target_page = ?, device_target = ?, devices = ?, status = ?,
          sort_order = ?, priority = ?, start_date = ?, end_date = ?, tournament_id = ?
      WHERE id = ?`,
-    [title, title, imageUrl, width, height, sizePreset, imageFit, position, displayMode, motionType, movementDirection, speed, speed, slideInterval, pauseOnHover, venueIdsJson, tournamentIdsJson, targetPage, deviceTarget, status, sortOrder, sortOrder, startDate, endDate, tournamentId, id]
+    [title, title, description, linkUrl, imageUrl, width, height, sizePreset, imageFit, position, displayMode, motionType, movementDirection, speed, speed, slideInterval, pauseOnHover, venueIdsJson, tournamentIdsJson, targetPage, deviceTarget, devicesJson, status, sortOrder, sortOrder, startDate, endDate, tournamentId, id]
   );
 
   const [updatedRow] = await db.query('SELECT * FROM advertisements WHERE id = ?', [id]);

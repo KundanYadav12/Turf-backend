@@ -38,4 +38,15 @@ router.get('/my-registrations', authenticateUser, async (req, res, next) => {
   }
 });
 
+// 9. User Live Streaming Assignments (Protected: Self)
+const streamPermissionService = require('../services/streamPermissionService');
+router.get('/my-streaming-assignments', authenticateUser, async (req, res, next) => {
+  try {
+    const data = await streamPermissionService.getUserStreamingAssignments(req.user.id);
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;

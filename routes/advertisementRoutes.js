@@ -5,14 +5,38 @@ const { authenticateUser } = require('../middleware/authMiddleware');
 const { authorizeRoles } = require('../middleware/rbacMiddleware');
 const upload = require('../middleware/multerMiddleware');
 
-// 1. GET /api/advertisements/active - Public signage active ads feed
+// 1. GET /api/advertisements/active - Public signage, TV & mobile active ads feed
 router.get('/active', async (req, res, next) => {
   try {
     const data = await advertisementService.getActiveAds({
       tournamentId: req.query.tournamentId,
-      venueId: req.query.venueId
+      venueId: req.query.venueId,
+      device: req.query.device
     });
     res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 1b. GET /api/advertisements/mobile - Dedicated public mobile ads endpoint
+router.get('/mobile', async (req, res, next) => {
+  try {
+    const data = await advertisementService.getActiveAds({
+      tournamentId: req.query.tournamentId,
+      venueId: req.query.venueId,
+      device: 'MOBILE'
+    });
+    res.json({
+      success: true,
+      data: {
+        mobileTopAds: data.mobileTopAds || [],
+        mobileBottomAds: data.mobileBottomAds || [],
+        courtMiddleAds: data.courtMiddleAds || [],
+        mobileZoneSettings: data.mobileZoneSettings || {},
+        state: data.state || {}
+      }
+    });
   } catch (error) {
     next(error);
   }

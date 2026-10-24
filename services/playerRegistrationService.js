@@ -461,7 +461,35 @@ const getTournamentPlayerRegistrations = async (tournamentPublicId, arg2, arg3) 
     params
   );
 
+  const userRole = (user?.role || '').toUpperCase();
+  const isSuperAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
+  const isOrganizer = Boolean(
+    user && (
+      isSuperAdmin ||
+      Number(user.id) === Number(tournament.created_by) ||
+      Number(user.id) === Number(tournament.creator_id) ||
+      Number(user.id) === Number(tournament.venue_owner_id)
+    )
+  );
+
   return rows.map(r => {
+    // For non-organizers and public visitors: sanitize sensitive personal data (phone, email, address, Aadhaar)
+    if (!isOrganizer) {
+      return {
+        id: r.uuid,
+        internalId: r.id,
+        fullName: r.full_name,
+        photoUrl: r.photo_url,
+        preferredRole: r.preferred_role,
+        playingHand: r.playing_hand,
+        preferredTeam: r.preferred_team_id ? { id: r.preferred_team_id, name: r.preferred_team_name } : null,
+        assignedTeam: r.assigned_team_id ? { id: r.assigned_team_id, name: r.assigned_team_name } : null,
+        jerseySize: r.jersey_size,
+        status: r.status,
+        createdAt: r.created_at
+      };
+    }
+
     let customFields = {};
     try {
       customFields = typeof r.custom_fields_data === 'string'

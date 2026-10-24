@@ -4,7 +4,12 @@ const adminController = require('../controllers/adminController');
 const { authenticateUser } = require('../middleware/authMiddleware');
 const { authorizeRoles } = require('../middleware/rbacMiddleware');
 
-router.use(authenticateUser, authorizeRoles('ADMIN'));
+router.use(authenticateUser, authorizeRoles('ADMIN', 'SUPER_ADMIN'));
+
+// Tournament View Analytics Super Admin Insights
+const tournamentAnalyticsController = require('../controllers/tournamentAnalyticsController');
+router.get('/tournament-analytics', tournamentAnalyticsController.getSuperadminOverview);
+router.get('/tournament-analytics/:id', tournamentAnalyticsController.getSuperadminTournamentDetail);
 
 router.get('/dashboard', adminController.getAdminDashboardStats);
 router.get('/users', adminController.getUsers);

@@ -1057,7 +1057,8 @@ const recordDelivery = async ({
       subtext,
       commentary: autoCommentary,
       overCompleted,
-      state
+      state,
+      tournamentId: m.tournament_public_id
     });
 
     return {

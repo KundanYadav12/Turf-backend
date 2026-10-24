@@ -9,7 +9,8 @@ const migrations = [
   'migrate_module_f.js',
   'migrate_module_g.js',
   'migrate_module_i.js',
-  'migrate_module_j.js'
+  'migrate_module_j.js',
+  'migrate_tournament_analytics.js'
 ];
 
 console.log('🚀 Starting Turf Database Migration Runner...');

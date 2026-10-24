@@ -746,7 +746,7 @@ const startMatch = async (matchId, user) => {
 /**
  * 10. Record Point (+1 to Team A or Team B).
  */
-const recordPoint = async (matchId, { pointTo, notes = 'Point scored' }, user) => {
+const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = null, to = null, eventId = null, seq = null }, user) => {
   const m = await getMatchEntity(matchId);
   if (!m) {
     throw { statusCode: 404, message: 'Match not found.' };
@@ -832,10 +832,29 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored' }, user) =
 
   const state = await getScorerState(m.uuid);
 
+  const pointEvent = {
+    type: 'POINT_SCORED',
+    matchId: m.uuid,
+    tournamentId: m.tournament_uuid,
+    eventId: eventId || `pt-${m.id}-${nextSeq}-${Date.now()}`,
+    seq: seq || nextSeq,
+    from: from || {
+      side: 'left',
+      box: (m.team_a_score || 0) % 2 === 0 ? 'bottom' : 'top',
+      boxName: (m.team_a_score || 0) % 2 === 0 ? 'bottom-left' : 'top-left'
+    },
+    to: to || {
+      side: 'right',
+      box: (m.team_a_score || 0) % 2 === 0 ? 'top' : 'bottom',
+      boxName: (m.team_a_score || 0) % 2 === 0 ? 'top-right' : 'bottom-right'
+    },
+    timestamp: Date.now()
+  };
+
   // Broadcast real-time
   broadcastPickleballScore(m.uuid, m.tournament_uuid, {
     status: newStatus,
-    type: 'POINT',
+    type: 'POINT_SCORED',
     eventSeq: nextSeq,
     teamAScore: newScoreA,
     teamBScore: newScoreB,
@@ -843,7 +862,8 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored' }, user) =
     winnerTeamId,
     resultSummary,
     isCompleted,
-    state
+    state,
+    pointEvent
   });
 
   return state;
