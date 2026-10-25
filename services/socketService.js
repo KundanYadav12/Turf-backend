@@ -8,6 +8,7 @@ function initSocket(server) {
   const { Server } = require('socket.io');
   const { TRUSTED_ORIGINS } = require('../config/siteConfig');
   const io = new Server(server, {
+    addTrailingSlash: false,
     cors: {
       origin: (origin, callback) => {
         if (!origin) return callback(null, true);

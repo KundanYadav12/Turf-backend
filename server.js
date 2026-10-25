@@ -34,6 +34,21 @@ const { APP_URL, API_PUBLIC_URL, PORT: CONFIG_PORT, TRUSTED_ORIGINS } = require(
 
 const app = express();
 const server = http.createServer(app);
+
+// Prepend listener on HTTP server so Socket.IO / Engine.IO accepts requests
+// with or without trailing slash (e.g. /socket.io vs /socket.io/)
+server.prependListener('request', (req, res) => {
+  if (req.url === '/socket.io' || req.url.startsWith('/socket.io?')) {
+    req.url = req.url.replace('/socket.io', '/socket.io/');
+  }
+});
+
+server.prependListener('upgrade', (req, socket, head) => {
+  if (req.url === '/socket.io' || req.url.startsWith('/socket.io?')) {
+    req.url = req.url.replace('/socket.io', '/socket.io/');
+  }
+});
+
 const io = initSocket(server);
 const PORT = process.env.PORT || CONFIG_PORT || 5008;
 
