@@ -383,176 +383,24 @@ const generateFixtures = async (tournamentId, { mode = 'ROUND_ROBIN', customMatc
  * 5. Compute authoritative Group Standings.
  * Ranking Rules:
  *  1. Matches Won (DESC)
- *  2. Points Scored (PF) (DESC)
+ *  2. Higher Points Scored (PF) (DESC)
  *  3. Head-to-Head between tied teams
  *  4. Point Difference (PD) (DESC)
  *  5. Team Name (ASC)
  */
-const recalculateStandings = async (internalTournamentId) => {
-  // 1. Fetch all teams in tournament
-  const teams = await db.query(
-    `SELECT tm.id as team_id, tm.uuid as team_uuid, tm.name as team_name, tm.logo_url,
-            COALESCE(tt.group_name, 'Group 1') as group_name
-     FROM tournament_teams tt
-     JOIN teams tm ON tt.team_id = tm.id
-     WHERE tt.tournament_id = ? AND tt.registration_status = 'APPROVED'`,
-    [internalTournamentId]
-  );
-
-  // 2. Fetch all COMPLETED matches
-  const completedMatches = await db.query(
-    `SELECT id, team_a_id, team_b_id, team_a_score, team_b_score, winner_team_id, group_name
-     FROM tournament_matches
-     WHERE tournament_id = ? AND status = 'COMPLETED'`,
-    [internalTournamentId]
-  );
-
-  // 3. Aggregate stats per team
-  const statsMap = {};
-  teams.forEach(t => {
-    statsMap[t.team_id] = {
-      teamId: t.team_uuid,
-      internalId: t.team_id,
-      teamName: t.team_name,
-      logoUrl: t.logo_url,
-      groupName: t.group_name,
-      played: 0,
-      won: 0,
-      lost: 0,
-      pointsScored: 0,
-      pointsConceded: 0,
-      pointDifference: 0,
-      points: 0
-    };
-  });
-
-  completedMatches.forEach(m => {
-    const a = statsMap[m.team_a_id];
-    const b = statsMap[m.team_b_id];
-    const aScore = m.team_a_score || 0;
-    const bScore = m.team_b_score || 0;
-
-    if (a) {
-      a.played += 1;
-      a.pointsScored += aScore;
-      a.pointsConceded += bScore;
-      if (m.winner_team_id === m.team_a_id) {
-        a.won += 1;
-        a.points += 2;
-      } else if (m.winner_team_id === m.team_b_id) {
-        a.lost += 1;
-      }
-    }
-
-    if (b) {
-      b.played += 1;
-      b.pointsScored += bScore;
-      b.pointsConceded += aScore;
-      if (m.winner_team_id === m.team_b_id) {
-        b.won += 1;
-        b.points += 2;
-      } else if (m.winner_team_id === m.team_a_id) {
-        b.lost += 1;
-      }
-    }
-  });
-
-  // Calculate point difference
-  Object.values(statsMap).forEach(s => {
-    s.pointDifference = s.pointsScored - s.pointsConceded;
-  });
-
-  // 4. Group teams and sort
-  const groups = {};
-  Object.values(statsMap).forEach(s => {
-    if (!groups[s.groupName]) groups[s.groupName] = [];
-    groups[s.groupName].push(s);
-  });
-
-  const finalStandings = {};
-
-  for (const groupName of Object.keys(groups)) {
-    const list = groups[groupName];
-
-    list.sort((x, y) => {
-      // Rule 1: Matches won
-      if (y.won !== x.won) return y.won - x.won;
-
-      // Rule 2: Higher points scored (PF)
-      if (y.pointsScored !== x.pointsScored) return y.pointsScored - x.pointsScored;
-
-      // Rule 3: Head-to-Head between x and y
-      const h2h = completedMatches.find(m =>
-        (m.team_a_id === x.internalId && m.team_b_id === y.internalId) ||
-        (m.team_a_id === y.internalId && m.team_b_id === x.internalId)
-      );
-      if (h2h && h2h.winner_team_id) {
-        if (h2h.winner_team_id === x.internalId) return -1;
-        if (h2h.winner_team_id === y.internalId) return 1;
-      }
-
-      // Rule 4: Better point difference (PD)
-      if (y.pointDifference !== x.pointDifference) return y.pointDifference - x.pointDifference;
-
-      // Rule 5: Team name alphabetical
-      return x.teamName.localeCompare(y.teamName);
-    });
-
-    // Assign rank and sync with points_table in database
-    list.forEach((team, idx) => {
-      team.rank = idx + 1;
-    });
-
-    finalStandings[groupName] = list;
-
-    // Sync into `points_table`
-    for (const t of list) {
-      await db.query(
-        `INSERT INTO points_table (
-          tournament_id, team_id, matches_played, won, lost, points,
-          group_name, points_scored, points_conceded, point_difference
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON DUPLICATE KEY UPDATE 
-          matches_played = VALUES(matches_played),
-          won = VALUES(won),
-          lost = VALUES(lost),
-          points = VALUES(points),
-          group_name = VALUES(group_name),
-          points_scored = VALUES(points_scored),
-          points_conceded = VALUES(points_conceded),
-          point_difference = VALUES(point_difference)`,
-        [
-          internalTournamentId, t.internalId, t.played, t.won, t.lost, t.points,
-          groupName, t.pointsScored, t.pointsConceded, t.pointDifference
-        ]
-      );
-    }
-  }
-
-  return finalStandings;
+const recalculateStandings = async (internalTournamentId, options = {}) => {
+  const tournamentEngineService = require('./tournamentEngineService');
+  await tournamentEngineService.recalculateStandings(internalTournamentId, options);
+  const data = await tournamentEngineService.getTournamentStandings(internalTournamentId);
+  return data.groups || data.standings || {};
 };
 
 /**
  * 6. Get tournament standings by tournament public ID.
  */
 const getTournamentStandings = async (tournamentId) => {
-  const tournament = await getTournamentEntity(tournamentId);
-  if (!tournament) {
-    throw { statusCode: 404, message: 'Tournament not found.' };
-  }
-
-  const standings = await recalculateStandings(tournament.id);
-  return {
-    tournamentId: tournament.uuid,
-    tournamentName: tournament.name,
-    rankingRules: [
-      'Rule 1: Most matches won',
-      'Rule 2: Higher cumulative points scored (PF)',
-      'Rule 3: Head-to-head match result between tied teams',
-      'Rule 4: Better point difference (PD)'
-    ],
-    standings
-  };
+  const tournamentEngineService = require('./tournamentEngineService');
+  return await tournamentEngineService.getTournamentStandings(tournamentId);
 };
 
 /**
@@ -747,6 +595,12 @@ const startMatch = async (matchId, user) => {
  * 10. Record Point (+1 to Team A or Team B).
  */
 const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = null, to = null, eventId = null, seq = null }, user) => {
+  // Auto-end match break when live scoring resumes
+  try {
+    const matchBreakService = require('./matchBreakService');
+    matchBreakService.endBreak(matchId).catch(() => {});
+  } catch (e) {}
+
   const m = await getMatchEntity(matchId);
   if (!m) {
     throw { statusCode: 404, message: 'Match not found.' };
@@ -825,8 +679,12 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = nu
     [m.id, nextSeq, pointTo, newScoreA, newScoreB, user ? user.id : null, notes]
   );
 
-  // Recalculate standings if completed
+  // Recalculate standings if completed and auto-clear any break
   if (isCompleted) {
+    try {
+      const matchBreakService = require('./matchBreakService');
+      matchBreakService.endBreak(m.id).catch(() => {});
+    } catch (e) {}
     await recalculateStandings(m.tournament_id);
   }
 
@@ -996,6 +854,12 @@ const correctScore = async (matchId, { teamAScore, teamBScore, notes = 'Score Co
   );
 
   await recalculateStandings(m.tournament_id);
+  if (isCompleted) {
+    try {
+      const matchBreakService = require('./matchBreakService');
+      matchBreakService.endBreak(m.id).catch(() => {});
+    } catch (e) {}
+  }
 
   broadcastPickleballScore(m.uuid, m.tournament_uuid, {
     status: newStatus,

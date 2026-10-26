@@ -185,6 +185,36 @@ function initSocket(server) {
             viewerCount: actualViewerCount
           });
         }
+
+        // Deliver active match break state to late joiner immediately
+        try {
+          const matchBreakService = require('./matchBreakService');
+          matchBreakService.getBreakState(matchId).then((breakState) => {
+            if (breakState && breakState.isBreak) {
+              socket.emit('stream:break_state', breakState);
+              socket.emit('match:break_updated', breakState);
+            }
+          }).catch(() => {});
+        } catch (e) {}
+      }
+    });
+
+    // Match Break real-time socket events
+    socket.on('stream:break:start', async ({ matchId, reason, durationMinutes }) => {
+      if (matchId) {
+        try {
+          const matchBreakService = require('./matchBreakService');
+          await matchBreakService.startBreak(matchId, { reason, durationMinutes });
+        } catch (e) {}
+      }
+    });
+
+    socket.on('stream:break:end', async ({ matchId }) => {
+      if (matchId) {
+        try {
+          const matchBreakService = require('./matchBreakService');
+          await matchBreakService.endBreak(matchId);
+        } catch (e) {}
       }
     });
 

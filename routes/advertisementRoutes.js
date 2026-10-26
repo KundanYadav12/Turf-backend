@@ -42,6 +42,23 @@ router.get('/mobile', async (req, res, next) => {
   }
 });
 
+// 1c. GET /api/advertisements/stream - Dedicated public live stream viewer ads endpoint
+router.get('/stream', async (req, res, next) => {
+  try {
+    const data = await advertisementService.getStreamAds({
+      matchId: req.query.matchId,
+      tournamentId: req.query.tournamentId,
+      venueId: req.query.venueId
+    });
+    res.json({
+      success: true,
+      data
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // 2. GET /api/advertisements/state - Public signage ad playback state
 router.get('/state', (req, res) => {
   res.json({

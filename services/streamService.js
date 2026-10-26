@@ -549,6 +549,10 @@ async function updateStreamStatus(matchId, user, { status }) {
   }
   if (status === 'ENDED') {
     actualEnd = new Date();
+    try {
+      const matchBreakService = require('./matchBreakService');
+      matchBreakService.endBreak(match.public_id || matchId).catch(() => {});
+    } catch (e) {}
   }
 
   await db.query(
@@ -821,6 +825,10 @@ async function autoEndStreamOnDisconnect(matchId) {
     );
     try {
       await db.query('UPDATE tournament_matches SET has_live_stream = 0 WHERE id = ?', [match.id]);
+    } catch (e) {}
+    try {
+      const matchBreakService = require('./matchBreakService');
+      matchBreakService.endBreak(match.public_id || matchId).catch(() => {});
     } catch (e) {}
 
     const io = getIO();

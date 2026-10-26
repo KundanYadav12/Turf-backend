@@ -400,6 +400,70 @@ router.get('/:id/standings', async (req, res, next) => {
   }
 });
 
+// 13a. POST /api/tournaments/:id/standings/freeze - Freeze or Unfreeze tournament standings
+router.post('/:id/standings/freeze', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
+  try {
+    const db = require('../config/database');
+    const { getIO } = require('../services/socketService');
+    const tournament = await tournamentService.getTournamentByPublicId(req.params.id);
+    if (!tournament) return res.status(404).json({ success: false, message: 'Tournament not found' });
+
+    // Determine target freeze state (toggle if unspecified)
+    const currentFrozen = Boolean(tournament.is_standings_frozen);
+    const targetFrozen = req.body?.freeze !== undefined ? Boolean(req.body.freeze) : !currentFrozen;
+
+    // Update tournaments and points_table
+    await db.query('UPDATE tournaments SET is_standings_frozen = ? WHERE id = ?', [targetFrozen ? 1 : 0, tournament.id]);
+    await db.query('UPDATE points_table SET is_frozen = ? WHERE tournament_id = ?', [targetFrozen ? 1 : 0, tournament.id]);
+
+    // If unfreezing and forceRecalc requested, recalculate
+    if (!targetFrozen && req.body?.recalculate) {
+      await tournamentEngineService.recalculateStandings(tournament.id, { force: true });
+    }
+
+    const updatedData = await tournamentEngineService.getTournamentStandings(tournament.id);
+
+    const io = getIO();
+    if (io) {
+      io.to(`tournament:${tournament.uuid}`).emit('tournament:standingsUpdated', {
+        tournamentId: tournament.uuid,
+        isFrozen: targetFrozen,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    res.json({
+      success: true,
+      message: targetFrozen 
+        ? 'Tournament points table has been successfully FROZEN. Official final standings are permanently locked.' 
+        : 'Tournament points table unfrozen. Standings will dynamically update with matches.',
+      isFrozen: targetFrozen,
+      data: updatedData
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 13b. POST /api/tournaments/:id/standings/recalculate - Force recalculate tournament standings
+router.post('/:id/standings/recalculate', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
+  try {
+    const tournament = await tournamentService.getTournamentByPublicId(req.params.id);
+    if (!tournament) return res.status(404).json({ success: false, message: 'Tournament not found' });
+
+    await tournamentEngineService.recalculateStandings(tournament.id, { force: true });
+    const data = await tournamentEngineService.getTournamentStandings(tournament.id);
+
+    res.json({
+      success: true,
+      message: 'Points table standings successfully recalculated.',
+      data
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // 14. GET /api/tournaments/:id/awards - Tournament Awards & Leaderboards
 router.get('/:id/awards', async (req, res, next) => {
   try {

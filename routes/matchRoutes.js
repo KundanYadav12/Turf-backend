@@ -86,6 +86,71 @@ router.get('/:id/ads', async (req, res, next) => {
   }
 });
 
+// 3b. MATCH BREAK MANAGEMENT (Timeout, Interval, Game break, Technical, Other)
+const matchBreakService = require('../services/matchBreakService');
+
+async function checkBreakPermission(req, res, next) {
+  try {
+    const matchId = req.params.id;
+    if (!req.user) {
+      return res.status(401).json({ success: false, message: 'Authentication required.' });
+    }
+    const roleUpper = String(req.user.role || '').toUpperCase();
+    if (roleUpper === 'ADMIN' || roleUpper === 'SUPER_ADMIN') {
+      return next();
+    }
+    const { checkUserCanScoreMatch } = require('../services/scorerAccessService');
+    const canScore = await checkUserCanScoreMatch({
+      userId: req.user.id,
+      userRole: req.user.role,
+      matchPublicOrInternalId: matchId
+    });
+    if (canScore) return next();
+
+    const streamService = require('../services/streamService');
+    const canStream = await streamService.checkStreamPermission(matchId, req.user);
+    if (canStream) return next();
+
+    return res.status(403).json({
+      success: false,
+      message: 'Forbidden: You do not have permission to manage breaks for this match.'
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/matches/:id/break - Get current break status (Public)
+router.get('/:id/break', async (req, res, next) => {
+  try {
+    const data = await matchBreakService.getBreakState(req.params.id);
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/matches/:id/break/start - Start match break
+router.post('/:id/break/start', authenticateUser, checkBreakPermission, async (req, res, next) => {
+  try {
+    const { reason, durationMinutes } = req.body;
+    const data = await matchBreakService.startBreak(req.params.id, { reason, durationMinutes }, req.user);
+    res.json({ success: true, message: `Match break started (${data.reason}).`, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/matches/:id/break/end - End match break
+router.post('/:id/break/end', authenticateUser, checkBreakPermission, async (req, res, next) => {
+  try {
+    const data = await matchBreakService.endBreak(req.params.id, req.user);
+    res.json({ success: true, message: 'Match break ended. Live play resumed.', data });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // 4. GET /api/matches/:id/scorer - Full Scorer Console State (Protected: Scorer / Owner / Admin)
 router.get('/:id/scorer', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {

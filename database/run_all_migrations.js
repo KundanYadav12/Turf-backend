@@ -12,7 +12,8 @@ const migrations = [
   'migrate_module_j.js',
   'migrate_tournament_analytics.js',
   'migrate_match_streams.js',
-  'migrate_tournament_stream_permissions.js'
+  'migrate_tournament_stream_permissions.js',
+  'seed_superadmin.js'
 ];
 
 console.log('🚀 Starting Turf Database Migration Runner...');

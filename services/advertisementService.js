@@ -25,6 +25,19 @@ const DEFAULT_MOBILE_ZONE_SETTINGS = {
   bottomSpeed: 40          // in px/sec (range: 15-150)
 };
 
+// Sensible defaults for live stream viewer display zones (backward-compatible)
+const DEFAULT_STREAM_ZONE_SETTINGS = {
+  topHeight: 48,          // in px (range: 24-120)
+  bottomHeight: 52,       // in px (range: 24-120)
+  leftWidth: 140,         // in px (range: 60-260)
+  rightWidth: 140,        // in px (range: 60-260)
+  topSpeed: 45,           // in px/sec (range: 15-120)
+  bottomSpeed: 45,        // in px/sec (range: 15-120)
+  rotateInterval: 6,      // in seconds (range: 3-20)
+  breakInterval: 5,       // in seconds (range: 3-15)
+  hideSidebarsOnMobile: true
+};
+
 // Authoritative real-time playback state
 let playbackState = {
   adsEnabled: true,
@@ -40,6 +53,8 @@ let playbackState = {
   venuePortraitZoneSettings: {}, // venueId -> { topHeight, bottomHeight, sidebarStripHeight, sidebarsMode }
   mobileZoneSettings: { ...DEFAULT_MOBILE_ZONE_SETTINGS },
   venueMobileZoneSettings: {}, // venueId -> { topHeight, bottomHeight, topSpeed, bottomSpeed }
+  streamZoneSettings: { ...DEFAULT_STREAM_ZONE_SETTINGS },
+  venueStreamZoneSettings: {}, // venueId -> { topHeight, bottomHeight, leftWidth, rightWidth, topSpeed, bottomSpeed, rotateInterval, breakInterval, hideSidebarsOnMobile }
   updatedAt: new Date().toISOString()
 };
 
@@ -138,13 +153,29 @@ const controlPlayback = (action, payload = {}) => {
       const venueId = payload.venueId;
       const isMobile = Boolean(payload.isMobile || payload.orientation === 'MOBILE');
       const isPortrait = Boolean(payload.isPortrait || payload.orientation === 'PORTRAIT');
+      const isStream = Boolean(payload.isStream || payload.orientation === 'STREAM');
       const targetSizes = payload.sizes || { ...payload };
       delete targetSizes.venueId;
       delete targetSizes.isPortrait;
       delete targetSizes.isMobile;
+      delete targetSizes.isStream;
       delete targetSizes.orientation;
 
-      if (isMobile) {
+      if (isStream) {
+        if (venueId && venueId !== 'ALL' && venueId !== 'GLOBAL') {
+          const vKey = String(venueId);
+          playbackState.venueStreamZoneSettings[vKey] = {
+            ...DEFAULT_STREAM_ZONE_SETTINGS,
+            ...(playbackState.venueStreamZoneSettings[vKey] || {}),
+            ...targetSizes
+          };
+        } else {
+          playbackState.streamZoneSettings = {
+            ...playbackState.streamZoneSettings,
+            ...targetSizes
+          };
+        }
+      } else if (isMobile) {
         if (venueId && venueId !== 'ALL' && venueId !== 'GLOBAL') {
           const vKey = String(venueId);
           playbackState.venueMobileZoneSettings[vKey] = {
@@ -194,11 +225,30 @@ const controlPlayback = (action, payload = {}) => {
     }
 
     case 'RESET_ZONE_SIZE': {
-      const { venueId, zone, isPortrait, isMobile, orientation } = payload;
+      const { venueId, zone, isPortrait, isMobile, isStream, orientation } = payload;
+      const checkStream = Boolean(isStream || orientation === 'STREAM');
       const checkMobile = Boolean(isMobile || orientation === 'MOBILE');
       const checkPortrait = Boolean(isPortrait || orientation === 'PORTRAIT');
 
-      if (checkMobile) {
+      if (checkStream) {
+        if (venueId && venueId !== 'ALL' && venueId !== 'GLOBAL') {
+          const vKey = String(venueId);
+          if (zone && zone !== 'ALL' && playbackState.venueStreamZoneSettings[vKey]) {
+            delete playbackState.venueStreamZoneSettings[vKey][zone];
+            if (Object.keys(playbackState.venueStreamZoneSettings[vKey]).length === 0) {
+              delete playbackState.venueStreamZoneSettings[vKey];
+            }
+          } else {
+            delete playbackState.venueStreamZoneSettings[vKey];
+          }
+        } else {
+          if (zone && zone !== 'ALL' && DEFAULT_STREAM_ZONE_SETTINGS[zone] !== undefined) {
+            playbackState.streamZoneSettings[zone] = DEFAULT_STREAM_ZONE_SETTINGS[zone];
+          } else {
+            playbackState.streamZoneSettings = { ...DEFAULT_STREAM_ZONE_SETTINGS };
+          }
+        }
+      } else if (checkMobile) {
         if (venueId && venueId !== 'ALL' && venueId !== 'GLOBAL') {
           const vKey = String(venueId);
           if (zone && zone !== 'ALL' && playbackState.venueMobileZoneSettings[vKey]) {
@@ -314,7 +364,11 @@ const formatAd = (row) => {
     devices = [row.device_target];
   }
 
-  const validPositions = ['TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS', 'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM'];
+  const validPositions = [
+    'TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS',
+    'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM',
+    'STREAM_TOP', 'STREAM_BOTTOM', 'STREAM_LEFT', 'STREAM_RIGHT', 'STREAM_BREAK'
+  ];
   const rawPos = (row.position || '').toUpperCase();
   const position = validPositions.includes(rawPos) ? rawPos : 'TOP';
 
@@ -325,22 +379,37 @@ const formatAd = (row) => {
     linkUrl: row.link_url || '',
     imageUrl: row.image_url,
     position,
-    width: row.width || (position === 'LEFT' || position === 'RIGHT' ? '240px' : position === 'COURT_MIDDLE' ? '80px' : '100%'),
+    width: row.width || (
+      position === 'LEFT' || position === 'RIGHT' ? '240px' :
+      position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' ? '140px' :
+      position === 'COURT_MIDDLE' ? '80px' : '100%'
+    ),
     height: row.height || (
       position === 'TOP' ? '80px' :
       position === 'BOTTOM' ? '48px' :
+      position === 'STREAM_TOP' ? '48px' :
+      position === 'STREAM_BOTTOM' ? '52px' :
+      position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' || position === 'STREAM_BREAK' ? '100%' :
       position === 'COURT_MIDDLE' ? '240px' :
       position === 'MOBILE_TOP' ? '64px' :
       position === 'MOBILE_BOTTOM' ? '56px' : 'auto'
     ),
     sizePreset: row.size_preset || 'RESPONSIVE',
     imageFit: row.image_fit || (position === 'COURT_MIDDLE' ? 'cover' : 'contain'),
-    motionType: row.motion_type || (row.display_mode === 'MOTION' ? 'SCROLL' : 'STATIC'),
-    movementDirection: row.movement_direction || (row.scroll_direction === 'LEFT_TO_RIGHT' ? 'LEFT_TO_RIGHT' : 'RIGHT_TO_LEFT'),
+    motionType: row.motion_type || (
+      row.display_mode === 'MOTION' ? 'SCROLL' :
+      (position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' || position === 'STREAM_BREAK') ? 'CROSSFADE' :
+      'STATIC'
+    ),
+    movementDirection: row.movement_direction || (
+      (row.scroll_direction === 'LEFT_TO_RIGHT' || position === 'STREAM_BOTTOM' || position === 'MOBILE_BOTTOM')
+        ? 'LEFT_TO_RIGHT'
+        : 'RIGHT_TO_LEFT'
+    ),
     displayMode: row.display_mode || (position === 'TOP' ? 'STATIC' : 'MOTION'),
     status: row.status || 'ACTIVE',
     sortOrder: row.sort_order ?? row.priority ?? 0,
-    speed: parseInt(row.speed || row.scroll_speed || (position === 'MOBILE_TOP' ? 50 : position === 'MOBILE_BOTTOM' ? 40 : 25), 10),
+    speed: parseInt(row.speed || row.scroll_speed || (position === 'MOBILE_TOP' ? 50 : position === 'MOBILE_BOTTOM' ? 40 : position.startsWith('STREAM') ? 45 : 25), 10),
     slideInterval: parseInt(row.slide_interval || 6, 10),
     pauseOnHover: row.pause_on_hover === 1 || row.pause_on_hover === true || row.pause_on_hover === undefined,
     targetPage: row.target_page || 'ALL',
@@ -437,6 +506,11 @@ const getActiveAds = async ({ tournamentId, venueId, device } = {}) => {
   let courtMiddleAds = resolvePositionPriority(activeAds.filter(a => a.position === 'COURT_MIDDLE'));
   let mobileTopAds = resolvePositionPriority(activeAds.filter(a => a.position === 'MOBILE_TOP'));
   let mobileBottomAds = resolvePositionPriority(activeAds.filter(a => a.position === 'MOBILE_BOTTOM'));
+  let streamTopAds = resolvePositionPriority(activeAds.filter(a => a.position === 'STREAM_TOP'));
+  let streamBottomAds = resolvePositionPriority(activeAds.filter(a => a.position === 'STREAM_BOTTOM'));
+  let streamLeftAds = resolvePositionPriority(activeAds.filter(a => a.position === 'STREAM_LEFT'));
+  let streamRightAds = resolvePositionPriority(activeAds.filter(a => a.position === 'STREAM_RIGHT'));
+  let streamBreakAds = resolvePositionPriority(activeAds.filter(a => a.position === 'STREAM_BREAK'));
 
   const vKey = resolvedVenueId ? String(resolvedVenueId) : null;
   const resolvedZoneSettings = vKey && playbackState.venueZoneSettings[vKey]
@@ -451,6 +525,10 @@ const getActiveAds = async ({ tournamentId, venueId, device } = {}) => {
     ? { ...DEFAULT_MOBILE_ZONE_SETTINGS, ...playbackState.mobileZoneSettings, ...playbackState.venueMobileZoneSettings[vKey] }
     : { ...DEFAULT_MOBILE_ZONE_SETTINGS, ...playbackState.mobileZoneSettings };
 
+  const resolvedStreamZoneSettings = vKey && playbackState.venueStreamZoneSettings?.[vKey]
+    ? { ...DEFAULT_STREAM_ZONE_SETTINGS, ...playbackState.streamZoneSettings, ...playbackState.venueStreamZoneSettings[vKey] }
+    : { ...DEFAULT_STREAM_ZONE_SETTINGS, ...playbackState.streamZoneSettings };
+
   return {
     state: getPlaybackState(),
     zoneSettings: resolvedZoneSettings,
@@ -459,6 +537,8 @@ const getActiveAds = async ({ tournamentId, venueId, device } = {}) => {
     venuePortraitZoneSettings: playbackState.venuePortraitZoneSettings,
     mobileZoneSettings: resolvedMobileZoneSettings,
     venueMobileZoneSettings: playbackState.venueMobileZoneSettings,
+    streamZoneSettings: resolvedStreamZoneSettings,
+    venueStreamZoneSettings: playbackState.venueStreamZoneSettings,
     topAds,
     bottomAds,
     leftAds,
@@ -467,6 +547,11 @@ const getActiveAds = async ({ tournamentId, venueId, device } = {}) => {
     courtMiddleAds,
     mobileTopAds,
     mobileBottomAds,
+    streamTopAds,
+    streamBottomAds,
+    streamLeftAds,
+    streamRightAds,
+    streamBreakAds,
     allActiveAds: activeAds
   };
 };
@@ -490,7 +575,12 @@ const getAllAds = async () => {
         WHEN 'COURT_MIDDLE' THEN 7
         WHEN 'MOBILE_TOP' THEN 8
         WHEN 'MOBILE_BOTTOM' THEN 9
-        ELSE 10
+        WHEN 'STREAM_TOP' THEN 10
+        WHEN 'STREAM_BOTTOM' THEN 11
+        WHEN 'STREAM_LEFT' THEN 12
+        WHEN 'STREAM_RIGHT' THEN 13
+        WHEN 'STREAM_BREAK' THEN 14
+        ELSE 15
       END,
       a.sort_order ASC, a.id DESC
   `);
@@ -509,14 +599,26 @@ const createAd = async (adData, userId = null) => {
   const linkUrl = adData.linkUrl || adData.link_url || null;
   const imageUrl = adData.imageUrl || adData.image_url;
   
-  const validPositions = ['TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS', 'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM'];
+  const validPositions = [
+    'TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS',
+    'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM',
+    'STREAM_TOP', 'STREAM_BOTTOM', 'STREAM_LEFT', 'STREAM_RIGHT', 'STREAM_BREAK'
+  ];
   const posUpper = (adData.position || '').toUpperCase();
   const position = validPositions.includes(posUpper) ? posUpper : 'TOP';
 
-  const width = adData.width || (position === 'LEFT' || position === 'RIGHT' ? '240px' : position === 'COURT' ? '50%' : position === 'COURT_MIDDLE' ? '80px' : '100%');
+  const width = adData.width || (
+    position === 'LEFT' || position === 'RIGHT' ? '240px' :
+    position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' ? '140px' :
+    position === 'COURT' ? '50%' :
+    position === 'COURT_MIDDLE' ? '80px' : '100%'
+  );
   const height = adData.height || (
     position === 'TOP' ? '80px' :
     position === 'BOTTOM' ? '48px' :
+    position === 'STREAM_TOP' ? '48px' :
+    position === 'STREAM_BOTTOM' ? '52px' :
+    position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' || position === 'STREAM_BREAK' ? '100%' :
     position === 'COURT' ? '80%' :
     position === 'COURT_MIDDLE' ? '240px' :
     position === 'MOBILE_TOP' ? '64px' :
@@ -625,11 +727,28 @@ const updateAd = async (id, adData) => {
     ? (adData.linkUrl !== undefined ? adData.linkUrl : adData.link_url)
     : existing.link_url;
   const imageUrl = adData.imageUrl || adData.image_url || existing.image_url;
-  const validPositions = ['TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS', 'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM'];
+  const validPositions = [
+    'TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS',
+    'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM',
+    'STREAM_TOP', 'STREAM_BOTTOM', 'STREAM_LEFT', 'STREAM_RIGHT', 'STREAM_BREAK'
+  ];
   const posUpper = (adData.position || '').toUpperCase();
   const position = posUpper && validPositions.includes(posUpper) ? posUpper : (existing.position || 'TOP');
-  const width = adData.width !== undefined ? adData.width : (existing.width || (position === 'COURT_MIDDLE' ? '80px' : '100%'));
-  const height = adData.height !== undefined ? adData.height : (existing.height || (position === 'COURT_MIDDLE' ? '240px' : 'auto'));
+  const width = adData.width !== undefined ? adData.width : (
+    existing.width || (
+      position === 'COURT_MIDDLE' ? '80px' :
+      (position === 'STREAM_LEFT' || position === 'STREAM_RIGHT') ? '140px' : '100%'
+    )
+  );
+  const height = adData.height !== undefined ? adData.height : (
+    existing.height || (
+      position === 'COURT_MIDDLE' ? '240px' :
+      position === 'STREAM_TOP' ? '48px' :
+      position === 'STREAM_BOTTOM' ? '52px' :
+      (position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' || position === 'STREAM_BREAK') ? '100%' :
+      'auto'
+    )
+  );
   const sizePreset = adData.sizePreset || adData.size_preset || existing.size_preset || 'RESPONSIVE';
   const imageFit = adData.imageFit || adData.image_fit || existing.image_fit || (position === 'COURT_MIDDLE' ? 'cover' : 'contain');
   const motionType = adData.motionType || adData.motion_type || existing.motion_type || 'STATIC';
@@ -728,13 +847,52 @@ const deleteAd = async (id) => {
   return { success: true, id };
 };
 
+/**
+ * Dedicated public read endpoint for active live stream viewer ads
+ */
+const getStreamAds = async ({ matchId, tournamentId, venueId } = {}) => {
+  let resolvedTournId = tournamentId;
+  let resolvedVenueId = venueId;
+
+  if (matchId && (!resolvedTournId || !resolvedVenueId)) {
+    try {
+      const rows = await db.query(
+        `SELECT tournament_id, venue_id FROM tournament_matches WHERE uuid = ? OR id = ? LIMIT 1`,
+        [String(matchId), isNaN(matchId) ? 0 : parseInt(matchId, 10)]
+      );
+      if (rows.length > 0) {
+        if (!resolvedTournId) resolvedTournId = rows[0].tournament_id;
+        if (!resolvedVenueId) resolvedVenueId = rows[0].venue_id;
+      }
+    } catch (e) {}
+  }
+
+  const ads = await getActiveAds({
+    tournamentId: resolvedTournId,
+    venueId: resolvedVenueId,
+    device: 'STREAM'
+  });
+
+  return {
+    streamTopAds: ads.streamTopAds || [],
+    streamBottomAds: ads.streamBottomAds || [],
+    streamLeftAds: ads.streamLeftAds || [],
+    streamRightAds: ads.streamRightAds || [],
+    streamBreakAds: ads.streamBreakAds || [],
+    streamZoneSettings: ads.streamZoneSettings || { ...DEFAULT_STREAM_ZONE_SETTINGS },
+    state: ads.state || {}
+  };
+};
+
 module.exports = {
   getPlaybackState,
   controlPlayback,
   getActiveAds,
   getActiveAdsForSignage: getActiveAds,
+  getStreamAds,
   getAllAds,
   createAd,
   updateAd,
-  deleteAd
+  deleteAd,
+  DEFAULT_STREAM_ZONE_SETTINGS
 };

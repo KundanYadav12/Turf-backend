@@ -621,26 +621,38 @@ function oversToDecimal(overs) {
 
 /**
  * Authoritative Standings Recalculation Engine
- * Calculates sport-specific points, GD, NRR, game/point differentials and rankings.
+ * Calculates sport-specific points, GD, NRR, game/point differentials, rankings,
+ * and permanently preserves/freezes standings after tournament conclusion.
  */
-async function recalculateStandings(tournamentId) {
+async function recalculateStandings(tournamentId, options = {}) {
   const tournament = await getTournamentEntity(tournamentId);
   if (!tournament) return;
 
-  const sportConfig = getSportConfig(tournament.sport_slug);
-  const winPts = sportConfig.standingsFormula?.winPoints ?? 2;
+  const { force = false } = options;
+
+  // 0. Standings Freeze check: If standings are already frozen or tournament is COMPLETED,
+  // do not overwrite unless force is explicitly requested.
+  if (!force && (tournament.is_standings_frozen || tournament.status === 'COMPLETED')) {
+    console.log(`ℹ️ [recalculateStandings] Tournament #${tournament.id} standings are frozen. Skipping destructive recalculation.`);
+    return;
+  }
+
+  const sportSlug = tournament.sport_slug || 'cricket';
+  const sportConfig = getSportConfig(sportSlug);
+  const winPts = sportConfig.standingsFormula?.winPoints ?? (sportSlug === 'pickleball' ? 2 : 2);
   const drawPts = sportConfig.standingsFormula?.drawPoints ?? (sportConfig.standingsFormula?.tiePoints ?? 1);
   const lossPts = sportConfig.standingsFormula?.lossPoints ?? 0;
 
   // 1. Fetch all registered teams
   const teams = await db.query(
-    `SELECT tt.team_id, COALESCE(tt.group_name, 'Group 1') as group_name
+    `SELECT tt.team_id, tm.name as team_name, tm.uuid as team_uuid, COALESCE(tt.group_name, 'Group 1') as group_name
      FROM tournament_teams tt
+     JOIN teams tm ON tt.team_id = tm.id
      WHERE tt.tournament_id = ? AND tt.registration_status = 'APPROVED'`,
     [tournament.id]
   );
 
-  // 2. Fetch all completed group/league matches
+  // 2. Fetch all completed group/league matches (exclude knockout playoff matches from group standings)
   const matches = await db.query(
     `SELECT tm.*, 
             COALESCE(tm.team_a_score, 0) as score_a,
@@ -648,13 +660,29 @@ async function recalculateStandings(tournamentId) {
      FROM tournament_matches tm
      WHERE tm.tournament_id = ? 
        AND tm.status = 'COMPLETED'
-       AND (tm.counts_in_standings = 1 OR (tm.counts_in_standings IS NULL AND (tm.category = 'League' OR tm.category IS NULL)))`,
+       AND (tm.counts_in_standings = 1 OR tm.counts_in_standings IS NULL OR tm.category = 'League' OR tm.stage = 'GROUP')`,
     [tournament.id]
   );
 
+  // 2b. ANTI-ZEROING SAFETY GUARD:
+  // If no completed matches were found, but points_table already contains non-zero match records,
+  // do NOT wipe valid historical standings with all zeros!
+  if (matches.length === 0 && !force) {
+    const existingPts = await db.query(
+      `SELECT SUM(matches_played) as total_played, SUM(points) as total_points 
+       FROM points_table WHERE tournament_id = ?`,
+      [tournament.id]
+    );
+    const existingPlayed = Number(existingPts[0]?.total_played || 0);
+    if (existingPlayed > 0) {
+      console.warn(`⚠️ [recalculateStandings] Refusing to zero out non-zero standings table for tournament #${tournament.id} when 0 completed matches returned.`);
+      return;
+    }
+  }
+
   // Fetch cricket innings for completed matches if sport is cricket
   const cricketInningsMap = {};
-  if (tournament.sport_slug === 'cricket') {
+  if (sportSlug === 'cricket') {
     const inningsRows = await db.query(
       `SELECT ci.*, cm.total_overs as match_quota_overs
        FROM cricket_innings ci
@@ -675,6 +703,8 @@ async function recalculateStandings(tournamentId) {
   for (const t of teams) {
     statsMap[t.team_id] = {
       teamId: t.team_id,
+      teamUuid: t.team_uuid,
+      teamName: t.team_name,
       groupName: t.group_name,
       played: 0,
       won: 0,
@@ -721,14 +751,13 @@ async function recalculateStandings(tournamentId) {
     tB.pa += scoreA;
 
     // Cricket Innings data for Net Run Rate
-    if (tournament.sport_slug === 'cricket') {
+    if (sportSlug === 'cricket') {
       const innings = cricketInningsMap[m.id];
       if (innings && innings.length > 0) {
         for (const inn of innings) {
           const tBat = statsMap[inn.batting_team_id];
           const tBowl = statsMap[inn.bowling_team_id];
           const matchQuota = inn.match_quota_overs || 20;
-          // All-out rule: if 10 or more wickets lost, credited with full match quota overs
           const isAllOut = Number(inn.total_wickets) >= 10;
           const decOvers = oversToDecimal(inn.total_overs_bowled);
           const effectiveOvers = isAllOut ? matchQuota : decOvers;
@@ -771,13 +800,19 @@ async function recalculateStandings(tournamentId) {
       }
     }
 
-    // Win, Loss, Draw determination
-    if (m.winner_team_id === m.team_a_id) {
+    // Win, Loss, Draw determination with robust score fallback
+    let winnerId = m.winner_team_id;
+    if (!winnerId) {
+      if (scoreA > scoreB) winnerId = m.team_a_id;
+      else if (scoreB > scoreA) winnerId = m.team_b_id;
+    }
+
+    if (winnerId === m.team_a_id) {
       tA.won++;
       tA.points += winPts;
       tB.lost++;
       tB.points += lossPts;
-    } else if (m.winner_team_id === m.team_b_id) {
+    } else if (winnerId === m.team_b_id) {
       tB.won++;
       tB.points += winPts;
       tA.lost++;
@@ -796,7 +831,7 @@ async function recalculateStandings(tournamentId) {
     t.gd = t.gf - t.ga;
     t.pdiff = t.pf - t.pa;
 
-    if (tournament.sport_slug === 'cricket') {
+    if (sportSlug === 'cricket') {
       const runRateFor = t.oversFaced > 0 ? (t.runsScored / t.oversFaced) : 0;
       const runRateAgainst = t.oversBowled > 0 ? (t.runsConceded / t.oversBowled) : 0;
       const rawNrr = runRateFor - runRateAgainst;
@@ -804,14 +839,33 @@ async function recalculateStandings(tournamentId) {
     }
   }
 
-  // Update points_table in database with net_run_rate included
+  // Check tournament completion: if all scheduled tournament matches have concluded, freeze standings
+  const [matchCounts] = await db.query(
+    `SELECT 
+       COUNT(*) as total_fixtures,
+       SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed_fixtures,
+       SUM(CASE WHEN status NOT IN ('COMPLETED', 'CANCELLED') THEN 1 ELSE 0 END) as pending_fixtures
+     FROM tournament_matches
+     WHERE tournament_id = ?`,
+    [tournament.id]
+  );
+  const totalFixtures = Number(matchCounts?.total_fixtures || 0);
+  const pendingFixtures = Number(matchCounts?.pending_fixtures || 0);
+  const isFinished = totalFixtures > 0 && pendingFixtures === 0;
+  const shouldFreeze = Boolean(tournament.is_standings_frozen || tournament.status === 'COMPLETED' || isFinished);
+
+  if (shouldFreeze && !tournament.is_standings_frozen) {
+    await db.query(`UPDATE tournaments SET is_standings_frozen = 1 WHERE id = ?`, [tournament.id]);
+  }
+
+  // Update points_table in database with all metrics and freeze status
   for (const s of Object.values(statsMap)) {
     await db.query(
       `INSERT INTO points_table (
         tournament_id, team_id, matches_played, won, lost, tied, drawn,
         points, points_scored, points_conceded, point_difference,
-        goals_for, goals_against, goal_difference, sets_won, sets_lost, net_run_rate, group_name
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        goals_for, goals_against, goal_difference, sets_won, sets_lost, net_run_rate, group_name, is_frozen
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         matches_played = VALUES(matches_played),
         won = VALUES(won),
@@ -827,11 +881,13 @@ async function recalculateStandings(tournamentId) {
         goal_difference = VALUES(goal_difference),
         sets_won = VALUES(sets_won),
         sets_lost = VALUES(sets_lost),
-        net_run_rate = VALUES(net_run_rate)`,
+        net_run_rate = VALUES(net_run_rate),
+        group_name = VALUES(group_name),
+        is_frozen = VALUES(is_frozen)`,
       [
         tournament.id, s.teamId, s.played, s.won, s.lost, s.drawn, s.drawn,
         s.points, s.pf, s.pa, s.pdiff,
-        s.gf, s.ga, s.gd, s.setsWon, s.setsLost, s.nrr, s.groupName
+        s.gf, s.ga, s.gd, s.setsWon, s.setsLost, s.nrr, s.groupName, shouldFreeze ? 1 : 0
       ]
     );
   }
@@ -841,6 +897,7 @@ async function recalculateStandings(tournamentId) {
   if (io) {
     io.to(`tournament:${tournament.uuid}`).emit('tournament:standingsUpdated', {
       tournamentId: tournament.uuid,
+      isFrozen: shouldFreeze,
       timestamp: new Date().toISOString()
     });
   }
@@ -848,6 +905,7 @@ async function recalculateStandings(tournamentId) {
 
 /**
  * Returns tournament standings grouped by group_name with full rankings.
+ * Self-heals if rows are unpopulated, and maintains freeze stability after tournament.
  */
 async function getTournamentStandings(tournamentId) {
   const tournament = await getTournamentEntity(tournamentId);
@@ -857,9 +915,50 @@ async function getTournamentStandings(tournamentId) {
 
   const sportSlug = tournament.sport_slug || 'cricket';
 
-  // Order criteria by sport: Points DESC, then NRR/Diff DESC (highest first, positive above negative), then won DESC
+  // 1. Check if standings need self-healing recalculation
+  const [standingsMeta] = await db.query(
+    `SELECT COUNT(*) as row_count, 
+            COALESCE(SUM(matches_played), 0) as total_played, 
+            COALESCE(SUM(points), 0) as total_points,
+            COALESCE(MAX(is_frozen), 0) as any_frozen
+     FROM points_table WHERE tournament_id = ?`,
+    [tournament.id]
+  );
+  const [completedMatchMeta] = await db.query(
+    `SELECT COUNT(*) as completed_count 
+     FROM tournament_matches 
+     WHERE tournament_id = ? AND status = 'COMPLETED'`,
+    [tournament.id]
+  );
+  const completedCount = Number(completedMatchMeta?.completed_count || 0);
+  const totalPlayed = Number(standingsMeta?.total_played || 0);
+
+  // Self-heal: If completed matches exist but points_table has 0 total played matches, auto-heal!
+  if (completedCount > 0 && totalPlayed === 0) {
+    console.log(`⚡ [getTournamentStandings] Self-healing standings for tournament #${tournament.id} (${completedCount} completed matches detected).`);
+    await recalculateStandings(tournament.id, { force: true });
+  }
+
+  // 2. Determine freeze status
+  const [matchCounts] = await db.query(
+    `SELECT 
+       COUNT(*) as total_fixtures,
+       SUM(CASE WHEN status NOT IN ('COMPLETED', 'CANCELLED') THEN 1 ELSE 0 END) as pending_fixtures
+     FROM tournament_matches
+     WHERE tournament_id = ?`,
+    [tournament.id]
+  );
+  const totalFixtures = Number(matchCounts?.total_fixtures || 0);
+  const pendingFixtures = Number(matchCounts?.pending_fixtures || 0);
+  const isFinished = totalFixtures > 0 && pendingFixtures === 0;
+  const isFrozen = Boolean(tournament.is_standings_frozen || tournament.status === 'COMPLETED' || standingsMeta?.any_frozen || isFinished);
+
+  // 3. Order criteria by sport
   let orderByClause = 'pt.points DESC, pt.point_difference DESC, pt.won DESC';
-  if (sportSlug === 'football') {
+  if (sportSlug === 'pickleball') {
+    // Pickleball standard: Most wins -> Higher points scored (PF) -> Better point diff (PD) -> Points -> Team name
+    orderByClause = 'pt.won DESC, pt.points_scored DESC, pt.point_difference DESC, pt.points DESC, tm.name ASC';
+  } else if (sportSlug === 'football') {
     orderByClause = 'pt.points DESC, pt.goal_difference DESC, pt.won DESC, pt.goals_for DESC';
   } else if (sportSlug === 'cricket') {
     orderByClause = 'pt.points DESC, pt.net_run_rate DESC, pt.won DESC';
@@ -880,36 +979,75 @@ async function getTournamentStandings(tournamentId) {
     [tournament.id]
   );
 
+  // Fetch completed matches for head-to-head tiebreakers
+  const completedMatches = await db.query(
+    `SELECT team_a_id, team_b_id, winner_team_id
+     FROM tournament_matches
+     WHERE tournament_id = ? AND status = 'COMPLETED'`,
+    [tournament.id]
+  );
+
   const groups = {};
   for (const r of rows) {
     const gName = r.group_name || 'Group 1';
     if (!groups[gName]) groups[gName] = [];
 
+    const pDiff = r.point_difference != null ? r.point_difference : ((r.points_scored || 0) - (r.points_conceded || 0));
+    const gDiff = r.goal_difference != null ? r.goal_difference : pDiff;
+
     groups[gName].push({
       teamId: r.team_public_id,
       internalTeamId: r.team_id,
       name: r.team_name,
+      teamName: r.team_name,
       logo: r.team_logo,
-      played: r.matches_played,
-      won: r.won,
-      lost: r.lost,
-      drawn: r.draws,
-      points: r.points,
+      logoUrl: r.team_logo,
+      groupName: gName,
+      played: r.matches_played || 0,
+      won: r.won || 0,
+      lost: r.lost || 0,
+      drawn: r.draws || 0,
+      points: r.points || 0,
       goalsFor: r.goals_for || r.points_scored || 0,
       goalsAgainst: r.goals_against || r.points_conceded || 0,
-      goalDifference: r.goal_difference != null ? r.goal_difference : (r.point_difference || 0),
+      goalDifference: gDiff,
       pointsFor: r.points_scored || 0,
+      pointsScored: r.points_scored || 0,
       pointsAgainst: r.points_conceded || 0,
-      pointDifference: r.point_difference || 0,
+      pointsConceded: r.points_conceded || 0,
+      pointDifference: pDiff,
+      diff: pDiff,
       netRunRate: parseFloat(r.net_run_rate) || 0.000,
       setsWon: r.sets_won || 0,
-      setsLost: r.sets_lost || 0
+      setsLost: r.sets_lost || 0,
+      isFrozen
     });
   }
 
-  // Calculate ranks
+  // Calculate ranks with head-to-head tiebreak logic
   for (const gName of Object.keys(groups)) {
-    groups[gName].forEach((team, idx) => {
+    const list = groups[gName];
+
+    // Optional sports-specific tiebreaking
+    if (sportSlug === 'pickleball') {
+      list.sort((x, y) => {
+        if (y.won !== x.won) return y.won - x.won;
+        if (y.pointsFor !== x.pointsFor) return y.pointsFor - x.pointsFor;
+        // Head-to-head between x and y
+        const h2h = completedMatches.find(m =>
+          (m.team_a_id === x.internalTeamId && m.team_b_id === y.internalTeamId) ||
+          (m.team_a_id === y.internalTeamId && m.team_b_id === x.internalTeamId)
+        );
+        if (h2h && h2h.winner_team_id) {
+          if (h2h.winner_team_id === x.internalTeamId) return -1;
+          if (h2h.winner_team_id === y.internalTeamId) return 1;
+        }
+        if (y.pointDifference !== x.pointDifference) return y.pointDifference - x.pointDifference;
+        return (x.name || '').localeCompare(y.name || '');
+      });
+    }
+
+    list.forEach((team, idx) => {
       team.rank = idx + 1;
       team.isQualified = idx < (tournament.playoff_teams_per_group || 2);
     });
@@ -917,9 +1055,19 @@ async function getTournamentStandings(tournamentId) {
 
   return {
     tournamentId: tournament.uuid,
+    tournamentName: tournament.name,
     sportSlug,
     format: tournament.tournament_format || tournament.format,
-    groups
+    isFrozen,
+    status: tournament.status,
+    rankingRules: sportSlug === 'pickleball' ? [
+      '1. Most Wins',
+      '2. Higher Points Scored (PF)',
+      '3. Head-to-Head Result',
+      '4. Point Difference (PD)'
+    ] : null,
+    groups,
+    standings: groups // Both groups and standings for universal frontend compatibility
   };
 }
 

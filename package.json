@@ -8,6 +8,7 @@
     "dev": "nodemon server.js",
     "migrate": "node database/run_all_migrations.js",
     "migrate:streaming": "node database/migrate_streaming.js",
+    "seed:superadmin": "node database/seed_superadmin.js",
     "db:init": "node database/initDb.js",
     "test": "node test_gitignore_rules.js",
     "test:gitignore": "node test_gitignore_rules.js"
