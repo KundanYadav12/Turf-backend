@@ -1,5 +1,21 @@
+const crypto = require('crypto');
 const db = require('../config/database');
 const { getIO } = require('../services/socketService');
+
+/**
+ * Generate a cryptographically secure random alphanumeric invite code
+ */
+const generateInviteCode = () => {
+  return crypto.randomBytes(8).toString('hex');
+};
+
+/**
+ * Centralized base web URL for shareable links
+ */
+const getBaseAppUrl = () => {
+  const url = process.env.PUBLIC_APP_URL || process.env.APP_URL || process.env.NEXT_PUBLIC_APP_URL || 'https://playzo.duckdns.org';
+  return url.replace(/\/+$/, '');
+};
 
 /**
  * Helper to resolve all venue IDs owned by the authenticated user
@@ -62,7 +78,7 @@ const getMyTeams = async (req, res, next) => {
           s.name as sport_name,
           s.slug as sport_slug,
           u.full_name as captain_name,
-          (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id) as member_count,
+          (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id AND tm.deleted_at IS NULL) as member_count,
           COALESCE(SUM(pt.matches_played), 0) as matches_played,
           COALESCE(SUM(pt.won), 0) as won,
           COALESCE(SUM(pt.lost), 0) as lost,
@@ -94,7 +110,7 @@ const getMyTeams = async (req, res, next) => {
           s.name as sport_name,
           s.slug as sport_slug,
           u.full_name as captain_name,
-          (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id) as member_count,
+          (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id AND tm.deleted_at IS NULL) as member_count,
           COALESCE(SUM(pt.matches_played), 0) as matches_played,
           COALESCE(SUM(pt.won), 0) as won,
           COALESCE(SUM(pt.lost), 0) as lost,
@@ -125,7 +141,7 @@ const getMyTeams = async (req, res, next) => {
           s.name as sport_name,
           s.slug as sport_slug,
           u.full_name as captain_name,
-          (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id) as member_count,
+          (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id AND tm.deleted_at IS NULL) as member_count,
           COALESCE(SUM(pt.matches_played), 0) as matches_played,
           COALESCE(SUM(pt.won), 0) as won,
           COALESCE(SUM(pt.lost), 0) as lost,
@@ -134,13 +150,13 @@ const getMyTeams = async (req, res, next) => {
         LEFT JOIN venues v ON t.venue_id = v.id
         LEFT JOIN sports s ON t.sport_id = s.id
         LEFT JOIN users u ON t.captain_id = u.id
-        LEFT JOIN team_members mem ON mem.team_id = t.id
+        LEFT JOIN team_members mem ON mem.team_id = t.id AND mem.deleted_at IS NULL
         LEFT JOIN points_table pt ON pt.team_id = t.id
-        WHERE t.captain_id = ? OR mem.user_id = ?
+        WHERE t.owner_id = ? OR t.captain_id = ? OR mem.user_id = ?
         GROUP BY t.id
         ORDER BY t.created_at DESC
       `;
-      queryParams = [userId, userId];
+      queryParams = [userId, userId, userId];
     }
 
     const rows = await db.query(teamsQuery, queryParams);
@@ -215,7 +231,7 @@ const discoverTeams = async (req, res, next) => {
         s.slug as sport_slug,
         u.full_name as captain_name,
         tourn.name as tournament_name,
-        (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id) as member_count,
+        (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id AND tm.deleted_at IS NULL) as member_count,
         COALESCE(SUM(pt.matches_played), 0) as matches_played,
         COALESCE(SUM(pt.won), 0) as won,
         COALESCE(SUM(pt.lost), 0) as lost,
@@ -299,7 +315,15 @@ const getTeamById = async (req, res, next) => {
       }
     }
 
-    // 1. Fetch Roster Members with user photos, usernames, roles, jerseys, positions
+    // Ensure team has an invite_code, generate if missing
+    let inviteCode = team.invite_code;
+    if (!inviteCode) {
+      inviteCode = generateInviteCode();
+      await db.query('UPDATE teams SET invite_code = ? WHERE id = ?', [inviteCode, team.id]);
+      team.invite_code = inviteCode;
+    }
+
+    // 1. Fetch Roster Members with user photos, usernames, roles, jerseys, positions (excluding soft-deleted)
     const members = await db.query(
       `SELECT tm.id as member_id, tm.user_id, tm.role, tm.jersey_number, tm.position,
               tm.is_captain, tm.is_vice_captain, tm.joined_at,
@@ -309,10 +333,16 @@ const getTeamById = async (req, res, next) => {
               u.dob, u.primary_sport_slug, u.experience_level
        FROM team_members tm
        LEFT JOIN users u ON tm.user_id = u.id
-       WHERE tm.team_id = ?
+       WHERE tm.team_id = ? AND tm.deleted_at IS NULL
        ORDER BY tm.is_captain DESC, tm.is_vice_captain DESC, tm.id ASC`,
       [team.id]
     );
+
+    // Caller membership status
+    const isMember = callerId ? members.some((m) => m.user_id === callerId) : false;
+    const isOwner = callerId ? team.owner_id === callerId : false;
+    const myMemberRecord = callerId ? members.find((m) => m.user_id === callerId) : null;
+    const baseUrl = getBaseAppUrl();
 
     // 2. Fetch Team Record & Scoring Stats
     const ptRows = await db.query(
@@ -379,6 +409,12 @@ const getTeamById = async (req, res, next) => {
         tournamentName: team.tournament_name || null,
         memberCount: members.length,
         canManage,
+        isMember,
+        isOwner,
+        myMembershipId: myMemberRecord?.member_id || null,
+        inviteCode: team.invite_code || null,
+        inviteUrl: team.invite_code ? `${baseUrl}/teams/join/${team.invite_code}` : null,
+        deepLinkUrl: team.invite_code ? `turf://teams/join/${team.invite_code}` : null,
         statistics: {
           matchesPlayed,
           won,
@@ -399,6 +435,7 @@ const getTeamById = async (req, res, next) => {
           jerseyNumber: m.jersey_number,
           isCaptain: Boolean(m.is_captain),
           isViceCaptain: Boolean(m.is_vice_captain),
+          isOwner: team.owner_id === m.user_id,
           experienceLevel: m.experience_level || 'Club',
           joinedAt: m.joined_at
         })),
@@ -485,14 +522,15 @@ const createTeam = async (req, res, next) => {
     }
 
     const assignedCaptainId = captainId || userId;
+    const inviteCode = generateInviteCode();
 
     // Create Team
     const insertRes = await db.query(
       `INSERT INTO teams (
         uuid, name, logo_url, captain_id, owner_id, venue_id, sport_id,
         description, division, coach_name, contact_phone, home_location,
-        tournament_id, status
-      ) VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        tournament_id, status, invite_code
+      ) VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         name.trim(),
         logoUrl || null,
@@ -506,12 +544,13 @@ const createTeam = async (req, res, next) => {
         contactPhone || null,
         homeLocation || null,
         tournamentId || null,
-        status || 'ACTIVE'
+        status || 'ACTIVE',
+        inviteCode
       ]
     );
 
     const teamId = insertRes.insertId;
-    const [teamRow] = await db.query('SELECT id, uuid, name, logo_url FROM teams WHERE id = ?', [teamId]);
+    const [teamRow] = await db.query('SELECT id, uuid, name, logo_url, invite_code FROM teams WHERE id = ?', [teamId]);
 
     // Seed Initial Squad Players if provided
     if (Array.isArray(initialPlayers) && initialPlayers.length > 0) {
@@ -680,6 +719,7 @@ const addPlayerToTeam = async (req, res, next) => {
 
     const {
       userId: targetUserId,
+      existingUserId,
       fullName,
       username,
       phone,
@@ -692,7 +732,7 @@ const addPlayerToTeam = async (req, res, next) => {
       photoUrl: initialPhotoUrl
     } = req.body;
 
-    let finalUserId = targetUserId;
+    let finalUserId = targetUserId || existingUserId;
     let uploadedPhotoUrl = initialPhotoUrl || null;
 
     // Process photo if file uploaded via multipart
@@ -786,35 +826,65 @@ const addPlayerToTeam = async (req, res, next) => {
     }
 
     // Check if player is already registered in this team
-    const [alreadyInTeam] = await db.query(
-      `SELECT id FROM team_members WHERE team_id = ? AND user_id = ?`,
+    const [existingMember] = await db.query(
+      `SELECT id, deleted_at FROM team_members WHERE team_id = ? AND user_id = ?`,
       [team.id, finalUserId]
     );
 
-    if (alreadyInTeam) {
-      return res.status(400).json({ success: false, message: 'Player is already a registered member of this team.' });
+    if (existingMember && existingMember.deleted_at === null) {
+      return res.status(400).json({ success: false, message: 'Player is already an active registered member of this team.' });
     }
 
     const [userRecord] = await db.query(`SELECT full_name, username, profile_photo FROM users WHERE id = ?`, [finalUserId]);
     const finalPhoto = uploadedPhotoUrl || userRecord?.profile_photo || null;
 
-    const memberIns = await db.query(
-      `INSERT INTO team_members (
-        team_id, user_id, role, jersey_number, position,
-        is_captain, is_vice_captain, player_name, photo_url
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        team.id,
-        finalUserId,
-        role,
-        jerseyNumber || null,
-        position || 'Player',
-        isCaptain ? 1 : 0,
-        isViceCaptain ? 1 : 0,
-        userRecord?.full_name || fullName || 'Player',
-        finalPhoto
-      ]
-    );
+    let memberId = null;
+    if (existingMember && existingMember.deleted_at !== null) {
+      // Reactivate previously departed player
+      await db.query(
+        `UPDATE team_members SET
+           deleted_at = NULL,
+           joined_at = NOW(),
+           role = ?,
+           jersey_number = ?,
+           position = ?,
+           is_captain = ?,
+           is_vice_captain = ?,
+           player_name = ?,
+           photo_url = ?
+         WHERE id = ?`,
+        [
+          role,
+          jerseyNumber || null,
+          position || 'Player',
+          isCaptain ? 1 : 0,
+          isViceCaptain ? 1 : 0,
+          userRecord?.full_name || fullName || 'Player',
+          finalPhoto,
+          existingMember.id
+        ]
+      );
+      memberId = existingMember.id;
+    } else {
+      const memberIns = await db.query(
+        `INSERT INTO team_members (
+          team_id, user_id, role, jersey_number, position,
+          is_captain, is_vice_captain, player_name, photo_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          team.id,
+          finalUserId,
+          role,
+          jerseyNumber || null,
+          position || 'Player',
+          isCaptain ? 1 : 0,
+          isViceCaptain ? 1 : 0,
+          userRecord?.full_name || fullName || 'Player',
+          finalPhoto
+        ]
+      );
+      memberId = memberIns.insertId;
+    }
 
     // If marked captain, update team's captain_id
     if (isCaptain || role === 'CAPTAIN') {
@@ -822,7 +892,7 @@ const addPlayerToTeam = async (req, res, next) => {
     }
 
     const memberCountRes = await db.query(
-      `SELECT COUNT(*) as count FROM team_members WHERE team_id = ?`,
+      `SELECT COUNT(*) as count FROM team_members WHERE team_id = ? AND deleted_at IS NULL`,
       [team.id]
     );
 
@@ -830,7 +900,7 @@ const addPlayerToTeam = async (req, res, next) => {
       success: true,
       message: `Player "${userRecord?.full_name || fullName}" added to roster!`,
       data: {
-        memberId: memberIns.insertId,
+        memberId,
         userId: finalUserId,
         name: userRecord?.full_name || fullName,
         username: userRecord?.username || (finalUserId ? `user_${finalUserId}` : null),
@@ -883,7 +953,7 @@ const updateTeamPlayer = async (req, res, next) => {
 
 /**
  * 9. DELETE /api/teams/:id/players/:memberId (Remove Player from Roster)
- * Historical match statistics remain intact!
+ * Historical match statistics remain intact via soft deletion!
  */
 const removePlayerFromTeam = async (req, res, next) => {
   try {
@@ -893,20 +963,61 @@ const removePlayerFromTeam = async (req, res, next) => {
 
     const userId = req.user.id;
     if (req.user.role !== 'ADMIN' && team.owner_id !== userId && team.captain_id !== userId) {
-      return res.status(403).json({ success: false, message: 'Forbidden.' });
+      return res.status(403).json({ success: false, message: 'Forbidden. Only organizers/captains can remove players.' });
     }
 
-    await db.query(`DELETE FROM team_members WHERE id = ? AND team_id = ?`, [memberId, team.id]);
+    const [targetMember] = await db.query(
+      'SELECT id, user_id, player_name FROM team_members WHERE id = ? AND team_id = ? AND deleted_at IS NULL',
+      [memberId, team.id]
+    );
+
+    if (!targetMember) {
+      return res.status(404).json({ success: false, message: 'Player is not currently on this squad roster.' });
+    }
+
+    // Protect the team owner from being removed
+    if (targetMember.user_id === team.owner_id) {
+      return res.status(400).json({ success: false, message: 'The team owner cannot be removed from the team.' });
+    }
+
+    // Soft delete membership so historical match and tournament stats remain intact
+    await db.query(
+      `UPDATE team_members SET deleted_at = NOW(), is_captain = 0, is_vice_captain = 0 WHERE id = ? AND team_id = ?`,
+      [memberId, team.id]
+    );
+
+    // If removed player was captain, clear captain_id on team
+    if (team.captain_id === targetMember.user_id) {
+      await db.query('UPDATE teams SET captain_id = NULL WHERE id = ?', [team.id]);
+    }
 
     const memberCountRes = await db.query(
-      `SELECT COUNT(*) as count FROM team_members WHERE team_id = ?`,
+      `SELECT COUNT(*) as count FROM team_members WHERE team_id = ? AND deleted_at IS NULL`,
       [team.id]
     );
 
+    const totalRosterSize = memberCountRes[0]?.count || 0;
+
+    const io = getIO();
+    if (io) {
+      io.to(`team:${team.uuid}`).emit('team:member_removed', {
+        teamId: team.uuid,
+        memberId: parseInt(memberId, 10),
+        userId: targetMember.user_id,
+        playerName: targetMember.player_name,
+        totalRosterSize
+      });
+      io.to(`user:${targetMember.user_id}`).emit('team:member_removed', {
+        teamId: team.uuid,
+        memberId: parseInt(memberId, 10),
+        totalRosterSize
+      });
+    }
+
     res.json({
       success: true,
-      message: 'Player removed from squad roster.',
-      totalRosterSize: memberCountRes[0]?.count || 0
+      message: `Player "${targetMember.player_name || 'Member'}" removed from squad roster.`,
+      totalRosterSize
     });
   } catch (error) {
     next(error);
@@ -947,7 +1058,7 @@ const bulkAddPlayers = async (req, res, next) => {
       }
 
       const [inRoster] = await db.query(
-        `SELECT id FROM team_members WHERE team_id = ? AND user_id = ?`,
+        `SELECT id, deleted_at FROM team_members WHERE team_id = ? AND user_id = ?`,
         [team.id, pUserId]
       );
 
@@ -958,10 +1069,400 @@ const bulkAddPlayers = async (req, res, next) => {
           [team.id, pUserId, pName.trim()]
         );
         addedCount++;
+      } else if (inRoster.deleted_at !== null) {
+        await db.query(
+          `UPDATE team_members SET deleted_at = NULL, joined_at = NOW(), player_name = ? WHERE id = ?`,
+          [pName.trim(), inRoster.id]
+        );
+        addedCount++;
       }
     }
 
     res.json({ success: true, message: `Successfully added ${addedCount} players to squad!`, addedCount });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * 11. GET /api/teams/invite/:code (Preview Team Details for Joining Link)
+ */
+const getTeamInviteInfo = async (req, res, next) => {
+  try {
+    const { code } = req.params;
+    if (!code || !code.trim()) {
+      return res.status(400).json({ success: false, message: 'Invite code is required.' });
+    }
+
+    const [team] = await db.query(
+      `SELECT t.id, t.uuid, t.name, t.logo_url as logoUrl, t.description, t.division, t.status,
+              t.owner_id, t.captain_id, t.invite_code,
+              s.name as sport_name, s.slug as sport_slug,
+              v.name as venue_name, v.city as venue_city,
+              u.full_name as captain_name,
+              (SELECT COUNT(*) FROM team_members tm WHERE tm.team_id = t.id AND tm.deleted_at IS NULL) as member_count
+       FROM teams t
+       LEFT JOIN sports s ON t.sport_id = s.id
+       LEFT JOIN venues v ON t.venue_id = v.id
+       LEFT JOIN users u ON t.captain_id = u.id
+       WHERE t.invite_code = ? AND t.status = 'ACTIVE'`,
+      [code.trim()]
+    );
+
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'This team invitation link is invalid, expired, or has been revoked.'
+      });
+    }
+
+    const callerId = req.user?.id;
+    let isMember = false;
+    let isOwner = false;
+
+    if (callerId) {
+      isOwner = team.owner_id === callerId;
+      const [mem] = await db.query(
+        'SELECT id FROM team_members WHERE team_id = ? AND user_id = ? AND deleted_at IS NULL',
+        [team.id, callerId]
+      );
+      isMember = Boolean(mem) || isOwner;
+    }
+
+    const baseUrl = getBaseAppUrl();
+
+    res.json({
+      success: true,
+      data: {
+        id: team.uuid,
+        name: team.name,
+        logoUrl: team.logoUrl,
+        description: team.description,
+        division: team.division || 'Open',
+        status: team.status,
+        sport: {
+          name: team.sport_name || 'Cricket',
+          slug: team.sport_slug || 'cricket'
+        },
+        venue: team.venue_name ? { name: team.venue_name, city: team.venue_city } : null,
+        captainName: team.captain_name || 'Not Assigned',
+        memberCount: parseInt(team.member_count, 10) || 0,
+        inviteCode: team.invite_code,
+        inviteUrl: `${baseUrl}/teams/join/${team.invite_code}`,
+        deepLinkUrl: `turf://teams/join/${team.invite_code}`,
+        isMember,
+        isOwner
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * 12. POST /api/teams/join/:code (Join Team via Secure Invite Code)
+ */
+const joinTeamByInviteCode = async (req, res, next) => {
+  try {
+    const { code } = req.params;
+    const userId = req.user.id;
+
+    if (!code || !code.trim()) {
+      return res.status(400).json({ success: false, message: 'Invite code is required.' });
+    }
+
+    const [team] = await db.query(
+      'SELECT id, uuid, name, owner_id, status FROM teams WHERE invite_code = ? AND status = "ACTIVE"',
+      [code.trim()]
+    );
+
+    if (!team) {
+      return res.status(404).json({
+        success: false,
+        message: 'This team invitation link is invalid, expired, or has been revoked.'
+      });
+    }
+
+    // Check if user is already an active member
+    const [existingMember] = await db.query(
+      'SELECT id, role, deleted_at FROM team_members WHERE team_id = ? AND user_id = ?',
+      [team.id, userId]
+    );
+
+    if (existingMember && existingMember.deleted_at === null) {
+      return res.status(200).json({
+        success: true,
+        alreadyMember: true,
+        message: `You are already a member of ${team.name}.`,
+        data: {
+          teamId: team.uuid,
+          teamName: team.name
+        }
+      });
+    }
+
+    const [userRecord] = await db.query(
+      'SELECT full_name, profile_photo, primary_position, jersey_number FROM users WHERE id = ?',
+      [userId]
+    );
+
+    if (existingMember && existingMember.deleted_at !== null) {
+      // Reactivate previously departed member
+      await db.query(
+        `UPDATE team_members SET 
+           deleted_at = NULL, 
+           joined_at = NOW(), 
+           role = 'PLAYER',
+           player_name = ?,
+           photo_url = COALESCE(photo_url, ?)
+         WHERE id = ?`,
+        [userRecord?.full_name || 'Player', userRecord?.profile_photo || null, existingMember.id]
+      );
+    } else {
+      // Insert brand new member
+      await db.query(
+        `INSERT INTO team_members (
+           team_id, user_id, role, position, jersey_number, player_name, photo_url
+         ) VALUES (?, ?, 'PLAYER', ?, ?, ?, ?)`,
+        [
+          team.id,
+          userId,
+          userRecord?.primary_position || 'Player',
+          userRecord?.jersey_number || null,
+          userRecord?.full_name || 'Player',
+          userRecord?.profile_photo || null
+        ]
+      );
+    }
+
+    const [countRes] = await db.query(
+      'SELECT COUNT(*) as count FROM team_members WHERE team_id = ? AND deleted_at IS NULL',
+      [team.id]
+    );
+
+    const totalRosterSize = countRes?.count || 1;
+
+    // Real-time notification
+    const io = getIO();
+    if (io) {
+      io.to(`team:${team.uuid}`).emit('team:member_joined', {
+        teamId: team.uuid,
+        userId,
+        playerName: userRecord?.full_name || 'Player',
+        totalRosterSize
+      });
+      io.to(`user:${team.owner_id}`).emit('team:member_joined', {
+        teamId: team.uuid,
+        userId,
+        playerName: userRecord?.full_name || 'Player',
+        totalRosterSize
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Congratulations! You have joined ${team.name}!`,
+      data: {
+        teamId: team.uuid,
+        teamName: team.name,
+        totalRosterSize
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * 13. POST /api/teams/:id/leave (Player Leaves Team Themselves)
+ */
+const leaveTeam = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const team = await resolveTeam(id);
+    if (!team) return res.status(404).json({ success: false, message: 'Team not found.' });
+
+    const userId = req.user.id;
+
+    // Prevent team owner from leaving without transferring ownership
+    if (team.owner_id === userId) {
+      return res.status(400).json({
+        success: false,
+        message: 'As the team owner, you cannot leave the team. You must transfer ownership first or delete the team.'
+      });
+    }
+
+    const [member] = await db.query(
+      'SELECT id, is_captain FROM team_members WHERE team_id = ? AND user_id = ? AND deleted_at IS NULL',
+      [team.id, userId]
+    );
+
+    if (!member) {
+      return res.status(200).json({
+        success: true,
+        message: `You are not currently an active member of ${team.name}.`
+      });
+    }
+
+    // Soft delete membership
+    await db.query(
+      'UPDATE team_members SET deleted_at = NOW(), is_captain = 0, is_vice_captain = 0 WHERE id = ?',
+      [member.id]
+    );
+
+    // If user was captain, clear captain_id on team
+    if (team.captain_id === userId) {
+      await db.query('UPDATE teams SET captain_id = NULL WHERE id = ?', [team.id]);
+    }
+
+    const [countRes] = await db.query(
+      'SELECT COUNT(*) as count FROM team_members WHERE team_id = ? AND deleted_at IS NULL',
+      [team.id]
+    );
+
+    const totalRosterSize = countRes?.count || 0;
+
+    const io = getIO();
+    if (io) {
+      io.to(`team:${team.uuid}`).emit('team:member_left', {
+        teamId: team.uuid,
+        userId,
+        totalRosterSize
+      });
+      io.to(`user:${team.owner_id}`).emit('team:member_left', {
+        teamId: team.uuid,
+        userId,
+        totalRosterSize
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `You have successfully left ${team.name}.`,
+      data: {
+        teamId: team.uuid,
+        totalRosterSize
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * 14. GET /api/teams/:id/invite-link (Get or Generate Shareable Invite Link)
+ */
+const getInviteLink = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const team = await resolveTeam(id);
+    if (!team) return res.status(404).json({ success: false, message: 'Team not found.' });
+
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Permission check: Owner, Captain, Venue Owner, Admin, or active team member
+    const [isMem] = await db.query(
+      'SELECT id FROM team_members WHERE team_id = ? AND user_id = ? AND deleted_at IS NULL',
+      [team.id, userId]
+    );
+
+    if (userRole !== 'ADMIN' && team.owner_id !== userId && team.captain_id !== userId && !isMem) {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden. Only team members and organizers can view team invitation links.'
+      });
+    }
+
+    let inviteCode = team.invite_code;
+    if (!inviteCode) {
+      inviteCode = generateInviteCode();
+      await db.query('UPDATE teams SET invite_code = ? WHERE id = ?', [inviteCode, team.id]);
+      team.invite_code = inviteCode;
+    }
+
+    const baseUrl = getBaseAppUrl();
+
+    res.json({
+      success: true,
+      data: {
+        teamId: team.uuid,
+        teamName: team.name,
+        inviteCode: team.invite_code,
+        inviteUrl: `${baseUrl}/teams/join/${team.invite_code}`,
+        deepLinkUrl: `turf://teams/join/${team.invite_code}`
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * 15. POST /api/teams/:id/regenerate-invite-link (Regenerate Invite Link - Owner/Admin)
+ */
+const regenerateInviteLink = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const team = await resolveTeam(id);
+    if (!team) return res.status(404).json({ success: false, message: 'Team not found.' });
+
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    if (userRole !== 'ADMIN' && team.owner_id !== userId && team.captain_id !== userId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden. Only team organizers can regenerate invitation links.'
+      });
+    }
+
+    const newCode = generateInviteCode();
+    await db.query('UPDATE teams SET invite_code = ? WHERE id = ?', [newCode, team.id]);
+
+    const baseUrl = getBaseAppUrl();
+
+    res.json({
+      success: true,
+      message: 'Team invitation link regenerated successfully! The previous link has been invalidated.',
+      data: {
+        teamId: team.uuid,
+        teamName: team.name,
+        inviteCode: newCode,
+        inviteUrl: `${baseUrl}/teams/join/${newCode}`,
+        deepLinkUrl: `turf://teams/join/${newCode}`
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * 16. POST /api/teams/:id/revoke-invite-link (Revoke Invite Link - Owner/Admin)
+ */
+const revokeInviteLink = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const team = await resolveTeam(id);
+    if (!team) return res.status(404).json({ success: false, message: 'Team not found.' });
+
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    if (userRole !== 'ADMIN' && team.owner_id !== userId && team.captain_id !== userId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden. Only team organizers can revoke invitation links.'
+      });
+    }
+
+    await db.query('UPDATE teams SET invite_code = NULL WHERE id = ?', [team.id]);
+
+    res.json({
+      success: true,
+      message: 'Team invitation link revoked. Players can no longer join using previous links.'
+    });
   } catch (error) {
     next(error);
   }
@@ -977,5 +1478,11 @@ module.exports = {
   addPlayerToTeam,
   updateTeamPlayer,
   removePlayerFromTeam,
-  bulkAddPlayers
+  bulkAddPlayers,
+  getTeamInviteInfo,
+  joinTeamByInviteCode,
+  leaveTeam,
+  getInviteLink,
+  regenerateInviteLink,
+  revokeInviteLink
 };
