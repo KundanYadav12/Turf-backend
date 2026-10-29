@@ -15,6 +15,7 @@ const migrations = [
   'migrate_tournament_stream_permissions.js',
   'migrate_multi_live_matches.js',
   'migrate_team_joining_links.js',
+  'migrate_standings_frozen_columns.js',
   'seed_superadmin.js'
 ];
 

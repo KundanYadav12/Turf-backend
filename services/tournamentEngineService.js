@@ -29,6 +29,28 @@ async function getTournamentEntity(tournamentId) {
   return rows && rows.length > 0 ? rows[0] : null;
 }
 
+let frozenColumnsChecked = false;
+async function ensureFrozenColumns() {
+  if (frozenColumnsChecked) return;
+  try {
+    const tCols = await db.query("SHOW COLUMNS FROM tournaments LIKE 'is_standings_frozen'");
+    if (!tCols || tCols.length === 0) {
+      await db.query("ALTER TABLE tournaments ADD COLUMN is_standings_frozen TINYINT(1) NOT NULL DEFAULT 0 AFTER status");
+    }
+  } catch (e) {
+    // ignore
+  }
+  try {
+    const pCols = await db.query("SHOW COLUMNS FROM points_table LIKE 'is_frozen'");
+    if (!pCols || pCols.length === 0) {
+      await db.query("ALTER TABLE points_table ADD COLUMN is_frozen TINYINT(1) NOT NULL DEFAULT 0 AFTER point_difference");
+    }
+  } catch (e) {
+    // ignore
+  }
+  frozenColumnsChecked = true;
+}
+
 /**
  * Validates scheduling conflicts for teams and courts.
  */
@@ -626,6 +648,7 @@ function oversToDecimal(overs) {
  * and permanently preserves/freezes standings after tournament conclusion.
  */
 async function recalculateStandings(tournamentId, options = {}) {
+  await ensureFrozenColumns();
   const tournament = await getTournamentEntity(tournamentId);
   if (!tournament) return;
 
@@ -856,41 +879,81 @@ async function recalculateStandings(tournamentId, options = {}) {
   const shouldFreeze = Boolean(tournament.is_standings_frozen || tournament.status === 'COMPLETED' || isFinished);
 
   if (shouldFreeze && !tournament.is_standings_frozen) {
-    await db.query(`UPDATE tournaments SET is_standings_frozen = 1 WHERE id = ?`, [tournament.id]);
+    try {
+      await db.query(`UPDATE tournaments SET is_standings_frozen = 1 WHERE id = ?`, [tournament.id]);
+    } catch (e) {
+      // column may not exist on unmigrated database
+    }
   }
 
   // Update points_table in database with all metrics and freeze status
   for (const s of Object.values(statsMap)) {
-    await db.query(
-      `INSERT INTO points_table (
-        tournament_id, team_id, matches_played, won, lost, tied, drawn,
-        points, points_scored, points_conceded, point_difference,
-        goals_for, goals_against, goal_difference, sets_won, sets_lost, net_run_rate, group_name, is_frozen
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        matches_played = VALUES(matches_played),
-        won = VALUES(won),
-        lost = VALUES(lost),
-        tied = VALUES(tied),
-        drawn = VALUES(drawn),
-        points = VALUES(points),
-        points_scored = VALUES(points_scored),
-        points_conceded = VALUES(points_conceded),
-        point_difference = VALUES(point_difference),
-        goals_for = VALUES(goals_for),
-        goals_against = VALUES(goals_against),
-        goal_difference = VALUES(goal_difference),
-        sets_won = VALUES(sets_won),
-        sets_lost = VALUES(sets_lost),
-        net_run_rate = VALUES(net_run_rate),
-        group_name = VALUES(group_name),
-        is_frozen = VALUES(is_frozen)`,
-      [
-        tournament.id, s.teamId, s.played, s.won, s.lost, s.drawn, s.drawn,
-        s.points, s.pf, s.pa, s.pdiff,
-        s.gf, s.ga, s.gd, s.setsWon, s.setsLost, s.nrr, s.groupName, shouldFreeze ? 1 : 0
-      ]
-    );
+    try {
+      await db.query(
+        `INSERT INTO points_table (
+          tournament_id, team_id, matches_played, won, lost, tied, drawn,
+          points, points_scored, points_conceded, point_difference,
+          goals_for, goals_against, goal_difference, sets_won, sets_lost, net_run_rate, group_name, is_frozen
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          matches_played = VALUES(matches_played),
+          won = VALUES(won),
+          lost = VALUES(lost),
+          tied = VALUES(tied),
+          drawn = VALUES(drawn),
+          points = VALUES(points),
+          points_scored = VALUES(points_scored),
+          points_conceded = VALUES(points_conceded),
+          point_difference = VALUES(point_difference),
+          goals_for = VALUES(goals_for),
+          goals_against = VALUES(goals_against),
+          goal_difference = VALUES(goal_difference),
+          sets_won = VALUES(sets_won),
+          sets_lost = VALUES(sets_lost),
+          net_run_rate = VALUES(net_run_rate),
+          group_name = VALUES(group_name),
+          is_frozen = VALUES(is_frozen)`,
+        [
+          tournament.id, s.teamId, s.played, s.won, s.lost, s.drawn, s.drawn,
+          s.points, s.pf, s.pa, s.pdiff,
+          s.gf, s.ga, s.gd, s.setsWon, s.setsLost, s.nrr, s.groupName, shouldFreeze ? 1 : 0
+        ]
+      );
+    } catch (insertErr) {
+      if (insertErr.code === 'ER_BAD_FIELD_ERROR' || (insertErr.message && insertErr.message.includes('is_frozen'))) {
+        await db.query(
+          `INSERT INTO points_table (
+            tournament_id, team_id, matches_played, won, lost, tied, drawn,
+            points, points_scored, points_conceded, point_difference,
+            goals_for, goals_against, goal_difference, sets_won, sets_lost, net_run_rate, group_name
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            matches_played = VALUES(matches_played),
+            won = VALUES(won),
+            lost = VALUES(lost),
+            tied = VALUES(tied),
+            drawn = VALUES(drawn),
+            points = VALUES(points),
+            points_scored = VALUES(points_scored),
+            points_conceded = VALUES(points_conceded),
+            point_difference = VALUES(point_difference),
+            goals_for = VALUES(goals_for),
+            goals_against = VALUES(goals_against),
+            goal_difference = VALUES(goal_difference),
+            sets_won = VALUES(sets_won),
+            sets_lost = VALUES(sets_lost),
+            net_run_rate = VALUES(net_run_rate),
+            group_name = VALUES(group_name)`,
+          [
+            tournament.id, s.teamId, s.played, s.won, s.lost, s.drawn, s.drawn,
+            s.points, s.pf, s.pa, s.pdiff,
+            s.gf, s.ga, s.gd, s.setsWon, s.setsLost, s.nrr, s.groupName
+          ]
+        );
+      } else {
+        throw insertErr;
+      }
+    }
   }
 
   // Broadcast standings update event via Socket.IO
@@ -916,15 +979,36 @@ async function getTournamentStandings(tournamentId) {
 
   const sportSlug = tournament.sport_slug || 'cricket';
 
+  await ensureFrozenColumns();
+
   // 1. Check if standings need self-healing recalculation
-  const [standingsMeta] = await db.query(
-    `SELECT COUNT(*) as row_count, 
-            COALESCE(SUM(matches_played), 0) as total_played, 
-            COALESCE(SUM(points), 0) as total_points,
-            COALESCE(MAX(is_frozen), 0) as any_frozen
-     FROM points_table WHERE tournament_id = ?`,
-    [tournament.id]
-  );
+  let standingsMeta = null;
+  try {
+    const res = await db.query(
+      `SELECT COUNT(*) as row_count, 
+              COALESCE(SUM(matches_played), 0) as total_played, 
+              COALESCE(SUM(points), 0) as total_points,
+              COALESCE(MAX(is_frozen), 0) as any_frozen
+       FROM points_table WHERE tournament_id = ?`,
+      [tournament.id]
+    );
+    standingsMeta = res?.[0] || null;
+  } catch (err) {
+    if (err.code === 'ER_BAD_FIELD_ERROR' || (err.message && err.message.includes('is_frozen'))) {
+      const res = await db.query(
+        `SELECT COUNT(*) as row_count, 
+                COALESCE(SUM(matches_played), 0) as total_played, 
+                COALESCE(SUM(points), 0) as total_points,
+                0 as any_frozen
+         FROM points_table WHERE tournament_id = ?`,
+        [tournament.id]
+      );
+      standingsMeta = res?.[0] || null;
+    } else {
+      throw err;
+    }
+  }
+
   const [completedMatchMeta] = await db.query(
     `SELECT COUNT(*) as completed_count 
      FROM tournament_matches 

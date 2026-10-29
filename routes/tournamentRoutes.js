@@ -480,9 +480,13 @@ router.post('/:id/standings/freeze', authenticateUser, authorizeTournamentOrgani
     const currentFrozen = Boolean(tournament.is_standings_frozen);
     const targetFrozen = req.body?.freeze !== undefined ? Boolean(req.body.freeze) : !currentFrozen;
 
-    // Update tournaments and points_table
-    await db.query('UPDATE tournaments SET is_standings_frozen = ? WHERE id = ?', [targetFrozen ? 1 : 0, tournament.id]);
-    await db.query('UPDATE points_table SET is_frozen = ? WHERE tournament_id = ?', [targetFrozen ? 1 : 0, tournament.id]);
+    // Update tournaments and points_table (safe if columns unmigrated)
+    try {
+      await db.query('UPDATE tournaments SET is_standings_frozen = ? WHERE id = ?', [targetFrozen ? 1 : 0, tournament.id]);
+    } catch (e) {}
+    try {
+      await db.query('UPDATE points_table SET is_frozen = ? WHERE tournament_id = ?', [targetFrozen ? 1 : 0, tournament.id]);
+    } catch (e) {}
 
     // If unfreezing and forceRecalc requested, recalculate
     if (!targetFrozen && req.body?.recalculate) {
