@@ -347,6 +347,15 @@ const setupToss = async ({
   const isAuth = await checkScorerAuthorization(userId, userRole, matchInfo.id);
   if (!isAuth) throw { statusCode: 403, message: 'Unauthorized: You do not have permission to score this match.' };
 
+  // Idempotency: Return active match state if already LIVE
+  if (matchInfo.status === 'LIVE') {
+    return {
+      success: true,
+      message: 'Match is already live.',
+      data: await getCricketScorerState(matchInfo.uuid)
+    };
+  }
+
   return await db.transaction(async (conn) => {
     // Determine batting & bowling teams
     const [mRows] = await conn.query('SELECT team_a_id, team_b_id FROM tournament_matches WHERE id = ?', [matchInfo.id]);

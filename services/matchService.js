@@ -282,9 +282,142 @@ const recordScoreEvent = async ({
   });
 };
 
+/**
+ * Returns all currently active LIVE matches across the entire platform,
+ * optionally filtered by tournament or sport.
+ * Guarantees zero limit, returning all concurrent live matches.
+ */
+const getAllLiveMatches = async ({ tournamentId = null, sport = null, limit = 100 } = {}) => {
+  const conditions = ["tm.status = 'LIVE'"];
+  const params = [];
+
+  if (tournamentId) {
+    conditions.push('(t.uuid = ? OR t.id = ?)');
+    params.push(tournamentId, isNaN(tournamentId) ? -1 : parseInt(tournamentId, 10));
+  }
+
+  if (sport) {
+    conditions.push('(LOWER(s.slug) = LOWER(?) OR LOWER(s.name) = LOWER(?))');
+    params.push(sport, sport);
+  }
+
+  const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500);
+
+  const sql = `
+    SELECT 
+      tm.id as match_id,
+      tm.uuid as public_id,
+      tm.uuid as match_uuid,
+      tm.match_number,
+      tm.match_date,
+      tm.start_time,
+      tm.end_time,
+      tm.status,
+      tm.category,
+      tm.show_on_display,
+      COALESCE(tm.live_score_summary, '0 - 0') as live_score_summary,
+      tm.live_subtext,
+      tm.sport_state,
+      tm.team_a_score,
+      tm.team_b_score,
+      tm.has_live_stream,
+      tm.live_stream_id,
+      t.id as tournament_id,
+      t.uuid as tournament_uuid,
+      t.name as tournament_name,
+      COALESCE(v.city, '') as tournament_city,
+      s.id as sport_id,
+      s.slug as sport_slug,
+      s.name as sport_name,
+      c.id as court_id,
+      c.name as court_name,
+      v.id as venue_id,
+      v.name as venue_name,
+      v.city as venue_city,
+      ta.uuid as team_a_id, ta.name as team_a_name, ta.logo_url as team_a_logo,
+      tb.uuid as team_b_id, tb.name as team_b_name, tb.logo_url as team_b_logo
+    FROM tournament_matches tm
+    JOIN tournaments t ON tm.tournament_id = t.id
+    JOIN sports s ON t.sport_id = s.id
+    LEFT JOIN courts c ON tm.court_id = c.id
+    LEFT JOIN venues v ON COALESCE(tm.venue_id, t.venue_id) = v.id
+    LEFT JOIN teams ta ON tm.team_a_id = ta.id
+    LEFT JOIN teams tb ON tm.team_b_id = tb.id
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY tm.updated_at DESC, tm.id DESC
+    LIMIT ?
+  `;
+
+  params.push(safeLimit);
+  const rows = await db.query(sql, params);
+
+  return rows.map(m => {
+    let parsedSportState = null;
+    try {
+      parsedSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : m.sport_state;
+    } catch {
+      parsedSportState = null;
+    }
+
+    return {
+      id: m.public_id || m.match_id,
+      matchId: m.match_id,
+      uuid: m.public_id,
+      matchNumber: m.match_number,
+      status: m.status,
+      category: m.category,
+      showOnDisplay: m.show_on_display === null || m.show_on_display === undefined ? true : Boolean(m.show_on_display),
+      hasLiveStream: Boolean(m.has_live_stream),
+      liveStreamId: m.live_stream_id,
+      tournament: {
+        id: m.tournament_uuid || m.tournament_id,
+        tournamentId: m.tournament_id,
+        uuid: m.tournament_uuid,
+        name: m.tournament_name,
+        city: m.tournament_city
+      },
+      tournamentName: m.tournament_name,
+      tournamentCity: m.tournament_city,
+      tournamentId: m.tournament_uuid || m.tournament_id,
+      sport: {
+        id: m.sport_id,
+        slug: m.sport_slug,
+        name: m.sport_name
+      },
+      sportSlug: m.sport_slug,
+      court: {
+        id: m.court_id,
+        name: m.court_name || 'Main Court',
+        venueName: m.venue_name || 'Sports Arena',
+        city: m.venue_city || m.tournament_city || 'Mumbai'
+      },
+      courtName: m.court_name || 'Main Court',
+      venueName: m.venue_name || 'Sports Arena',
+      teamA: {
+        id: m.team_a_id,
+        name: m.team_a_name,
+        logo: m.team_a_logo
+      },
+      teamB: {
+        id: m.team_b_id,
+        name: m.team_b_name,
+        logo: m.team_b_logo
+      },
+      score: {
+        summary: m.live_score_summary,
+        subtext: m.live_subtext,
+        teamAScore: m.team_a_score,
+        teamBScore: m.team_b_score,
+        details: parsedSportState
+      }
+    };
+  });
+};
 
 module.exports = {
   getMatchByPublicId,
   getMatchEventsPaginated,
-  recordScoreEvent
+  recordScoreEvent,
+  getAllLiveMatches
 };
+

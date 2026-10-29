@@ -4,6 +4,7 @@ const tournamentService = require('../services/tournamentService');
 const scorerAccessService = require('../services/scorerAccessService');
 const streamPermissionService = require('../services/streamPermissionService');
 const fixtureService = require('../services/fixtureService');
+const matchService = require('../services/matchService');
 const auctionController = require('../controllers/auctionController');
 const { authenticateUser, optionalAuthenticateUser } = require('../middleware/authMiddleware');
 const { authorizeRoles } = require('../middleware/rbacMiddleware');
@@ -53,6 +54,40 @@ router.get('/scorers/my-matches', authenticateUser, async (req, res, next) => {
   }
 });
 
+// 1b. GET /api/tournaments/live & /live-all - Active Tournaments with Live Matches
+const getLiveTournamentsHandler = async (req, res, next) => {
+  try {
+    const liveMatches = await matchService.getAllLiveMatches(req.query);
+    const tournamentMap = new Map();
+    for (const m of liveMatches) {
+      const tId = m.tournamentId || (m.tournament && m.tournament.id);
+      if (!tId) continue;
+      if (!tournamentMap.has(tId)) {
+        tournamentMap.set(tId, {
+          tournament: m.tournament,
+          sport: m.sport,
+          liveMatches: []
+        });
+      }
+      tournamentMap.get(tId).liveMatches.push(m);
+    }
+    const liveTournaments = Array.from(tournamentMap.values());
+    res.json({
+      success: true,
+      data: {
+        tournaments: liveTournaments,
+        totalLiveTournaments: liveTournaments.length,
+        totalLiveMatches: liveMatches.length,
+        matches: liveMatches
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+router.get('/live', getLiveTournamentsHandler);
+router.get('/live-all', getLiveTournamentsHandler);
+
 // 2. GET /api/tournaments/:id - Overview details
 router.get('/:id', async (req, res, next) => {
   try {
@@ -91,6 +126,17 @@ router.delete('/:id', authenticateUser, async (req, res, next) => {
   }
 });
 
+// 2b. GET /api/tournaments/live & /api/tournaments/live-all - Active Live matches across all tournaments
+router.get(['/live', '/live-all'], async (req, res, next) => {
+  try {
+    const matchService = require('../services/matchService');
+    const matches = await matchService.getAllLiveMatches(req.query);
+    res.json({ success: true, data: { items: matches, count: matches.length } });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // 3. GET /api/tournaments/:id/live - Active Live match summaries
 router.get('/:id/live', async (req, res, next) => {
   try {
@@ -110,6 +156,28 @@ router.get('/:id/matches', async (req, res, next) => {
     next(error);
   }
 });
+
+// 4-live. GET /api/tournaments/:id/live & /:id/live-matches - All current LIVE matches in this tournament
+const getTournamentLiveMatchesHandler = async (req, res, next) => {
+  try {
+    const matches = await matchService.getAllLiveMatches({
+      tournamentId: req.params.id,
+      sport: req.query.sport,
+      limit: req.query.limit
+    });
+    res.json({
+      success: true,
+      data: {
+        items: matches,
+        count: matches.length
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+router.get('/:id/live', getTournamentLiveMatchesHandler);
+router.get('/:id/live-matches', getTournamentLiveMatchesHandler);
 
 // 4a. PUT /api/tournaments/:id/matches/display-bulk - Bulk Match Display Selection (Protected)
 router.put('/:id/matches/display-bulk', authenticateUser, async (req, res, next) => {

@@ -141,6 +141,7 @@ const getTournamentByPublicId = async (publicId) => {
       t.start_date, t.end_date, t.status, t.rules, t.has_auction,
       t.created_by, t.venue_id, v.owner_id as venue_owner_id,
       t.match_format, t.target_score, t.win_by_two, t.max_score, t.roster_size, t.groups_count,
+      t.sport_config,
       COALESCE(t.total_views, 0) as total_views,
       COALESCE(t.unique_viewers, 0) as unique_viewers,
       t.last_viewed_at,
@@ -162,9 +163,16 @@ const getTournamentByPublicId = async (publicId) => {
   }
 
   const t = rows[0];
+  let parsedSportConfig = {};
+  try {
+    parsedSportConfig = typeof t.sport_config === 'string' ? JSON.parse(t.sport_config) : (t.sport_config || {});
+  } catch {}
+
+  const scoringMode = parsedSportConfig?.scoringMode || 'RALLY';
 
   return {
     id: t.public_id,
+    internalId: t.id,
     name: t.name,
     description: t.description,
     format: t.format,
@@ -191,11 +199,13 @@ const getTournamentByPublicId = async (publicId) => {
     auctionId: t.auction_id || null,
     auctionStatus: t.auction_status || null,
     matchFormat: t.match_format || 'DOUBLES',
+    scoringMode,
     targetScore: t.target_score != null ? t.target_score : 15,
     winByTwo: t.win_by_two != null ? Boolean(t.win_by_two) : true,
     maxScore: t.max_score || null,
     rosterSize: t.roster_size || 12,
     groupsCount: t.groups_count || 2,
+    sportConfig: parsedSportConfig,
     sport: {
       name: t.sport_name,
       slug: t.sport_slug
@@ -1080,11 +1090,13 @@ const createTournament = async ({
   status = 'PUBLISHED',
   hasAuction = false,
   matchFormat = 'DOUBLES',
+  scoringMode = 'RALLY',
   targetScore = 15,
   winByTwo = true,
   maxScore = null,
   rosterSize = 12,
   groupsCount = 2,
+  sportConfig = null,
   user
 }) => {
   const crypto = require('crypto');
@@ -1216,6 +1228,11 @@ const createTournament = async ({
   const parsedRosterSize = Math.max(1, parseInt(rosterSize, 10) || 12);
   const parsedGroupsCount = Math.max(1, parseInt(groupsCount, 10) || 2);
   const resolvedMatchFormat = matchFormat === 'SINGLES' ? 'SINGLES' : 'DOUBLES';
+  const resolvedScoringMode = String(scoringMode || '').toUpperCase() === 'SIDE_OUT' ? 'SIDE_OUT' : 'RALLY';
+  const resolvedSportConfig = {
+    ...(typeof sportConfig === 'object' && sportConfig !== null ? sportConfig : {}),
+    scoringMode: resolvedScoringMode
+  };
 
   // 13. Persistence
   await db.query(
@@ -1223,8 +1240,8 @@ const createTournament = async ({
       uuid, name, sport_id, description, banner_url, format, venue_id,
       start_date, end_date, registration_deadline, entry_fee, max_teams,
       rules, status, created_by, has_auction,
-      match_format, target_score, win_by_two, max_score, roster_size, groups_count
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      match_format, target_score, win_by_two, max_score, roster_size, groups_count, sport_config
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       publicId,
       name.trim(),
@@ -1247,7 +1264,8 @@ const createTournament = async ({
       parsedWinByTwo,
       parsedMaxScore,
       parsedRosterSize,
-      parsedGroupsCount
+      parsedGroupsCount,
+      JSON.stringify(resolvedSportConfig)
     ]
   );
 

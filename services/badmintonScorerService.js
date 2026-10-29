@@ -140,7 +140,7 @@ async function getScorerState(matchPublicId) {
 /**
  * 2. Set Singles or Doubles active lineup.
  */
-async function setLineup(matchPublicId, { matchFormat = 'DOUBLES', teamALineup = [], teamBLineup = [] }, user) {
+async function setLineup(matchPublicId, { matchFormat = 'DOUBLES', teamALineup = [], teamBLineup = [], startingServingTeam = 'teamA' }, user) {
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
@@ -155,9 +155,20 @@ async function setLineup(matchPublicId, { matchFormat = 'DOUBLES', teamALineup =
     teamB: teamBLineup
   };
 
+  const isB = startingServingTeam === 'teamB' || startingServingTeam === 'B';
+  state.currentServer = isB ? 'B' : 'A';
+  state.servingTeam = isB ? 'teamB' : 'teamA';
+  state.startingServingTeam = state.servingTeam;
+  state.serverCourt = 'RIGHT';
+
   // Set initial server and receiver names
-  if (teamALineup.length > 0) state.serverPlayerName = teamALineup[0].name;
-  if (teamBLineup.length > 0) state.receiverPlayerName = teamBLineup[0].name;
+  if (isB) {
+    if (teamBLineup.length > 0) state.serverPlayerName = teamBLineup[0].name;
+    if (teamALineup.length > 0) state.receiverPlayerName = teamALineup[0].name;
+  } else {
+    if (teamALineup.length > 0) state.serverPlayerName = teamALineup[0].name;
+    if (teamBLineup.length > 0) state.receiverPlayerName = teamBLineup[0].name;
+  }
 
   await db.query(
     `UPDATE tournament_matches 
@@ -177,21 +188,36 @@ async function setLineup(matchPublicId, { matchFormat = 'DOUBLES', teamALineup =
 /**
  * 3. Start Badminton Match Live.
  */
-async function startMatch(matchPublicId, user) {
+async function startMatch(matchPublicId, reqBodyOrUser, maybeUser) {
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
+
+  if (match.status === 'LIVE') {
+    let currentState = {};
+    try {
+      currentState = typeof match.sport_state === 'string' ? JSON.parse(match.sport_state) : (match.sport_state || {});
+    } catch (_) {}
+    return { success: true, message: 'Badminton match is already live.', state: currentState };
+  }
 
   let state = {};
   try {
     state = typeof match.sport_state === 'string' ? JSON.parse(match.sport_state) : (match.sport_state || {});
   } catch (e) {}
 
+  const reqBody = (reqBodyOrUser && typeof reqBodyOrUser === 'object' && !reqBodyOrUser.role) ? reqBodyOrUser : {};
+  const startingServingTeam = reqBody.startingServingTeam || state.startingServingTeam || state.servingTeam || (state.currentServer === 'B' ? 'teamB' : 'teamA');
+  const isB = startingServingTeam === 'teamB' || startingServingTeam === 'B';
+
   state.currentGame = state.currentGame || 1;
-  state.currentServer = state.currentServer || 'A';
+  state.currentServer = isB ? 'B' : 'A';
+  state.servingTeam = isB ? 'teamB' : 'teamA';
+  state.startingServingTeam = state.servingTeam;
   state.serverCourt = 'RIGHT';
 
   const scoreSummary = `Game 1: 0 - 0`;
-  const liveSubtext = `Serving: ${match.team_a_name} (Right)`;
+  const serverTeamName = isB ? match.team_b_name : match.team_a_name;
+  const liveSubtext = `Serving: ${serverTeamName} (Right)`;
 
   state.eventSeq = 1;
 

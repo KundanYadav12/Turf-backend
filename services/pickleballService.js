@@ -341,15 +341,20 @@ const generateFixtures = async (tournamentId, { mode = 'ROUND_ROBIN', customMatc
       }
     }
   } else if (mode === 'CUSTOM' && Array.isArray(customMatches)) {
+    const { resolveTeamId } = require('./fixtureService');
     let matchNumber = 1;
     for (const m of customMatches) {
       if (!m.teamAId || !m.teamBId || m.teamAId === m.teamBId) continue;
+      const resolvedA = await resolveTeamId(m.teamAId);
+      const resolvedB = await resolveTeamId(m.teamBId);
+      if (!resolvedA || !resolvedB) continue;
+
       fixturesToInsert.push({
         uuid: crypto.randomUUID(),
         tournament_id: tournament.id,
         match_number: matchNumber++,
-        team_a_id: m.teamAId,
-        team_b_id: m.teamBId,
+        team_a_id: resolvedA,
+        team_b_id: resolvedB,
         group_name: m.groupName || 'Group 1',
         match_date: m.date || new Date().toISOString().slice(0, 10),
         start_time: m.startTime || '10:00:00',
@@ -404,6 +409,180 @@ const getTournamentStandings = async (tournamentId) => {
 };
 
 /**
+ * Deterministically calculates player positions ('RIGHT' | 'LEFT') for a pickleball doubles team
+ * based strictly on the team's score parity and immutable starting positions.
+ *
+ * Rules:
+ * - Even team score (0, 2, 4, 6, 8, 10, 12, 14...):
+ *     Player who started on RIGHT occupies RIGHT-side position.
+ *     Player who started on LEFT occupies LEFT-side position.
+ * - Odd team score (1, 3, 5, 7, 9, 11, 13, 15...):
+ *     Player who started on RIGHT occupies LEFT-side position.
+ *     Player who started on LEFT occupies RIGHT-side position.
+ */
+function calculatePickleballDoublesPositions(teamScore, originalPlayerPositions) {
+  const score = Math.max(0, parseInt(teamScore, 10) || 0);
+  const isEven = (score % 2 === 0);
+
+  let rightPlayerId = null;
+  let leftPlayerId = null;
+
+  if (Array.isArray(originalPlayerPositions)) {
+    if (originalPlayerPositions.length >= 2) {
+      const p0 = originalPlayerPositions[0];
+      const p1 = originalPlayerPositions[1];
+      const p0Id = (typeof p0 === 'object' && p0 !== null) ? (p0.name || p0.id) : String(p0);
+      const p1Id = (typeof p1 === 'object' && p1 !== null) ? (p1.name || p1.id) : String(p1);
+      const p0Court = (typeof p0 === 'object' && p0?.startCourt) ? String(p0.startCourt).toUpperCase() : 'RIGHT';
+      if (p0Court === 'RIGHT') {
+        rightPlayerId = p0Id;
+        leftPlayerId = p1Id;
+      } else {
+        rightPlayerId = p1Id;
+        leftPlayerId = p0Id;
+      }
+    } else if (originalPlayerPositions.length === 1) {
+      const p0 = originalPlayerPositions[0];
+      rightPlayerId = (typeof p0 === 'object' && p0 !== null) ? (p0.name || p0.id) : String(p0);
+    }
+  } else if (originalPlayerPositions && typeof originalPlayerPositions === 'object') {
+    for (const [id, court] of Object.entries(originalPlayerPositions)) {
+      if (String(court).toUpperCase() === 'RIGHT') rightPlayerId = id;
+      else if (String(court).toUpperCase() === 'LEFT') leftPlayerId = id;
+    }
+    if (!rightPlayerId && !leftPlayerId) {
+      const keys = Object.keys(originalPlayerPositions);
+      rightPlayerId = keys[0];
+      leftPlayerId = keys[1];
+    }
+  }
+
+  const result = {};
+  if (rightPlayerId && leftPlayerId) {
+    if (isEven) {
+      result[rightPlayerId] = 'RIGHT';
+      result[leftPlayerId] = 'LEFT';
+    } else {
+      result[rightPlayerId] = 'LEFT';
+      result[leftPlayerId] = 'RIGHT';
+    }
+  } else if (rightPlayerId) {
+    result[rightPlayerId] = isEven ? 'RIGHT' : 'LEFT';
+  }
+  return result;
+}
+
+/**
+ * Computes authoritative court state, player positions, serving team, server, and active service box.
+ */
+function computeAuthoritativeCourtState({
+  format = 'DOUBLES',
+  scoringMode = 'RALLY',
+  rotationRule = 'OFFICIAL',
+  scores = { teamA: 0, teamB: 0 },
+  lineup = { teamA: [], teamB: [] },
+  servingTeam = 'teamA',
+  serverNumber = 1,
+  teamA = { name: 'Team A' },
+  teamB = { name: 'Team B' },
+  existingPlayerLocations = null,
+  startingServingTeam = 'teamA'
+}) {
+  const isDoubles = format !== 'SINGLES';
+  const isBadmintonRule = String(rotationRule || '').toUpperCase() === 'BADMINTON' || String(rotationRule || '').toUpperCase() === 'BADMINTON_STYLE';
+  const isSideOut = !isBadmintonRule && String(scoringMode).toUpperCase() === 'SIDE_OUT';
+  const scoreA = Math.max(0, parseInt(scores.teamA, 10) || 0);
+  const scoreB = Math.max(0, parseInt(scores.teamB, 10) || 0);
+
+  const rawA = Array.isArray(lineup.teamA) ? lineup.teamA : [];
+  const rawB = Array.isArray(lineup.teamB) ? lineup.teamB : [];
+
+  const pA1 = typeof rawA[0] === 'string' ? rawA[0] : (rawA[0]?.name || `${teamA.name || 'Team A'} 1`);
+  const pA2 = typeof rawA[1] === 'string' ? rawA[1] : (rawA[1]?.name || `${teamA.name || 'Team A'} 2`);
+  const pB1 = typeof rawB[0] === 'string' ? rawB[0] : (rawB[0]?.name || `${teamB.name || 'Team B'} 1`);
+  const pB2 = typeof rawB[1] === 'string' ? rawB[1] : (rawB[1]?.name || `${teamB.name || 'Team B'} 2`);
+
+  const pA1Court = (typeof rawA[0] === 'object' && rawA[0]?.startCourt) ? String(rawA[0].startCourt).toUpperCase() : 'RIGHT';
+  const pA2Court = (typeof rawA[1] === 'object' && rawA[1]?.startCourt) ? String(rawA[1].startCourt).toUpperCase() : (pA1Court === 'RIGHT' ? 'LEFT' : 'RIGHT');
+  const pB1Court = (typeof rawB[0] === 'object' && rawB[0]?.startCourt) ? String(rawB[0].startCourt).toUpperCase() : 'RIGHT';
+  const pB2Court = (typeof rawB[1] === 'object' && rawB[1]?.startCourt) ? String(rawB[1].startCourt).toUpperCase() : (pB1Court === 'RIGHT' ? 'LEFT' : 'RIGHT');
+
+  const originalPositionsA = isDoubles ? { [pA1]: pA1Court, [pA2]: pA2Court } : { [pA1]: 'RIGHT' };
+  const originalPositionsB = isDoubles ? { [pB1]: pB1Court, [pB2]: pB2Court } : { [pB1]: 'RIGHT' };
+
+  let playerLocations = {};
+  if (existingPlayerLocations && typeof existingPlayerLocations === 'object' && Object.keys(existingPlayerLocations).length > 0) {
+    playerLocations = { ...existingPlayerLocations };
+  } else if (isDoubles) {
+    if (scoreA > 0 || scoreB > 0) {
+      const posA = calculatePickleballDoublesPositions(scoreA, originalPositionsA);
+      const posB = calculatePickleballDoublesPositions(scoreB, originalPositionsB);
+      playerLocations = { ...posA, ...posB };
+    } else {
+      playerLocations[pA1] = pA1Court;
+      playerLocations[pA2] = pA2Court;
+      playerLocations[pB1] = pB1Court;
+      playerLocations[pB2] = pB2Court;
+    }
+  } else {
+    playerLocations[pA1] = (scoreA % 2 === 0) ? 'RIGHT' : 'LEFT';
+    playerLocations[pB1] = (scoreB % 2 === 0) ? 'RIGHT' : 'LEFT';
+  }
+
+  // Ensure dual keying by ID as well if member objects provided
+  if (typeof rawA[0] === 'object' && rawA[0]?.id && playerLocations[pA1]) playerLocations[rawA[0].id] = playerLocations[pA1];
+  if (typeof rawA[1] === 'object' && rawA[1]?.id && playerLocations[pA2]) playerLocations[rawA[1].id] = playerLocations[pA2];
+  if (typeof rawB[0] === 'object' && rawB[0]?.id && playerLocations[pB1]) playerLocations[rawB[0].id] = playerLocations[pB1];
+  if (typeof rawB[1] === 'object' && rawB[1]?.id && playerLocations[pB2]) playerLocations[rawB[1].id] = playerLocations[pB2];
+
+  // Active serving court: Even score -> RIGHT box, Odd score -> LEFT box
+  const sScore = servingTeam === 'teamA' ? scoreA : scoreB;
+  const serviceCourt = (sScore % 2 === 0) ? 'RIGHT' : 'LEFT';
+  const receiverCourt = serviceCourt; // Cross-court diagonal
+
+  // Active server player
+  const sPlayers = servingTeam === 'teamA'
+    ? (isDoubles ? [pA1, pA2] : [pA1])
+    : (isDoubles ? [pB1, pB2] : [pB1]);
+  const activeServerName = sPlayers.find(p => (playerLocations[p] || playerLocations[p?.name] || playerLocations[p?.id]) === serviceCourt) || sPlayers[0];
+
+  const rPlayers = servingTeam === 'teamA'
+    ? (isDoubles ? [pB1, pB2] : [pB1])
+    : (isDoubles ? [pA1, pA2] : [pA1]);
+  const activeReceiverName = rPlayers.find(p => (playerLocations[p] || playerLocations[p?.name] || playerLocations[p?.id]) === receiverCourt) || rPlayers[0];
+
+  // Screen box names (Assuming Team A on LEFT facing right, Team B on RIGHT facing left)
+  // Left team: RIGHT court is bottom-left, LEFT court is top-left
+  // Right team: RIGHT court is top-right, LEFT court is bottom-right
+  const servingBoxName = servingTeam === 'teamA'
+    ? (serviceCourt === 'RIGHT' ? 'bottom-left' : 'top-left')
+    : (serviceCourt === 'RIGHT' ? 'top-right' : 'bottom-right');
+
+  const targetBoxName = servingTeam === 'teamA'
+    ? (receiverCourt === 'RIGHT' ? 'top-right' : 'bottom-right')
+    : (receiverCourt === 'RIGHT' ? 'bottom-left' : 'top-left');
+
+  return {
+    format: isDoubles ? 'DOUBLES' : 'SINGLES',
+    scoringMode: isBadmintonRule ? 'RALLY' : (isSideOut ? 'SIDE_OUT' : 'RALLY'),
+    rotationRule: isBadmintonRule ? 'BADMINTON' : 'OFFICIAL',
+    servingTeam,
+    serverNumber: isBadmintonRule ? 1 : (isSideOut && isDoubles ? (serverNumber || 1) : 1),
+    serviceCourt,
+    receiverCourt,
+    servingBoxName,
+    targetBoxName,
+    activeServerName,
+    activeReceiverName,
+    playerLocations,
+    originalPositions: {
+      teamA: originalPositionsA,
+      teamB: originalPositionsB
+    }
+  };
+}
+
+/**
  * Helper to fetch match entity by public ID.
  */
 const getMatchEntity = async (matchId) => {
@@ -411,9 +590,9 @@ const getMatchEntity = async (matchId) => {
     `SELECT tm.id, tm.uuid, tm.tournament_id, tm.match_number, tm.status,
             tm.team_a_id, tm.team_b_id, tm.team_a_score, tm.team_b_score,
             tm.team_a_lineup, tm.team_b_lineup, tm.group_name, tm.winner_team_id,
-            tm.result_summary, tm.live_score_summary,
+            tm.result_summary, tm.live_score_summary, tm.sport_state,
             t.uuid as tournament_uuid, t.name as tournament_name,
-            t.match_format, t.target_score, t.win_by_two, t.max_score,
+            t.match_format, t.target_score, t.win_by_two, t.max_score, t.sport_config, t.rules as tournament_rules,
             ta.uuid as team_a_uuid, ta.name as team_a_name, ta.logo_url as team_a_logo,
             tb.uuid as team_b_uuid, tb.name as team_b_name, tb.logo_url as team_b_logo
      FROM tournament_matches tm
@@ -476,6 +655,37 @@ const getScorerState = async (matchId) => {
     // ignore
   }
 
+  let sportConfig = null;
+  try {
+    sportConfig = typeof m.sport_config === 'string' ? JSON.parse(m.sport_config) : (m.sport_config || {});
+  } catch {
+    // ignore
+  }
+
+  let sportState = null;
+  try {
+    sportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {
+    // ignore
+  }
+
+  const rotationRule = sportState?.rotationRule || sportConfig?.rotationRule || 'OFFICIAL';
+  const isBadmintonRule = String(rotationRule).toUpperCase() === 'BADMINTON';
+  const scoringMode = isBadmintonRule ? 'RALLY' : (sportConfig?.scoringMode || sportState?.scoringMode || 'RALLY');
+  const courtState = computeAuthoritativeCourtState({
+    format: m.match_format || 'DOUBLES',
+    scoringMode,
+    rotationRule,
+    scores: { teamA: m.team_a_score || 0, teamB: m.team_b_score || 0 },
+    lineup: { teamA: parsedALineup || [], teamB: parsedBLineup || [] },
+    servingTeam: sportState?.servingTeam || 'teamA',
+    serverNumber: sportState?.serverNumber || (scoringMode === 'SIDE_OUT' && m.match_format !== 'SINGLES' ? 2 : 1),
+    teamA: { id: m.team_a_uuid, name: m.team_a_name },
+    teamB: { id: m.team_b_uuid, name: m.team_b_name },
+    existingPlayerLocations: sportState?.playerLocations || null,
+    startingServingTeam: sportState?.startingServingTeam || 'teamA'
+  });
+
   return {
     matchId: m.uuid,
     matchNumber: m.match_number,
@@ -487,9 +697,12 @@ const getScorerState = async (matchId) => {
     },
     rules: {
       matchFormat: m.match_format || 'DOUBLES',
+      scoringMode,
+      rotationRule,
       targetScore: m.target_score != null ? m.target_score : 15,
       winByTwo: m.win_by_two != null ? Boolean(m.win_by_two) : true,
-      maxScore: m.max_score || null
+      maxScore: m.max_score || null,
+      tournamentRules: m.tournament_rules || null
     },
     scores: {
       teamA: m.team_a_score || 0,
@@ -513,6 +726,22 @@ const getScorerState = async (matchId) => {
       logo: m.team_b_logo,
       squad: squadB
     },
+    sportState: {
+      ...(sportState || {}),
+      scoringMode,
+      rotationRule: courtState.rotationRule,
+      servingTeam: courtState.servingTeam,
+      serverNumber: courtState.serverNumber,
+      serviceCourt: courtState.serviceCourt,
+      receiverCourt: courtState.receiverCourt,
+      servingBoxName: courtState.servingBoxName,
+      targetBoxName: courtState.targetBoxName,
+      activeServerName: courtState.activeServerName,
+      activeReceiverName: courtState.activeReceiverName,
+      playerLocations: courtState.playerLocations,
+      originalPositions: courtState.originalPositions
+    },
+    courtState,
     logs
   };
 };
@@ -520,7 +749,7 @@ const getScorerState = async (matchId) => {
 /**
  * 8. Set active lineup before starting match.
  */
-const setLineup = async (matchId, { teamALineup, teamBLineup }, user) => {
+const setLineup = async (matchId, { teamALineup, teamBLineup, startingServingTeam = 'teamA', rotationRule }, user) => {
   const m = await getMatchEntity(matchId);
   if (!m) {
     throw { statusCode: 404, message: 'Match not found.' };
@@ -550,11 +779,59 @@ const setLineup = async (matchId, { teamALineup, teamBLineup }, user) => {
     throw { statusCode: 400, message: 'Team B active lineup contains duplicate players.' };
   }
 
+  let sportConfig = null;
+  try {
+    sportConfig = typeof m.sport_config === 'string' ? JSON.parse(m.sport_config) : (m.sport_config || {});
+  } catch {}
+  let currentSportState = null;
+  try {
+    currentSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {}
+
+  const resolvedRotationRule = rotationRule || currentSportState?.rotationRule || sportConfig?.rotationRule || 'OFFICIAL';
+  const isBadmintonRule = String(resolvedRotationRule).toUpperCase() === 'BADMINTON';
+  const scoringMode = isBadmintonRule ? 'RALLY' : (sportConfig?.scoringMode || currentSportState?.scoringMode || 'RALLY');
+
+  const isSideOut = !isBadmintonRule && String(scoringMode).toUpperCase() === 'SIDE_OUT';
+  const isDoubles = format !== 'SINGLES';
+  const serverNumber = isBadmintonRule ? 1 : ((isSideOut && isDoubles) ? 2 : 1);
+
+  const initialCourtState = computeAuthoritativeCourtState({
+    format,
+    scoringMode,
+    rotationRule: resolvedRotationRule,
+    scores: { teamA: m.team_a_score || 0, teamB: m.team_b_score || 0 },
+    lineup: { teamA: teamALineup, teamB: teamBLineup },
+    servingTeam: startingServingTeam === 'teamB' ? 'teamB' : 'teamA',
+    serverNumber,
+    teamA: { id: m.team_a_uuid, name: m.team_a_name },
+    teamB: { id: m.team_b_uuid, name: m.team_b_name },
+    startingServingTeam
+  });
+
+  const sportStateToSave = {
+    scoringMode,
+    rotationRule: initialCourtState.rotationRule,
+    servingTeam: initialCourtState.servingTeam,
+    startingServingTeam: initialCourtState.servingTeam,
+    serverNumber: initialCourtState.serverNumber,
+    serviceCourt: initialCourtState.serviceCourt,
+    receiverCourt: initialCourtState.receiverCourt,
+    servingBoxName: initialCourtState.servingBoxName,
+    targetBoxName: initialCourtState.targetBoxName,
+    activeServerName: initialCourtState.activeServerName,
+    activeReceiverName: initialCourtState.activeReceiverName,
+    playerLocations: initialCourtState.playerLocations,
+    originalPositions: initialCourtState.originalPositions,
+    firstServeConfirmed: true
+  };
+
   await db.query(
     `UPDATE tournament_matches 
-     SET team_a_lineup = ?, team_b_lineup = ?, status = CASE WHEN status = 'SCHEDULED' THEN 'READY' ELSE status END
+     SET team_a_lineup = ?, team_b_lineup = ?, sport_state = ?,
+         status = CASE WHEN status = 'SCHEDULED' THEN 'READY' ELSE status END
      WHERE id = ?`,
-    [JSON.stringify(teamALineup), JSON.stringify(teamBLineup), m.id]
+    [JSON.stringify(teamALineup), JSON.stringify(teamBLineup), JSON.stringify(sportStateToSave), m.id]
   );
 
   return await getScorerState(m.uuid);
@@ -563,7 +840,7 @@ const setLineup = async (matchId, { teamALineup, teamBLineup }, user) => {
 /**
  * 9. Start Match.
  */
-const startMatch = async (matchId, user) => {
+const startMatch = async (matchId, body = {}, user) => {
   const m = await getMatchEntity(matchId);
   if (!m) {
     throw { statusCode: 404, message: 'Match not found.' };
@@ -573,23 +850,221 @@ const startMatch = async (matchId, user) => {
     throw { statusCode: 400, message: 'Match is already completed.' };
   }
 
+  // Idempotency: If match is already LIVE, return current live state without resetting scores
+  if (m.status === 'LIVE') {
+    return await getScorerState(m.uuid);
+  }
+
+  let sportConfig = null;
+  try {
+    sportConfig = typeof m.sport_config === 'string' ? JSON.parse(m.sport_config) : (m.sport_config || {});
+  } catch {}
+  let currentSportState = null;
+  try {
+    currentSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {}
+
+  const rotationRule = (body && body.rotationRule) || currentSportState?.rotationRule || sportConfig?.rotationRule || 'OFFICIAL';
+  const isBadmintonRule = String(rotationRule).toUpperCase() === 'BADMINTON';
+  const scoringMode = isBadmintonRule ? 'RALLY' : (sportConfig?.scoringMode || currentSportState?.scoringMode || 'RALLY');
+  const format = m.match_format || 'DOUBLES';
+  const isDoubles = format !== 'SINGLES';
+  const isSideOut = !isBadmintonRule && String(scoringMode).toUpperCase() === 'SIDE_OUT';
+  const startingServingTeam = (body && (body.startingServingTeam || body.startingServeTeam)) || currentSportState?.startingServingTeam || currentSportState?.servingTeam || 'teamA';
+  const serverNumber = isBadmintonRule ? 1 : ((isSideOut && isDoubles) ? 2 : 1);
+
+  const parsedALineup = typeof m.team_a_lineup === 'string' ? JSON.parse(m.team_a_lineup) : (m.team_a_lineup || []);
+  const parsedBLineup = typeof m.team_b_lineup === 'string' ? JSON.parse(m.team_b_lineup) : (m.team_b_lineup || []);
+
+  const initialCourtState = computeAuthoritativeCourtState({
+    format,
+    scoringMode,
+    rotationRule,
+    scores: { teamA: 0, teamB: 0 },
+    lineup: { teamA: parsedALineup, teamB: parsedBLineup },
+    servingTeam: startingServingTeam === 'teamB' ? 'teamB' : 'teamA',
+    serverNumber,
+    teamA: { id: m.team_a_uuid, name: m.team_a_name },
+    teamB: { id: m.team_b_uuid, name: m.team_b_name },
+    startingServingTeam
+  });
+
+  const sportStateToSave = {
+    scoringMode,
+    rotationRule: initialCourtState.rotationRule,
+    servingTeam: initialCourtState.servingTeam,
+    startingServingTeam: initialCourtState.servingTeam,
+    serverNumber: initialCourtState.serverNumber,
+    serviceCourt: initialCourtState.serviceCourt,
+    receiverCourt: initialCourtState.receiverCourt,
+    servingBoxName: initialCourtState.servingBoxName,
+    targetBoxName: initialCourtState.targetBoxName,
+    activeServerName: initialCourtState.activeServerName,
+    activeReceiverName: initialCourtState.activeReceiverName,
+    playerLocations: initialCourtState.playerLocations,
+    originalPositions: initialCourtState.originalPositions,
+    firstServeConfirmed: true
+  };
+
   await db.query(
     `UPDATE tournament_matches 
-     SET status = 'LIVE', live_score_summary = '0 - 0'
+     SET status = 'LIVE', live_score_summary = '0 - 0', team_a_score = 0, team_b_score = 0, sport_state = ?
      WHERE id = ?`,
-    [m.id]
+    [JSON.stringify(sportStateToSave), m.id]
   );
+
+  const state = await getScorerState(m.uuid);
 
   // Broadcast
   broadcastPickleballScore(m.uuid, m.tournament_uuid, {
     status: 'LIVE',
-    teamAScore: m.team_a_score || 0,
-    teamBScore: m.team_b_score || 0,
-    isCompleted: false
+    teamAScore: 0,
+    teamBScore: 0,
+    isCompleted: false,
+    sportState: sportStateToSave,
+    courtState: initialCourtState,
+    state
   });
 
-  return await getScorerState(m.uuid);
+  return state;
 };
+
+/**
+ * Deterministically reconstructs match state (scores, serving team, server number, and player court locations)
+ * by replaying point logs from the match start.
+ */
+function replayMatchFromLogs(m, logs = []) {
+  let sportConfig = null;
+  try {
+    sportConfig = typeof m.sport_config === 'string' ? JSON.parse(m.sport_config) : (m.sport_config || {});
+  } catch {}
+  let currentSportState = null;
+  try {
+    currentSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {}
+
+  const rotationRule = currentSportState?.rotationRule || sportConfig?.rotationRule || 'OFFICIAL';
+  const isBadmintonRule = String(rotationRule).toUpperCase() === 'BADMINTON';
+  const scoringMode = isBadmintonRule ? 'RALLY' : (sportConfig?.scoringMode || currentSportState?.scoringMode || 'RALLY');
+  const isSideOut = !isBadmintonRule && String(scoringMode).toUpperCase() === 'SIDE_OUT';
+  const format = m.match_format || 'DOUBLES';
+  const isDoubles = format !== 'SINGLES';
+
+  let parsedALineup = null;
+  let parsedBLineup = null;
+  try {
+    parsedALineup = typeof m.team_a_lineup === 'string' ? JSON.parse(m.team_a_lineup) : m.team_a_lineup;
+    parsedBLineup = typeof m.team_b_lineup === 'string' ? JSON.parse(m.team_b_lineup) : m.team_b_lineup;
+  } catch {}
+
+  const pA1 = typeof parsedALineup?.[0] === 'string' ? parsedALineup[0] : (parsedALineup?.[0]?.name || `${m.team_a_name || 'Team A'} 1`);
+  const pA2 = typeof parsedALineup?.[1] === 'string' ? parsedALineup[1] : (parsedALineup?.[1]?.name || `${m.team_a_name || 'Team A'} 2`);
+  const pB1 = typeof parsedBLineup?.[0] === 'string' ? parsedBLineup[0] : (parsedBLineup?.[0]?.name || `${m.team_b_name || 'Team B'} 1`);
+  const pB2 = typeof parsedBLineup?.[1] === 'string' ? parsedBLineup[1] : (parsedBLineup?.[1]?.name || `${m.team_b_name || 'Team B'} 2`);
+
+  const pA1Court = (typeof parsedALineup?.[0] === 'object' && parsedALineup?.[0]?.startCourt) ? String(parsedALineup[0].startCourt).toUpperCase() : 'RIGHT';
+  const pA2Court = (typeof parsedALineup?.[1] === 'object' && parsedALineup?.[1]?.startCourt) ? String(parsedALineup[1].startCourt).toUpperCase() : (pA1Court === 'RIGHT' ? 'LEFT' : 'RIGHT');
+  const pB1Court = (typeof parsedBLineup?.[0] === 'object' && parsedBLineup?.[0]?.startCourt) ? String(parsedBLineup[0].startCourt).toUpperCase() : 'RIGHT';
+  const pB2Court = (typeof parsedBLineup?.[1] === 'object' && parsedBLineup?.[1]?.startCourt) ? String(parsedBLineup[1].startCourt).toUpperCase() : (pB1Court === 'RIGHT' ? 'LEFT' : 'RIGHT');
+
+  let curServing = currentSportState?.startingServingTeam || 'teamA';
+  let curServerNum = (isSideOut && isDoubles) ? 2 : 1;
+  let scoreA = 0;
+  let scoreB = 0;
+
+  let playerLocations = {};
+  if (isDoubles) {
+    playerLocations[pA1] = pA1Court;
+    playerLocations[pA2] = pA2Court;
+    playerLocations[pB1] = pB1Court;
+    playerLocations[pB2] = pB2Court;
+  } else {
+    playerLocations[pA1] = 'RIGHT';
+    playerLocations[pB1] = 'RIGHT';
+  }
+
+  // Dual key by ID
+  if (typeof parsedALineup?.[0] === 'object' && parsedALineup[0]?.id) playerLocations[parsedALineup[0].id] = playerLocations[pA1];
+  if (typeof parsedALineup?.[1] === 'object' && parsedALineup[1]?.id) playerLocations[parsedALineup[1].id] = playerLocations[pA2];
+  if (typeof parsedBLineup?.[0] === 'object' && parsedBLineup[0]?.id) playerLocations[parsedBLineup[0].id] = playerLocations[pB1];
+  if (typeof parsedBLineup?.[1] === 'object' && parsedBLineup[1]?.id) playerLocations[parsedBLineup[1].id] = playerLocations[pB2];
+
+  const sorted = [...logs].sort((a, b) => (a.sequence_number || 0) - (b.sequence_number || 0));
+  for (const log of sorted) {
+    if (log.event_type === 'CORRECTION') {
+      if (log.team_a_score != null) scoreA = log.team_a_score;
+      if (log.team_b_score != null) scoreB = log.team_b_score;
+      continue;
+    }
+    const pointTo = (log.point_to === 'team_b' || log.pointTo === 'teamB') ? 'teamB' : 'teamA';
+    const isServingTeamWinner = pointTo === curServing;
+
+    if (isSideOut) {
+      if (isServingTeamWinner) {
+        if (pointTo === 'teamA') scoreA += 1;
+        else scoreB += 1;
+
+        if (isDoubles) {
+          const sP1 = curServing === 'teamA' ? pA1 : pB1;
+          const sP2 = curServing === 'teamA' ? pA2 : pB2;
+          const loc1 = playerLocations[sP1] || 'RIGHT';
+          const loc2 = playerLocations[sP2] || 'LEFT';
+          playerLocations[sP1] = loc2;
+          playerLocations[sP2] = loc1;
+        }
+      } else {
+        if (isDoubles) {
+          if (curServerNum === 1) {
+            curServerNum = 2;
+          } else {
+            curServing = curServing === 'teamA' ? 'teamB' : 'teamA';
+            curServerNum = 1;
+          }
+        } else {
+          curServing = curServing === 'teamA' ? 'teamB' : 'teamA';
+          curServerNum = 1;
+        }
+      }
+    } else {
+      // Rally scoring
+      if (pointTo === 'teamA') scoreA += 1;
+      else scoreB += 1;
+
+      if (isServingTeamWinner) {
+        if (isDoubles) {
+          const sP1 = curServing === 'teamA' ? pA1 : pB1;
+          const sP2 = curServing === 'teamA' ? pA2 : pB2;
+          const loc1 = playerLocations[sP1] || 'RIGHT';
+          const loc2 = playerLocations[sP2] || 'LEFT';
+          playerLocations[sP1] = loc2;
+          playerLocations[sP2] = loc1;
+        }
+      } else {
+        curServing = pointTo;
+        curServerNum = 1;
+      }
+    }
+
+    if (!isDoubles) {
+      playerLocations[pA1] = (scoreA % 2 === 0) ? 'RIGHT' : 'LEFT';
+      playerLocations[pB1] = (scoreB % 2 === 0) ? 'RIGHT' : 'LEFT';
+    }
+  }
+
+  // Dual key sync
+  if (typeof parsedALineup?.[0] === 'object' && parsedALineup[0]?.id) playerLocations[parsedALineup[0].id] = playerLocations[pA1];
+  if (typeof parsedALineup?.[1] === 'object' && parsedALineup[1]?.id) playerLocations[parsedALineup[1].id] = playerLocations[pA2];
+  if (typeof parsedBLineup?.[0] === 'object' && parsedBLineup[0]?.id) playerLocations[parsedBLineup[0].id] = playerLocations[pB1];
+  if (typeof parsedBLineup?.[1] === 'object' && parsedBLineup[1]?.id) playerLocations[parsedBLineup[1].id] = playerLocations[pB2];
+
+  return {
+    scores: { teamA: scoreA, teamB: scoreB },
+    servingTeam: curServing,
+    serverNumber: isBadmintonRule ? 1 : curServerNum,
+    rotationRule: isBadmintonRule ? 'BADMINTON' : 'OFFICIAL',
+    playerLocations
+  };
+}
 
 /**
  * 10. Record Point (+1 to Team A or Team B).
@@ -614,14 +1089,119 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = nu
     throw { statusCode: 400, message: 'Invalid pointTo value. Must be "team_a" or "team_b".' };
   }
 
+  let sportConfig = null;
+  try {
+    sportConfig = typeof m.sport_config === 'string' ? JSON.parse(m.sport_config) : (m.sport_config || {});
+  } catch {}
+  let currentSportState = null;
+  try {
+    currentSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {}
+
+  const rotationRule = currentSportState?.rotationRule || sportConfig?.rotationRule || 'OFFICIAL';
+  const isBadmintonRule = String(rotationRule).toUpperCase() === 'BADMINTON';
+  const scoringMode = isBadmintonRule ? 'RALLY' : (sportConfig?.scoringMode || currentSportState?.scoringMode || 'RALLY');
+  const isSideOut = !isBadmintonRule && String(scoringMode).toUpperCase() === 'SIDE_OUT';
+  const isDoubles = (m.match_format || 'DOUBLES') !== 'SINGLES';
+
   let newScoreA = m.team_a_score || 0;
   let newScoreB = m.team_b_score || 0;
+  let curServing = currentSportState?.servingTeam || 'teamA';
+  let curServerNum = isBadmintonRule ? 1 : (currentSportState?.serverNumber || (isSideOut && isDoubles ? 2 : 1));
+  let nextServingTeam = curServing;
+  let nextServerNumber = curServerNum;
 
-  if (pointTo === 'team_a') {
-    newScoreA += 1;
+  const winningTeamKey = pointTo === 'team_a' ? 'teamA' : 'teamB';
+  const isServingTeamWinner = winningTeamKey === curServing;
+
+  let parsedALineup = null;
+  let parsedBLineup = null;
+  try {
+    parsedALineup = typeof m.team_a_lineup === 'string' ? JSON.parse(m.team_a_lineup) : m.team_a_lineup;
+    parsedBLineup = typeof m.team_b_lineup === 'string' ? JSON.parse(m.team_b_lineup) : m.team_b_lineup;
+  } catch {}
+
+  const pA1 = typeof parsedALineup?.[0] === 'string' ? parsedALineup[0] : (parsedALineup?.[0]?.name || `${m.team_a_name || 'Team A'} 1`);
+  const pA2 = typeof parsedALineup?.[1] === 'string' ? parsedALineup[1] : (parsedALineup?.[1]?.name || `${m.team_a_name || 'Team A'} 2`);
+  const pB1 = typeof parsedBLineup?.[0] === 'string' ? parsedBLineup[0] : (parsedBLineup?.[0]?.name || `${m.team_b_name || 'Team B'} 1`);
+  const pB2 = typeof parsedBLineup?.[1] === 'string' ? parsedBLineup[1] : (parsedBLineup?.[1]?.name || `${m.team_b_name || 'Team B'} 2`);
+
+  let currentLocations = { ...(currentSportState?.playerLocations || {}) };
+  if (isDoubles) {
+    if (!currentLocations[pA1]) currentLocations[pA1] = 'RIGHT';
+    if (!currentLocations[pA2]) currentLocations[pA2] = 'LEFT';
+    if (!currentLocations[pB1]) currentLocations[pB1] = 'RIGHT';
+    if (!currentLocations[pB2]) currentLocations[pB2] = 'LEFT';
   } else {
-    newScoreB += 1;
+    if (!currentLocations[pA1]) currentLocations[pA1] = (newScoreA % 2 === 0) ? 'RIGHT' : 'LEFT';
+    if (!currentLocations[pB1]) currentLocations[pB1] = (newScoreB % 2 === 0) ? 'RIGHT' : 'LEFT';
   }
+
+  let nextLocations = { ...currentLocations };
+
+  if (isSideOut) {
+    if (isServingTeamWinner) {
+      if (pointTo === 'team_a') newScoreA += 1;
+      else newScoreB += 1;
+
+      // Serving team partners swap courts (RIGHT <-> LEFT). Receiving team NEVER swaps!
+      if (isDoubles) {
+        const sP1 = curServing === 'teamA' ? pA1 : pB1;
+        const sP2 = curServing === 'teamA' ? pA2 : pB2;
+        const loc1 = currentLocations[sP1] || 'RIGHT';
+        const loc2 = currentLocations[sP2] || 'LEFT';
+        nextLocations[sP1] = loc2;
+        nextLocations[sP2] = loc1;
+      }
+    } else {
+      // Receiving team won rally in Side-Out: no score change, nobody swaps!
+      if (isDoubles) {
+        if (curServerNum === 1) {
+          nextServerNumber = 2;
+        } else {
+          nextServingTeam = curServing === 'teamA' ? 'teamB' : 'teamA';
+          nextServerNumber = 1;
+        }
+      } else {
+        nextServingTeam = curServing === 'teamA' ? 'teamB' : 'teamA';
+        nextServerNumber = 1;
+      }
+    }
+  } else {
+    // RALLY SCORING (Every rally awards 1 point)
+    if (pointTo === 'team_a') {
+      newScoreA += 1;
+    } else {
+      newScoreB += 1;
+    }
+
+    if (isServingTeamWinner) {
+      // Serving team partners swap courts (RIGHT <-> LEFT). Receiving team NEVER swaps!
+      if (isDoubles) {
+        const sP1 = curServing === 'teamA' ? pA1 : pB1;
+        const sP2 = curServing === 'teamA' ? pA2 : pB2;
+        const loc1 = currentLocations[sP1] || 'RIGHT';
+        const loc2 = currentLocations[sP2] || 'LEFT';
+        nextLocations[sP1] = loc2;
+        nextLocations[sP2] = loc1;
+      }
+    } else {
+      // Receiving team won rally in Rally scoring: serve transfers with NO SWAP!
+      nextServingTeam = winningTeamKey;
+      nextServerNumber = 1;
+    }
+  }
+
+  if (!isDoubles) {
+    nextLocations[pA1] = (newScoreA % 2 === 0) ? 'RIGHT' : 'LEFT';
+    nextLocations[pB1] = (newScoreB % 2 === 0) ? 'RIGHT' : 'LEFT';
+  }
+
+  // Dual key nextLocations by ID
+  if (typeof parsedALineup?.[0] === 'object' && parsedALineup[0]?.id) nextLocations[parsedALineup[0].id] = nextLocations[pA1];
+  if (typeof parsedALineup?.[1] === 'object' && parsedALineup[1]?.id) nextLocations[parsedALineup[1].id] = nextLocations[pA2];
+  if (typeof parsedBLineup?.[0] === 'object' && parsedBLineup[0]?.id) nextLocations[parsedBLineup[0].id] = nextLocations[pB1];
+  if (typeof parsedBLineup?.[1] === 'object' && parsedBLineup[1]?.id) nextLocations[parsedBLineup[1].id] = nextLocations[pB2];
 
   const targetScore = m.target_score != null ? m.target_score : 15;
   const winByTwo = m.win_by_two != null ? Boolean(m.win_by_two) : true;
@@ -654,14 +1234,45 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = nu
   const newStatus = isCompleted ? 'COMPLETED' : 'LIVE';
   const liveScoreSummary = `${newScoreA} - ${newScoreB}`;
 
+  const nextCourtState = computeAuthoritativeCourtState({
+    format: m.match_format || 'DOUBLES',
+    scoringMode,
+    rotationRule,
+    scores: { teamA: newScoreA, teamB: newScoreB },
+    lineup: { teamA: parsedALineup || [], teamB: parsedBLineup || [] },
+    servingTeam: nextServingTeam,
+    serverNumber: nextServerNumber,
+    teamA: { id: m.team_a_uuid, name: m.team_a_name },
+    teamB: { id: m.team_b_uuid, name: m.team_b_name },
+    existingPlayerLocations: nextLocations
+  });
+
+  const updatedSportState = {
+    scoringMode,
+    rotationRule: nextCourtState.rotationRule,
+    servingTeam: nextCourtState.servingTeam,
+    startingServingTeam: currentSportState?.startingServingTeam || nextCourtState.servingTeam,
+    serverNumber: nextCourtState.serverNumber,
+    serviceCourt: nextCourtState.serviceCourt,
+    receiverCourt: nextCourtState.receiverCourt,
+    servingBoxName: nextCourtState.servingBoxName,
+    targetBoxName: nextCourtState.targetBoxName,
+    activeServerName: nextCourtState.activeServerName,
+    activeReceiverName: nextCourtState.activeReceiverName,
+    playerLocations: nextCourtState.playerLocations,
+    originalPositions: nextCourtState.originalPositions,
+    firstServeConfirmed: true
+  };
+
   // Update match in database
   await db.query(
     `UPDATE tournament_matches
      SET team_a_score = ?, team_b_score = ?, status = ?,
          winner_team_id = ?, result_summary = ?, live_score_summary = ?,
+         sport_state = ?,
          end_time = CASE WHEN ? = 'COMPLETED' THEN CURRENT_TIME ELSE end_time END
      WHERE id = ?`,
-    [newScoreA, newScoreB, newStatus, winnerTeamId, resultSummary, liveScoreSummary, newStatus, m.id]
+    [newScoreA, newScoreB, newStatus, winnerTeamId, resultSummary, liveScoreSummary, JSON.stringify(updatedSportState), newStatus, m.id]
   );
 
   // Get next sequence number
@@ -697,14 +1308,14 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = nu
     eventId: eventId || `pt-${m.id}-${nextSeq}-${Date.now()}`,
     seq: seq || nextSeq,
     from: from || {
-      side: 'left',
-      box: (m.team_a_score || 0) % 2 === 0 ? 'bottom' : 'top',
-      boxName: (m.team_a_score || 0) % 2 === 0 ? 'bottom-left' : 'top-left'
+      side: nextCourtState.servingTeam === 'teamA' ? 'left' : 'right',
+      box: nextCourtState.serviceCourt === 'RIGHT' ? (nextCourtState.servingTeam === 'teamA' ? 'bottom' : 'top') : (nextCourtState.servingTeam === 'teamA' ? 'top' : 'bottom'),
+      boxName: nextCourtState.servingBoxName
     },
     to: to || {
-      side: 'right',
-      box: (m.team_a_score || 0) % 2 === 0 ? 'top' : 'bottom',
-      boxName: (m.team_a_score || 0) % 2 === 0 ? 'top-right' : 'bottom-right'
+      side: nextCourtState.servingTeam === 'teamA' ? 'right' : 'left',
+      box: nextCourtState.receiverCourt === 'RIGHT' ? (nextCourtState.servingTeam === 'teamA' ? 'top' : 'bottom') : (nextCourtState.servingTeam === 'teamA' ? 'bottom' : 'top'),
+      boxName: nextCourtState.targetBoxName
     },
     timestamp: Date.now()
   };
@@ -720,6 +1331,8 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = nu
     winnerTeamId,
     resultSummary,
     isCompleted,
+    sportState: updatedSportState,
+    courtState: nextCourtState,
     state,
     pointEvent
   });
@@ -738,10 +1351,10 @@ const undoPoint = async (matchId, user) => {
 
   // Fetch the latest log
   const latestLogs = await db.query(
-    `SELECT id, sequence_number, team_a_score, team_b_score 
+    `SELECT id, sequence_number, point_to, team_a_score, team_b_score 
      FROM pickleball_score_logs 
      WHERE match_id = ? 
-     ORDER BY sequence_number DESC LIMIT 2`,
+     ORDER BY sequence_number DESC LIMIT 1`,
     [m.id]
   );
 
@@ -750,25 +1363,82 @@ const undoPoint = async (matchId, user) => {
   }
 
   const currentLog = latestLogs[0];
-  const prevLog = latestLogs.length > 1 ? latestLogs[1] : null;
-
-  const revertedA = prevLog ? prevLog.team_a_score : 0;
-  const revertedB = prevLog ? prevLog.team_b_score : 0;
 
   // Delete the undone log
   await db.query(`DELETE FROM pickleball_score_logs WHERE id = ?`, [currentLog.id]);
 
-  const liveScoreSummary = `${revertedA} - ${revertedB}`;
+  // Fetch all remaining logs in sequence order
+  const remainingLogs = await db.query(
+    `SELECT id, sequence_number, point_to, team_a_score, team_b_score, event_type 
+     FROM pickleball_score_logs 
+     WHERE match_id = ? 
+     ORDER BY sequence_number ASC`,
+    [m.id]
+  );
 
-  // If match was COMPLETED, undo re-opens it to LIVE
+  const replayed = replayMatchFromLogs(m, remainingLogs);
+  const revertedA = replayed.scores.teamA;
+  const revertedB = replayed.scores.teamB;
+  const liveScoreSummary = `${revertedA} - ${revertedB}`;
   const wasCompleted = m.status === 'COMPLETED';
+
+  let sportConfig = null;
+  try {
+    sportConfig = typeof m.sport_config === 'string' ? JSON.parse(m.sport_config) : (m.sport_config || {});
+  } catch {}
+  let currentSportState = null;
+  try {
+    currentSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {}
+
+  const rotationRule = replayed.rotationRule || currentSportState?.rotationRule || sportConfig?.rotationRule || 'OFFICIAL';
+  const isBadmintonRule = String(rotationRule).toUpperCase() === 'BADMINTON';
+  const scoringMode = isBadmintonRule ? 'RALLY' : (sportConfig?.scoringMode || currentSportState?.scoringMode || 'RALLY');
+
+  let parsedALineup = null;
+  let parsedBLineup = null;
+  try {
+    parsedALineup = typeof m.team_a_lineup === 'string' ? JSON.parse(m.team_a_lineup) : m.team_a_lineup;
+    parsedBLineup = typeof m.team_b_lineup === 'string' ? JSON.parse(m.team_b_lineup) : m.team_b_lineup;
+  } catch {}
+
+  const revertedCourtState = computeAuthoritativeCourtState({
+    format: m.match_format || 'DOUBLES',
+    scoringMode,
+    rotationRule,
+    scores: { teamA: revertedA, teamB: revertedB },
+    lineup: { teamA: parsedALineup || [], teamB: parsedBLineup || [] },
+    servingTeam: replayed.servingTeam,
+    serverNumber: replayed.serverNumber,
+    teamA: { id: m.team_a_uuid, name: m.team_a_name },
+    teamB: { id: m.team_b_uuid, name: m.team_b_name },
+    existingPlayerLocations: replayed.playerLocations
+  });
+
+  const updatedSportState = {
+    scoringMode,
+    rotationRule: revertedCourtState.rotationRule,
+    servingTeam: revertedCourtState.servingTeam,
+    startingServingTeam: currentSportState?.startingServingTeam || 'teamA',
+    serverNumber: revertedCourtState.serverNumber,
+    serviceCourt: revertedCourtState.serviceCourt,
+    receiverCourt: revertedCourtState.receiverCourt,
+    servingBoxName: revertedCourtState.servingBoxName,
+    targetBoxName: revertedCourtState.targetBoxName,
+    activeServerName: revertedCourtState.activeServerName,
+    activeReceiverName: revertedCourtState.activeReceiverName,
+    playerLocations: revertedCourtState.playerLocations,
+    originalPositions: revertedCourtState.originalPositions,
+    firstServeConfirmed: Boolean(currentSportState?.firstServeConfirmed)
+  };
 
   await db.query(
     `UPDATE tournament_matches
      SET team_a_score = ?, team_b_score = ?, status = 'LIVE',
-         winner_team_id = NULL, result_summary = NULL, live_score_summary = ?
+         winner_team_id = NULL, result_summary = NULL, live_score_summary = ?,
+         sport_state = ?
      WHERE id = ?`,
-    [revertedA, revertedB, liveScoreSummary, m.id]
+    [revertedA, revertedB, liveScoreSummary, JSON.stringify(updatedSportState), m.id]
   );
 
   if (wasCompleted) {
@@ -787,6 +1457,8 @@ const undoPoint = async (matchId, user) => {
     winnerTeamId: null,
     resultSummary: null,
     isCompleted: false,
+    sportState: updatedSportState,
+    courtState: revertedCourtState,
     state
   });
 
@@ -832,12 +1504,56 @@ const correctScore = async (matchId, { teamAScore, teamBScore, notes = 'Score Co
   const newStatus = isCompleted ? 'COMPLETED' : 'LIVE';
   const liveScoreSummary = `${newScoreA} - ${newScoreB}`;
 
+  let sportConfig = null;
+  try {
+    sportConfig = typeof m.sport_config === 'string' ? JSON.parse(m.sport_config) : (m.sport_config || {});
+  } catch {}
+  let currentSportState = null;
+  try {
+    currentSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {}
+
+  const scoringMode = sportConfig?.scoringMode || currentSportState?.scoringMode || 'RALLY';
+
+  let parsedALineup = null;
+  let parsedBLineup = null;
+  try {
+    parsedALineup = typeof m.team_a_lineup === 'string' ? JSON.parse(m.team_a_lineup) : m.team_a_lineup;
+    parsedBLineup = typeof m.team_b_lineup === 'string' ? JSON.parse(m.team_b_lineup) : m.team_b_lineup;
+  } catch {}
+
+  const correctedCourtState = computeAuthoritativeCourtState({
+    format: m.match_format || 'DOUBLES',
+    scoringMode,
+    scores: { teamA: newScoreA, teamB: newScoreB },
+    lineup: { teamA: parsedALineup || [], teamB: parsedBLineup || [] },
+    servingTeam: currentSportState?.servingTeam || 'teamA',
+    serverNumber: 1,
+    teamA: { id: m.team_a_uuid, name: m.team_a_name },
+    teamB: { id: m.team_b_uuid, name: m.team_b_name }
+  });
+
+  const updatedSportState = {
+    scoringMode,
+    servingTeam: correctedCourtState.servingTeam,
+    serverNumber: correctedCourtState.serverNumber,
+    serviceCourt: correctedCourtState.serviceCourt,
+    receiverCourt: correctedCourtState.receiverCourt,
+    servingBoxName: correctedCourtState.servingBoxName,
+    targetBoxName: correctedCourtState.targetBoxName,
+    activeServerName: correctedCourtState.activeServerName,
+    activeReceiverName: correctedCourtState.activeReceiverName,
+    playerLocations: correctedCourtState.playerLocations,
+    originalPositions: correctedCourtState.originalPositions
+  };
+
   await db.query(
     `UPDATE tournament_matches
      SET team_a_score = ?, team_b_score = ?, status = ?,
-         winner_team_id = ?, result_summary = ?, live_score_summary = ?
+         winner_team_id = ?, result_summary = ?, live_score_summary = ?,
+         sport_state = ?
      WHERE id = ?`,
-    [newScoreA, newScoreB, newStatus, winnerTeamId, resultSummary, liveScoreSummary, m.id]
+    [newScoreA, newScoreB, newStatus, winnerTeamId, resultSummary, liveScoreSummary, JSON.stringify(updatedSportState), m.id]
   );
 
   const lastSeqRows = await db.query(
@@ -863,11 +1579,90 @@ const correctScore = async (matchId, { teamAScore, teamBScore, notes = 'Score Co
 
   broadcastPickleballScore(m.uuid, m.tournament_uuid, {
     status: newStatus,
+    type: 'CORRECTION',
     teamAScore: newScoreA,
     teamBScore: newScoreB,
+    scoreSummary: liveScoreSummary,
     winnerTeamId,
     resultSummary,
-    isCompleted
+    isCompleted,
+    sportState: updatedSportState,
+    courtState: correctedCourtState
+  });
+
+  return await getScorerState(m.uuid);
+};
+
+/**
+ * 12. Update Playing / Rotation Rule for a match (OFFICIAL vs BADMINTON).
+ */
+const setRotationRule = async (matchId, body = {}, user) => {
+  const m = await getMatchEntity(matchId);
+  if (!m) {
+    throw { statusCode: 404, message: 'Match not found.' };
+  }
+
+  const rawRule = body.rotationRule || body.rule || 'OFFICIAL';
+  const normalizedRule = String(rawRule).toUpperCase() === 'BADMINTON' ? 'BADMINTON' : 'OFFICIAL';
+
+  let sportConfig = null;
+  try {
+    sportConfig = typeof m.sport_config === 'string' ? JSON.parse(m.sport_config) : (m.sport_config || {});
+  } catch {}
+  let currentSportState = null;
+  try {
+    currentSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {}
+
+  const isBadmintonRule = normalizedRule === 'BADMINTON';
+  const scoringMode = isBadmintonRule ? 'RALLY' : (sportConfig?.scoringMode || currentSportState?.scoringMode || 'RALLY');
+  const format = m.match_format || 'DOUBLES';
+  const isDoubles = format !== 'SINGLES';
+  const isSideOut = !isBadmintonRule && String(scoringMode).toUpperCase() === 'SIDE_OUT';
+  const serverNumber = isBadmintonRule ? 1 : ((isSideOut && isDoubles) ? 2 : 1);
+
+  currentSportState = currentSportState || {};
+  currentSportState.rotationRule = normalizedRule;
+  currentSportState.scoringMode = scoringMode;
+
+  const parsedALineup = typeof m.team_a_lineup === 'string' ? JSON.parse(m.team_a_lineup) : (m.team_a_lineup || []);
+  const parsedBLineup = typeof m.team_b_lineup === 'string' ? JSON.parse(m.team_b_lineup) : (m.team_b_lineup || []);
+
+  const updatedCourtState = computeAuthoritativeCourtState({
+    format,
+    scoringMode,
+    rotationRule: normalizedRule,
+    scores: { teamA: m.team_a_score || 0, teamB: m.team_b_score || 0 },
+    lineup: { teamA: parsedALineup, teamB: parsedBLineup },
+    servingTeam: currentSportState.servingTeam || 'teamA',
+    serverNumber: isBadmintonRule ? 1 : (currentSportState.serverNumber || serverNumber),
+    teamA: { id: m.team_a_uuid, name: m.team_a_name },
+    teamB: { id: m.team_b_uuid, name: m.team_b_name },
+    existingPlayerLocations: currentSportState.playerLocations || null,
+    startingServingTeam: currentSportState.startingServingTeam || 'teamA'
+  });
+
+  currentSportState.serviceCourt = updatedCourtState.serviceCourt;
+  currentSportState.receiverCourt = updatedCourtState.receiverCourt;
+  currentSportState.servingBoxName = updatedCourtState.servingBoxName;
+  currentSportState.targetBoxName = updatedCourtState.targetBoxName;
+  currentSportState.activeServerName = updatedCourtState.activeServerName;
+  currentSportState.activeReceiverName = updatedCourtState.activeReceiverName;
+  currentSportState.serverNumber = updatedCourtState.serverNumber;
+  currentSportState.playerLocations = updatedCourtState.playerLocations;
+
+  await db.query(
+    'UPDATE tournament_matches SET sport_state = ? WHERE id = ?',
+    [JSON.stringify(currentSportState), m.id]
+  );
+
+  broadcastPickleballScore(m.uuid, m.tournament_uuid, {
+    status: m.status,
+    type: 'RULE_CHANGE',
+    teamAScore: m.team_a_score || 0,
+    teamBScore: m.team_b_score || 0,
+    sportState: currentSportState,
+    courtState: updatedCourtState
   });
 
   return await getScorerState(m.uuid);
@@ -885,5 +1680,6 @@ module.exports = {
   startMatch,
   recordPoint,
   undoPoint,
-  correctScore
+  correctScore,
+  setRotationRule
 };

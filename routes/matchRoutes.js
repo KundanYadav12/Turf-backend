@@ -6,6 +6,45 @@ const universalUndoService = require('../services/universalUndoService');
 const { authenticateUser, optionalAuthenticateUser } = require('../middleware/authMiddleware');
 const { requireScorerForMatch } = require('../middleware/scorerAuthMiddleware');
 
+// 0. GET /api/matches/live - All active LIVE matches across the platform (concurrent/multi-tournament)
+router.get('/live', async (req, res, next) => {
+  try {
+    const { tournamentId, sport, limit } = req.query;
+    const matches = await matchService.getAllLiveMatches({ tournamentId, sport, limit });
+    res.json({
+      success: true,
+      data: {
+        items: matches,
+        count: matches.length
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 0b. GET /api/matches - Match query route supporting ?status=LIVE filter
+router.get('/', async (req, res, next) => {
+  try {
+    const { status, tournamentId, sport, limit } = req.query;
+    if (status === 'LIVE' || !status) {
+      const matches = await matchService.getAllLiveMatches({ tournamentId, sport, limit });
+      return res.json({
+        success: true,
+        data: {
+          items: matches,
+          count: matches.length
+        }
+      });
+    }
+    // Default fallback
+    const matches = await matchService.getAllLiveMatches({ tournamentId, sport, limit });
+    res.json({ success: true, data: { items: matches, count: matches.length } });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // 1. GET /api/matches/:id - Single Match Detailed State (Public / Viewers)
 router.get('/:id', async (req, res, next) => {
   try {
@@ -350,7 +389,7 @@ router.post('/:id/pickleball/lineup', authenticateUser, async (req, res, next) =
 // 13. POST /api/matches/:id/pickleball/start - Start Match Live
 router.post('/:id/pickleball/start', authenticateUser, async (req, res, next) => {
   try {
-    const data = await pickleballService.startMatch(req.params.id, req.user);
+    const data = await pickleballService.startMatch(req.params.id, req.body, req.user);
     res.json({ success: true, message: 'Match started!', data });
   } catch (error) {
     next(error);
@@ -382,6 +421,16 @@ router.post('/:id/pickleball/correct', authenticateUser, async (req, res, next) 
   try {
     const data = await pickleballService.correctScore(req.params.id, req.body, req.user);
     res.json({ success: true, message: 'Score corrected successfully!', data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 16b. POST /api/matches/:id/pickleball/rule - Toggle Rotation / Playing Rule (OFFICIAL vs BADMINTON)
+router.post('/:id/pickleball/rule', authenticateUser, async (req, res, next) => {
+  try {
+    const data = await pickleballService.setRotationRule(req.params.id, req.body, req.user);
+    res.json({ success: true, message: 'Playing rule updated successfully!', data });
   } catch (error) {
     next(error);
   }

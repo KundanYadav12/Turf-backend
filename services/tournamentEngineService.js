@@ -19,9 +19,10 @@ const { broadcastTournamentMatchUpdate, getIO } = require('./socketService');
 async function getTournamentEntity(tournamentId) {
   const intId = /^\d+$/.test(String(tournamentId).trim()) ? parseInt(tournamentId, 10) : -1;
   const rows = await db.query(
-    `SELECT t.*, s.slug as sport_slug, s.name as sport_name
+    `SELECT t.*, s.slug as sport_slug, s.name as sport_name, v.owner_id as venue_owner_id
      FROM tournaments t
      JOIN sports s ON t.sport_id = s.id
+     LEFT JOIN venues v ON t.venue_id = v.id
      WHERE t.uuid = ? OR t.id = ?`,
     [String(tournamentId), intId]
   );

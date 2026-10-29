@@ -360,6 +360,8 @@ function broadcastTournamentMatchUpdate(tournamentPublicId, matchData) {
   const eventPayload = {
     matchId,
     public_id: matchId,
+    tournamentId: tournamentPublicId || matchData.tournamentId || matchData.tournament_id,
+    tournamentPublicId: tournamentPublicId || matchData.tournamentId || matchData.tournament_id,
     eventSeq,
     timestamp: Date.now(),
     status: matchData.status,

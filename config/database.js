@@ -382,7 +382,20 @@ async function transaction(callback) {
   }
 }
 
+async function close() {
+  if (mysqlPool) {
+    await mysqlPool.end();
+    mysqlPool = null;
+  }
+  if (sqliteDb) {
+    await new Promise((resolve) => sqliteDb.close(() => resolve()));
+    sqliteDb = null;
+  }
+}
+
 module.exports = {
   query,
-  transaction
+  transaction,
+  close
 };
+

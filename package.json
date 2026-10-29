@@ -9,6 +9,9 @@
     "migrate": "node database/run_all_migrations.js",
     "migrate:streaming": "node database/migrate_streaming.js",
     "seed:superadmin": "node database/seed_superadmin.js",
+    "superadmin:create": "node scripts/createSuperadmin.js",
+    "superadmin:reset-password": "node scripts/resetSuperadminPassword.js",
+    "test:superadmin": "node test_superadmin_cli.js",
     "db:init": "node database/initDb.js",
     "test": "node test_gitignore_rules.js",
     "test:gitignore": "node test_gitignore_rules.js"

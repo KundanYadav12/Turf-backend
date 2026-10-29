@@ -106,6 +106,25 @@ async function checkSchedulingConflicts({
 }
 
 /**
+ * Safely resolves a team identifier (integer ID or UUID string) to an existing integer team_id.
+ * Prevents MySQL foreign key constraint violations on tournament_matches (team_a_id, team_b_id).
+ */
+async function resolveTeamId(teamIdentifier) {
+  if (teamIdentifier === null || teamIdentifier === undefined || teamIdentifier === '') return null;
+  const str = String(teamIdentifier).trim();
+  if (!str || str === 'null' || str === 'undefined' || str === '0') return null;
+
+  const isPureInt = /^\d+$/.test(str);
+  const intId = isPureInt ? parseInt(str, 10) : -1;
+
+  const rows = await db.query(
+    'SELECT id FROM teams WHERE id = ? OR uuid = ? LIMIT 1',
+    [intId, str]
+  );
+  return rows && rows.length > 0 ? rows[0].id : null;
+}
+
+/**
  * 2. Create a Single Fixture
  */
 async function createFixture({ tournamentId, user, fixtureData }) {
@@ -134,6 +153,21 @@ async function createFixture({ tournamentId, user, fixtureData }) {
     allowConflictOverride = false
   } = fixtureData;
 
+  // Resolve team IDs (supports integer ID or UUID string)
+  const resolvedTeamAId = await resolveTeamId(teamAId);
+  const resolvedTeamBId = await resolveTeamId(teamBId);
+
+  if (teamAId && !resolvedTeamAId) {
+    const err = new Error(`Selected Team A (${teamAId}) does not exist in the teams database.`);
+    err.statusCode = 400;
+    throw err;
+  }
+  if (teamBId && !resolvedTeamBId) {
+    const err = new Error(`Selected Team B (${teamBId}) does not exist in the teams database.`);
+    err.statusCode = 400;
+    throw err;
+  }
+
   // Validate Category
   const VALID_CATEGORIES = ['League', 'Knockout', 'Quarter-Final', 'Semi-Final', 'Final'];
   const resolvedCategory = VALID_CATEGORIES.includes(category) ? category : 'League';
@@ -147,8 +181,8 @@ async function createFixture({ tournamentId, user, fixtureData }) {
       endTime,
       courtId,
       venueId,
-      teamAId,
-      teamBId
+      teamAId: resolvedTeamAId,
+      teamBId: resolvedTeamBId
     });
 
     if (conflictResult.hasConflict && !allowConflictOverride) {
@@ -183,6 +217,22 @@ async function createFixture({ tournamentId, user, fixtureData }) {
     if (c) resolvedCourtName = c.name;
   }
 
+  const startingServingTeam = fixtureData.startingServingTeam || fixtureData.startingServeTeam || null;
+  const rotationRule = fixtureData.rotationRule || fixtureData.rule || null;
+  let initialSportStateObj = null;
+  if (startingServingTeam || rotationRule) {
+    initialSportStateObj = {};
+    if (startingServingTeam) {
+      initialSportStateObj.servingTeam = startingServingTeam === 'teamB' ? 'teamB' : 'teamA';
+      initialSportStateObj.startingServingTeam = initialSportStateObj.servingTeam;
+      initialSportStateObj.firstServeConfirmed = true;
+    }
+    if (rotationRule) {
+      initialSportStateObj.rotationRule = String(rotationRule).toUpperCase() === 'BADMINTON' ? 'BADMINTON' : 'OFFICIAL';
+    }
+  }
+  const initialSportState = initialSportStateObj ? JSON.stringify(initialSportStateObj) : null;
+
   const matchUuid = crypto.randomUUID();
 
   const insertResult = await db.query(
@@ -190,15 +240,16 @@ async function createFixture({ tournamentId, user, fixtureData }) {
       uuid, tournament_id, match_number, round_number,
       team_a_id, team_b_id, venue_id, court_id, court_name,
       match_date, start_time, end_time, status, category,
-      group_name, counts_in_standings, scorer_id, live_score_summary
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', ?, ?, ?, ?, 'Yet to Start')`,
+      group_name, counts_in_standings, scorer_id, live_score_summary,
+      sport_state
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED', ?, ?, ?, ?, 'Yet to Start', ?)`,
     [
       matchUuid,
       tournament.id,
       resolvedMatchNumber,
       roundNumber,
-      teamAId || null,
-      teamBId || null,
+      resolvedTeamAId || null,
+      resolvedTeamBId || null,
       venueId || null,
       courtId || null,
       resolvedCourtName || null,
@@ -208,7 +259,8 @@ async function createFixture({ tournamentId, user, fixtureData }) {
       resolvedCategory,
       groupName || null,
       resolvedCountsInStandings,
-      scorerId || null
+      scorerId || null,
+      initialSportState
     ]
   );
 
@@ -282,8 +334,25 @@ async function updateFixture({ tournamentId, matchId, user, updates }) {
   const targetStartTime = startTime !== undefined ? startTime : match.start_time;
   const targetEndTime = endTime !== undefined ? endTime : match.end_time;
   const targetCourtId = courtId !== undefined ? courtId : match.court_id;
-  const targetTeamAId = teamAId !== undefined ? teamAId : match.team_a_id;
-  const targetTeamBId = teamBId !== undefined ? teamBId : match.team_b_id;
+  let resolvedTeamAId = match.team_a_id;
+  if (teamAId !== undefined) {
+    resolvedTeamAId = await resolveTeamId(teamAId);
+    if (teamAId && !resolvedTeamAId) {
+      const err = new Error(`Selected Team A (${teamAId}) does not exist in the teams database.`);
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+
+  let resolvedTeamBId = match.team_b_id;
+  if (teamBId !== undefined) {
+    resolvedTeamBId = await resolveTeamId(teamBId);
+    if (teamBId && !resolvedTeamBId) {
+      const err = new Error(`Selected Team B (${teamBId}) does not exist in the teams database.`);
+      err.statusCode = 400;
+      throw err;
+    }
+  }
 
   // Conflict Check if timing, court, or teams changed
   if (targetDate && targetStartTime && targetEndTime) {
@@ -294,8 +363,8 @@ async function updateFixture({ tournamentId, matchId, user, updates }) {
       startTime: targetStartTime,
       endTime: targetEndTime,
       courtId: targetCourtId,
-      teamAId: targetTeamAId,
-      teamBId: targetTeamBId
+      teamAId: resolvedTeamAId,
+      teamBId: resolvedTeamBId
     });
 
     if (conflictResult.hasConflict && !allowConflictOverride) {
@@ -351,8 +420,8 @@ async function updateFixture({ tournamentId, matchId, user, updates }) {
     [
       newCategory,
       newCountsInStandings,
-      targetTeamAId || null,
-      targetTeamBId || null,
+      resolvedTeamAId || null,
+      resolvedTeamBId || null,
       targetDate || null,
       targetStartTime || null,
       targetEndTime || null,
@@ -369,6 +438,25 @@ async function updateFixture({ tournamentId, matchId, user, updates }) {
       match.id
     ]
   );
+
+  // Update sport_state if startingServingTeam or rotationRule is provided
+  const startingServingTeam = updates.startingServingTeam || updates.startingServeTeam;
+  const rotationRule = updates.rotationRule || updates.rule;
+  if (startingServingTeam || rotationRule) {
+    let existingSportState = {};
+    try {
+      existingSportState = typeof match.sport_state === 'string' ? JSON.parse(match.sport_state) : (match.sport_state || {});
+    } catch {}
+    if (startingServingTeam) {
+      existingSportState.servingTeam = startingServingTeam === 'teamB' ? 'teamB' : 'teamA';
+      existingSportState.startingServingTeam = existingSportState.servingTeam;
+      existingSportState.firstServeConfirmed = true;
+    }
+    if (rotationRule) {
+      existingSportState.rotationRule = String(rotationRule).toUpperCase() === 'BADMINTON' ? 'BADMINTON' : 'OFFICIAL';
+    }
+    await db.query('UPDATE tournament_matches SET sport_state = ? WHERE id = ?', [JSON.stringify(existingSportState), match.id]);
+  }
 
   // Sync tournament_scorers if scorer changed
   if (scorerId !== undefined && scorerId !== match.scorer_id) {
@@ -469,20 +557,46 @@ async function deleteFixture({ tournamentId, matchId, user, force = false }) {
  */
 async function autoGenerateLeague({ tournamentId, user, options = {} }) {
   const tournament = await getTournamentEntity(tournamentId);
-  if (!tournament) throw { statusCode: 404, message: 'Tournament not found' };
+  if (!tournament) {
+    const notFoundErr = new Error('Tournament not found or has been removed.');
+    notFoundErr.statusCode = 404;
+    throw notFoundErr;
+  }
 
-  if (user.role !== 'ADMIN' && tournament.created_by !== user.id && tournament.venue_owner_id !== user.id) {
-    throw { statusCode: 403, message: 'Only tournament organizer or super admin can generate fixtures.' };
+  const isAuthorized = user && (
+    user.role === 'ADMIN' ||
+    tournament.created_by === user.id ||
+    (tournament.venue_owner_id && tournament.venue_owner_id === user.id)
+  );
+  if (!isAuthorized) {
+    const authErr = new Error('Only tournament organizer or super admin can generate fixtures.');
+    authErr.statusCode = 403;
+    throw authErr;
   }
 
   const {
-    groupName = null,
-    startDate = tournament.start_date || new Date().toISOString().slice(0, 10),
-    dailyStartTime = '09:00:00',
-    matchDurationMinutes = 60,
-    bufferMinutes = 15,
-    matchesPerDay = 8
+    groupName = null
   } = options;
+
+  // Safe date normalization - guarantees a valid YYYY-MM-DD Date
+  const rawStartDate = (options.startDate && String(options.startDate).trim()) ||
+    (tournament.start_date ? (tournament.start_date instanceof Date ? tournament.start_date.toISOString().slice(0, 10) : String(tournament.start_date).slice(0, 10)) : null) ||
+    new Date().toISOString().slice(0, 10);
+
+  let startD = new Date(rawStartDate);
+  if (isNaN(startD.getTime())) {
+    startD = new Date();
+  }
+
+  // Safe time normalization (handles "HH:MM", "HH:MM:SS", null, "")
+  const timeStr = String(options.dailyStartTime || '09:00:00').trim();
+  const timeParts = timeStr.split(':').map(n => parseInt(n, 10));
+  const startHour = (!isNaN(timeParts[0]) && timeParts[0] >= 0 && timeParts[0] <= 23) ? timeParts[0] : 9;
+  const startMin = (!isNaN(timeParts[1]) && timeParts[1] >= 0 && timeParts[1] <= 59) ? timeParts[1] : 0;
+
+  const matchDurationMinutes = Math.max(10, parseInt(options.matchDurationMinutes, 10) || 60);
+  const bufferMinutes = Math.max(0, parseInt(options.bufferMinutes, 10) || 15);
+  const matchesPerDay = Math.max(1, parseInt(options.matchesPerDay, 10) || 8);
 
   // Fetch approved teams
   let teamsQuery = `
@@ -500,7 +614,9 @@ async function autoGenerateLeague({ tournamentId, user, options = {} }) {
 
   const teams = await db.query(teamsQuery, queryParams);
   if (!teams || teams.length < 2) {
-    throw { statusCode: 400, message: 'Need at least 2 approved teams to generate league fixtures.' };
+    const teamErr = new Error('Need at least 2 approved teams to generate league fixtures. Please register and approve teams first.');
+    teamErr.statusCode = 400;
+    throw teamErr;
   }
 
   // Get courts
@@ -532,11 +648,13 @@ async function autoGenerateLeague({ tournamentId, user, options = {} }) {
 
   let currentDayOffset = 0;
   let currentMatchInDay = 0;
-  const startD = new Date(startDate);
 
   function getSlot() {
-    const matchDate = new Date(startD.getTime() + currentDayOffset * 86400000).toISOString().slice(0, 10);
-    const [startHour, startMin] = dailyStartTime.split(':').map(Number);
+    const slotDateObj = new Date(startD.getTime() + currentDayOffset * 86400000);
+    const matchDate = !isNaN(slotDateObj.getTime())
+      ? slotDateObj.toISOString().slice(0, 10)
+      : new Date().toISOString().slice(0, 10);
+
     const totalMinutes = startHour * 60 + startMin + currentMatchInDay * (matchDurationMinutes + bufferMinutes);
 
     const sH = String(Math.floor(totalMinutes / 60) % 24).padStart(2, '0');
@@ -545,7 +663,9 @@ async function autoGenerateLeague({ tournamentId, user, options = {} }) {
     const eH = String(Math.floor(endMinutes / 60) % 24).padStart(2, '0');
     const eM = String(endMinutes % 60).padStart(2, '0');
 
-    const court = courts[currentMatchInDay % courts.length];
+    const court = (courts && courts.length > 0)
+      ? courts[currentMatchInDay % courts.length]
+      : { id: null, name: 'Main Court' };
 
     currentMatchInDay++;
     if (currentMatchInDay >= matchesPerDay) {
@@ -557,8 +677,8 @@ async function autoGenerateLeague({ tournamentId, user, options = {} }) {
       matchDate,
       startTime: `${sH}:${sM}:00`,
       endTime: `${eH}:${eM}:00`,
-      courtId: court.id,
-      courtName: court.name
+      courtId: court?.id || null,
+      courtName: court?.name || 'Main Court'
     };
   }
 
@@ -601,6 +721,12 @@ async function autoGenerateLeague({ tournamentId, user, options = {} }) {
     }
   }
 
+  if (generated.length === 0) {
+    const err = new Error('No fixtures were generated. Each group must contain at least 2 approved teams.');
+    err.statusCode = 400;
+    throw err;
+  }
+
   await recalculateStandings(tournament.id);
 
   const io = getIO();
@@ -624,19 +750,38 @@ async function autoGenerateLeague({ tournamentId, user, options = {} }) {
  */
 async function generateKnockoutBracket({ tournamentId, user, options = {} }) {
   const tournament = await getTournamentEntity(tournamentId);
-  if (!tournament) throw { statusCode: 404, message: 'Tournament not found' };
+  if (!tournament) {
+    const notFoundErr = new Error('Tournament not found or has been removed.');
+    notFoundErr.statusCode = 404;
+    throw notFoundErr;
+  }
 
-  if (user.role !== 'ADMIN' && tournament.created_by !== user.id && tournament.venue_owner_id !== user.id) {
-    throw { statusCode: 403, message: 'Only tournament organizer or super admin can generate brackets.' };
+  const isAuthorized = user && (
+    user.role === 'ADMIN' ||
+    tournament.created_by === user.id ||
+    (tournament.venue_owner_id && tournament.venue_owner_id === user.id)
+  );
+  if (!isAuthorized) {
+    const authErr = new Error('Only tournament organizer or super admin can generate brackets.');
+    authErr.statusCode = 403;
+    throw authErr;
   }
 
   const {
     seedFromStandings = true,
-    customTeamIds = null,
-    startDate = tournament.start_date || new Date().toISOString().slice(0, 10),
-    dailyStartTime = '14:00:00',
-    matchDurationMinutes = 60
+    customTeamIds = null
   } = options;
+
+  // Safe date normalization for knockout
+  const rawStartDate = (options.startDate && String(options.startDate).trim()) ||
+    (tournament.start_date ? (tournament.start_date instanceof Date ? tournament.start_date.toISOString().slice(0, 10) : String(tournament.start_date).slice(0, 10)) : null) ||
+    new Date().toISOString().slice(0, 10);
+
+  let startD = new Date(rawStartDate);
+  if (isNaN(startD.getTime())) {
+    startD = new Date();
+  }
+  const safeStartDate = startD.toISOString().slice(0, 10);
 
   // Resolve 8 or 4 teams for bracket
   let bracketTeamIds = [];
@@ -651,20 +796,41 @@ async function generateKnockoutBracket({ tournamentId, user, options = {} }) {
     );
     bracketTeamIds = standings.map(s => s.team_id);
   } else if (Array.isArray(customTeamIds) && customTeamIds.length >= 4) {
-    bracketTeamIds = customTeamIds.slice(0, 8);
+    const resolvedCustom = [];
+    for (const cId of customTeamIds) {
+      const rId = await resolveTeamId(cId);
+      if (rId && !resolvedCustom.includes(rId)) resolvedCustom.push(rId);
+    }
+    bracketTeamIds = resolvedCustom.slice(0, 8);
   }
 
   // Fallback to approved tournament teams if standings not yet played
   if (bracketTeamIds.length < 4) {
     const appTeams = await db.query(
-      `SELECT team_id FROM tournament_teams WHERE tournament_id = ? AND registration_status = 'APPROVED' LIMIT 8`,
+      `SELECT tt.team_id FROM tournament_teams tt
+       JOIN teams tm ON tt.team_id = tm.id
+       WHERE tt.tournament_id = ? AND tt.registration_status = 'APPROVED'
+       ORDER BY tt.seed_number ASC, tm.name ASC
+       LIMIT 8`,
       [tournament.id]
     );
     bracketTeamIds = appTeams.map(t => t.team_id);
   }
 
+  // Verify all bracketTeamIds exist in teams table to prevent foreign key errors
+  if (bracketTeamIds.length > 0) {
+    const validTeams = await db.query(
+      `SELECT id FROM teams WHERE id IN (${bracketTeamIds.map(() => '?').join(',')})`,
+      bracketTeamIds
+    );
+    const validSet = new Set(validTeams.map(t => t.id));
+    bracketTeamIds = bracketTeamIds.filter(id => validSet.has(id));
+  }
+
   if (bracketTeamIds.length < 4) {
-    throw { statusCode: 400, message: 'Need at least 4 teams to generate a knockout bracket.' };
+    const err = new Error('Need at least 4 teams to generate a knockout bracket.');
+    err.statusCode = 400;
+    throw err;
   }
 
   const is8Teams = bracketTeamIds.length >= 8;
@@ -692,7 +858,7 @@ async function generateKnockoutBracket({ tournamentId, user, options = {} }) {
       match_date, start_time, end_time, status, category,
       counts_in_standings, bracket_slot, live_score_summary
     ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, '19:00:00', '20:30:00', 'SCHEDULED', 'Final', 0, 'FINAL', 'Yet to Start')`,
-    [finalUuid, tournament.id, is8Teams ? matchNumberSeq + 6 : matchNumberSeq + 2, is8Teams ? 3 : 2, tournament.venue_id, court.id, court.name, startDate]
+    [finalUuid, tournament.id, is8Teams ? matchNumberSeq + 6 : matchNumberSeq + 2, is8Teams ? 3 : 2, tournament.venue_id, court.id, court.name, safeStartDate]
   );
   const finalId = finalInsert.insertId;
 
@@ -708,7 +874,7 @@ async function generateKnockoutBracket({ tournamentId, user, options = {} }) {
     [
       sf1Uuid, tournament.id, is8Teams ? matchNumberSeq + 4 : matchNumberSeq, is8Teams ? 2 : 1,
       is8Teams ? null : bracketTeamIds[0], is8Teams ? null : bracketTeamIds[3],
-      tournament.venue_id, court.id, court.name, startDate, finalId
+      tournament.venue_id, court.id, court.name, safeStartDate, finalId
     ]
   );
   const sf1Id = sf1Insert.insertId;
@@ -724,7 +890,7 @@ async function generateKnockoutBracket({ tournamentId, user, options = {} }) {
     [
       sf2Uuid, tournament.id, is8Teams ? matchNumberSeq + 5 : matchNumberSeq + 1, is8Teams ? 2 : 1,
       is8Teams ? null : bracketTeamIds[1], is8Teams ? null : bracketTeamIds[2],
-      tournament.venue_id, court.id, court.name, startDate, finalId
+      tournament.venue_id, court.id, court.name, safeStartDate, finalId
     ]
   );
   const sf2Id = sf2Insert.insertId;
@@ -739,7 +905,7 @@ async function generateKnockoutBracket({ tournamentId, user, options = {} }) {
         match_date, start_time, end_time, status, category,
         counts_in_standings, next_match_id, bracket_slot, bracket_target_team, live_score_summary
       ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, '09:00:00', '10:30:00', 'SCHEDULED', 'Quarter-Final', 0, ?, 'QF1', 'TEAM_A', 'Yet to Start')`,
-      [crypto.randomUUID(), tournament.id, matchNumberSeq++, bracketTeamIds[0], bracketTeamIds[7], tournament.venue_id, court.id, court.name, startDate, sf1Id]
+      [crypto.randomUUID(), tournament.id, matchNumberSeq++, bracketTeamIds[0], bracketTeamIds[7], tournament.venue_id, court.id, court.name, safeStartDate, sf1Id]
     );
 
     // QF2: Seed 4 vs Seed 5 -> SF1 (TEAM_B)
@@ -750,7 +916,7 @@ async function generateKnockoutBracket({ tournamentId, user, options = {} }) {
         match_date, start_time, end_time, status, category,
         counts_in_standings, next_match_id, bracket_slot, bracket_target_team, live_score_summary
       ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, '10:30:00', '12:00:00', 'SCHEDULED', 'Quarter-Final', 0, ?, 'QF2', 'TEAM_B', 'Yet to Start')`,
-      [crypto.randomUUID(), tournament.id, matchNumberSeq++, bracketTeamIds[3], bracketTeamIds[4], tournament.venue_id, court.id, court.name, startDate, sf1Id]
+      [crypto.randomUUID(), tournament.id, matchNumberSeq++, bracketTeamIds[3], bracketTeamIds[4], tournament.venue_id, court.id, court.name, safeStartDate, sf1Id]
     );
 
     // QF3: Seed 2 vs Seed 7 -> SF2 (TEAM_A)
@@ -761,7 +927,7 @@ async function generateKnockoutBracket({ tournamentId, user, options = {} }) {
         match_date, start_time, end_time, status, category,
         counts_in_standings, next_match_id, bracket_slot, bracket_target_team, live_score_summary
       ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, '12:00:00', '13:30:00', 'SCHEDULED', 'Quarter-Final', 0, ?, 'QF3', 'TEAM_A', 'Yet to Start')`,
-      [crypto.randomUUID(), tournament.id, matchNumberSeq++, bracketTeamIds[1], bracketTeamIds[6], tournament.venue_id, court.id, court.name, startDate, sf2Id]
+      [crypto.randomUUID(), tournament.id, matchNumberSeq++, bracketTeamIds[1], bracketTeamIds[6], tournament.venue_id, court.id, court.name, safeStartDate, sf2Id]
     );
 
     // QF4: Seed 3 vs Seed 6 -> SF2 (TEAM_B)
@@ -772,7 +938,7 @@ async function generateKnockoutBracket({ tournamentId, user, options = {} }) {
         match_date, start_time, end_time, status, category,
         counts_in_standings, next_match_id, bracket_slot, bracket_target_team, live_score_summary
       ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, '13:30:00', '15:00:00', 'SCHEDULED', 'Quarter-Final', 0, ?, 'QF4', 'TEAM_B', 'Yet to Start')`,
-      [crypto.randomUUID(), tournament.id, matchNumberSeq++, bracketTeamIds[2], bracketTeamIds[5], tournament.venue_id, court.id, court.name, startDate, sf2Id]
+      [crypto.randomUUID(), tournament.id, matchNumberSeq++, bracketTeamIds[2], bracketTeamIds[5], tournament.venue_id, court.id, court.name, safeStartDate, sf2Id]
     );
   }
 
@@ -830,6 +996,7 @@ async function getBracketTree(tournamentId) {
 }
 
 module.exports = {
+  resolveTeamId,
   checkSchedulingConflicts,
   createFixture,
   updateFixture,
@@ -838,3 +1005,4 @@ module.exports = {
   generateKnockoutBracket,
   getBracketTree
 };
+
