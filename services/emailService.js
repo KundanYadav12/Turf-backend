@@ -241,29 +241,45 @@ async function sendBookingConfirmation({
 /**
  * 3. Send Password Reset / Security Email
  */
-async function sendPasswordResetEmail({ email, fullName, resetUrl }) {
-  const subject = 'Reset your PlayZo password 🔒';
+async function sendPasswordResetEmail({ email, fullName, resetUrl, otpCode }) {
+  const subject = otpCode ? `Your PlayZo Password Reset Code: ${otpCode} 🔒` : 'Reset your PlayZo password 🔒';
 
   const bodyHtml = `
     <h2 style="color: #ffffff; margin-top: 0;">Password Reset Request</h2>
-    <p>Hello ${fullName || 'User'}, we received a request to reset the password for your PlayZo account.</p>
+    <p>Hello ${fullName || 'Sports Champion'}, we received a request to reset the password for your PlayZo account.</p>
     
-    <p>Click the button below to choose a new password. This link is valid for 1 hour for your security.</p>
-    
-    <p style="font-size: 13px; color: #94a3b8;">
-      If you did not request a password reset, you can safely ignore this email; your account remains secure.
+    ${otpCode ? `
+      <div class="card" style="text-align: center; padding: 24px; background: #1e293b; border: 1px solid #334155; border-radius: 12px; margin: 20px 0;">
+        <p style="margin: 0 0 10px; color: #94a3b8; font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700;">Verification Code</p>
+        <div style="font-size: 34px; font-weight: 800; letter-spacing: 8px; color: #34d399; background: #0b1120; padding: 14px 24px; border-radius: 10px; display: inline-block; border: 1px dashed #10b981; font-family: monospace;">
+          ${otpCode}
+        </div>
+        <p style="margin: 14px 0 0; color: #94a3b8; font-size: 12px;">This code will expire in <strong>15 minutes</strong>.</p>
+      </div>
+    ` : ''}
+
+    ${resetUrl ? `
+      <p style="margin-top: 15px;">You can also click the button below to reset your password directly:</p>
+    ` : ''}
+
+    <p style="font-size: 13px; color: #94a3b8; margin-top: 20px;">
+      If you did not request a password reset, please ignore this email or reach out to support. Your password will remain unchanged.
     </p>
   `;
 
   const html = renderEmailLayout({
     title: subject,
-    preheader: 'Reset your PlayZo account password',
+    preheader: otpCode ? `PlayZo password reset verification code: ${otpCode}` : 'Reset your PlayZo account password',
     bodyHtml,
-    actionUrl: resetUrl,
-    actionText: 'Reset Password'
+    actionUrl: resetUrl || '',
+    actionText: resetUrl ? 'Reset Password Directly' : ''
   });
 
-  return await sendEmail({ to: email, subject, html, text: `Reset your PlayZo password: ${resetUrl}` });
+  const text = otpCode
+    ? `Your PlayZo password reset code is: ${otpCode}. It expires in 15 minutes.${resetUrl ? ` Or reset directly at: ${resetUrl}` : ''}`
+    : `Reset your PlayZo password: ${resetUrl}`;
+
+  return await sendEmail({ to: email, subject, html, text });
 }
 
 module.exports = {

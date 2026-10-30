@@ -1,8 +1,10 @@
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('../config/database');
 const { normalizeUsername, checkUsernameAvailability } = require('../services/usernameService');
-const { sendWelcomeEmail } = require('../services/emailService');
+const { sendWelcomeEmail, sendPasswordResetEmail } = require('../services/emailService');
+const { APP_URL } = require('../config/siteConfig');
 
 const register = async (req, res, next) => {
   try {
@@ -207,8 +209,188 @@ const getMe = async (req, res, next) => {
   }
 };
 
+const forgotPassword = async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Please provide your registered email address.' });
+    }
+
+    const trimmedEmail = email.trim().toLowerCase();
+
+    // Check if user exists
+    const users = await db.query(
+      `SELECT id, full_name, email, status, deletion_status, deleted_at FROM users WHERE LOWER(email) = ?`,
+      [trimmedEmail]
+    );
+
+    if (!users || users.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No active account found with this email address.'
+      });
+    }
+
+    const user = users[0];
+    if (user.status !== 'ACTIVE' || user.deletion_status === 'SOFT_DELETED' || user.deletion_status === 'PERMANENTLY_DELETED' || user.deleted_at) {
+      return res.status(403).json({
+        success: false,
+        message: 'This account has been deactivated or scheduled for deletion.'
+      });
+    }
+
+    // Generate 6-digit OTP code and crypto token
+    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    // Invalidate any active previous unused codes for this email
+    await db.query(
+      `UPDATE password_resets SET used_at = NOW() WHERE LOWER(email) = ? AND used_at IS NULL`,
+      [trimmedEmail]
+    );
+
+    // Save into password_resets
+    await db.query(
+      `INSERT INTO password_resets (email, otp_code, token, expires_at) VALUES (?, ?, ?, ?)`,
+      [trimmedEmail, otpCode, token, expiresAt]
+    );
+
+    // Construct reset link
+    const baseUrl = APP_URL || 'https://playzo.duckdns.org';
+    const resetUrl = `${baseUrl}/login?resetToken=${token}&email=${encodeURIComponent(trimmedEmail)}`;
+
+    // Dispatch email asynchronously
+    sendPasswordResetEmail({
+      email: trimmedEmail,
+      fullName: user.full_name,
+      resetUrl,
+      otpCode
+    }).catch(err => {
+      console.warn('[ForgotPassword] Failed to send email:', err.message);
+    });
+
+    res.json({
+      success: true,
+      message: 'Password reset code has been sent to your email address.',
+      data: {
+        email: trimmedEmail,
+        ...(process.env.NODE_ENV !== 'production' ? { devOtp: otpCode } : {})
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const verifyResetCode = async (req, res, next) => {
+  try {
+    const { email, code, token } = req.body;
+    if (!email && !token) {
+      return res.status(400).json({ success: false, message: 'Email and verification code are required.' });
+    }
+
+    let records;
+    if (token) {
+      records = await db.query(
+        `SELECT * FROM password_resets WHERE token = ? AND used_at IS NULL AND expires_at > NOW() ORDER BY id DESC LIMIT 1`,
+        [token]
+      );
+    } else {
+      const trimmedEmail = email.trim().toLowerCase();
+      const trimmedCode = (code || '').trim();
+      records = await db.query(
+        `SELECT * FROM password_resets WHERE LOWER(email) = ? AND otp_code = ? AND used_at IS NULL AND expires_at > NOW() ORDER BY id DESC LIMIT 1`,
+        [trimmedEmail, trimmedCode]
+      );
+    }
+
+    if (!records || records.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired verification code. Please request a new one.'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Verification code confirmed. Please set your new password.'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const resetPassword = async (req, res, next) => {
+  try {
+    const { email, code, token, newPassword } = req.body;
+
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters long.'
+      });
+    }
+
+    let records;
+    if (token) {
+      records = await db.query(
+        `SELECT * FROM password_resets WHERE token = ? AND used_at IS NULL AND expires_at > NOW() ORDER BY id DESC LIMIT 1`,
+        [token]
+      );
+    } else {
+      if (!email || !code) {
+        return res.status(400).json({ success: false, message: 'Email and verification code are required.' });
+      }
+      const trimmedEmail = email.trim().toLowerCase();
+      const trimmedCode = (code || '').trim();
+      records = await db.query(
+        `SELECT * FROM password_resets WHERE LOWER(email) = ? AND otp_code = ? AND used_at IS NULL AND expires_at > NOW() ORDER BY id DESC LIMIT 1`,
+        [trimmedEmail, trimmedCode]
+      );
+    }
+
+    if (!records || records.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired verification code. Please request a new code.'
+      });
+    }
+
+    const resetRecord = records[0];
+    const targetEmail = resetRecord.email;
+
+    // Hash new password
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(newPassword, salt);
+
+    // Update user password
+    await db.query(
+      `UPDATE users SET password_hash = ?, updated_at = NOW() WHERE LOWER(email) = ?`,
+      [passwordHash, targetEmail.toLowerCase()]
+    );
+
+    // Mark reset record as used
+    await db.query(
+      `UPDATE password_resets SET used_at = NOW() WHERE id = ?`,
+      [resetRecord.id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Your password has been reset successfully! You can now sign in with your new password.'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   register,
   login,
-  getMe
+  getMe,
+  forgotPassword,
+  verifyResetCode,
+  resetPassword
 };
+
