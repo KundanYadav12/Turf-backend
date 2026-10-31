@@ -36,6 +36,92 @@ async function resolveMatch(matchId) {
 }
 
 /**
+ * Authoritative court and player tracking helper for BWF Badminton.
+ * Strictly adheres to BWF Laws of Badminton (Sections 10 & 11):
+ * - Service court parity: Even -> Right, Odd -> Left.
+ * - When serving team scores: partners swap courts; same server serves from new court.
+ * - When receiving team scores: service handover; neither team swaps courts; server is whoever is in court matching new score.
+ */
+function computeAuthoritativeBadmintonCourtState({
+  format = 'DOUBLES',
+  gameScoreA = 0,
+  gameScoreB = 0,
+  lineup = { teamA: [], teamB: [] },
+  servingTeam = 'teamA',
+  teamA = { name: 'Team A' },
+  teamB = { name: 'Team B' },
+  existingPlayerLocations = null
+}) {
+  const isDoubles = String(format).toUpperCase() !== 'SINGLES';
+  const rawA = Array.isArray(lineup.teamA) ? lineup.teamA : [];
+  const rawB = Array.isArray(lineup.teamB) ? lineup.teamB : [];
+
+  const pA1 = typeof rawA[0] === 'string' ? rawA[0] : (rawA[0]?.name || `${teamA.name || 'Team A'} 1`);
+  const pA2 = typeof rawA[1] === 'string' ? rawA[1] : (rawA[1]?.name || `${teamA.name || 'Team A'} 2`);
+  const pB1 = typeof rawB[0] === 'string' ? rawB[0] : (rawB[0]?.name || `${teamB.name || 'Team B'} 1`);
+  const pB2 = typeof rawB[1] === 'string' ? rawB[1] : (rawB[1]?.name || `${teamB.name || 'Team B'} 2`);
+
+  const pA1Court = (typeof rawA[0] === 'object' && rawA[0]?.startCourt) ? String(rawA[0].startCourt).toUpperCase() : 'RIGHT';
+  const pA2Court = (typeof rawA[1] === 'object' && rawA[1]?.startCourt) ? String(rawA[1].startCourt).toUpperCase() : (pA1Court === 'RIGHT' ? 'LEFT' : 'RIGHT');
+  const pB1Court = (typeof rawB[0] === 'object' && rawB[0]?.startCourt) ? String(rawB[0].startCourt).toUpperCase() : 'RIGHT';
+  const pB2Court = (typeof rawB[1] === 'object' && rawB[1]?.startCourt) ? String(rawB[1].startCourt).toUpperCase() : (pB1Court === 'RIGHT' ? 'LEFT' : 'RIGHT');
+
+  let playerLocations = {};
+  if (existingPlayerLocations && typeof existingPlayerLocations === 'object' && Object.keys(existingPlayerLocations).length > 0) {
+    playerLocations = { ...existingPlayerLocations };
+  } else if (isDoubles) {
+    playerLocations[pA1] = pA1Court;
+    playerLocations[pA2] = pA2Court;
+    playerLocations[pB1] = pB1Court;
+    playerLocations[pB2] = pB2Court;
+  } else {
+    playerLocations[pA1] = (gameScoreA % 2 === 0) ? 'RIGHT' : 'LEFT';
+    playerLocations[pB1] = (gameScoreB % 2 === 0) ? 'RIGHT' : 'LEFT';
+  }
+
+  // Dual key by ID as well if member objects provided
+  if (typeof rawA[0] === 'object' && rawA[0]?.id && playerLocations[pA1]) playerLocations[rawA[0].id] = playerLocations[pA1];
+  if (typeof rawA[1] === 'object' && rawA[1]?.id && playerLocations[pA2]) playerLocations[rawA[1].id] = playerLocations[pA2];
+  if (typeof rawB[0] === 'object' && rawB[0]?.id && playerLocations[pB1]) playerLocations[rawB[0].id] = playerLocations[pB1];
+  if (typeof rawB[1] === 'object' && rawB[1]?.id && playerLocations[pB2]) playerLocations[rawB[1].id] = playerLocations[pB2];
+
+  // BWF Service Court Parity: Even -> RIGHT box, Odd -> LEFT box
+  const sScore = servingTeam === 'teamA' ? gameScoreA : gameScoreB;
+  const serverCourt = (sScore % 2 === 0) ? 'RIGHT' : 'LEFT';
+  const receiverCourt = serverCourt; // Cross-court diagonal target
+
+  // Active server player
+  const sPlayers = servingTeam === 'teamA' ? (isDoubles ? [pA1, pA2] : [pA1]) : (isDoubles ? [pB1, pB2] : [pB1]);
+  const activeServer = sPlayers.find(p => (playerLocations[p] || playerLocations[p?.name] || playerLocations[p?.id]) === serverCourt) || sPlayers[0];
+
+  // Active receiver player
+  const rPlayers = servingTeam === 'teamA' ? (isDoubles ? [pB1, pB2] : [pB1]) : (isDoubles ? [pA1, pA2] : [pA1]);
+  const activeReceiver = rPlayers.find(p => (playerLocations[p] || playerLocations[p?.name] || playerLocations[p?.id]) === receiverCourt) || rPlayers[0];
+
+  // Screen box names (Assuming Team A on LEFT facing right, Team B on RIGHT facing left)
+  const servingBoxName = servingTeam === 'teamA'
+    ? (serverCourt === 'RIGHT' ? 'bottom-left' : 'top-left')
+    : (serverCourt === 'RIGHT' ? 'top-right' : 'bottom-right');
+
+  const targetBoxName = servingTeam === 'teamA'
+    ? (receiverCourt === 'RIGHT' ? 'top-right' : 'bottom-right')
+    : (receiverCourt === 'RIGHT' ? 'bottom-left' : 'top-left');
+
+  return {
+    format: isDoubles ? 'DOUBLES' : 'SINGLES',
+    servingTeam,
+    currentServer: servingTeam === 'teamA' ? 'A' : 'B',
+    serverCourt,
+    receiverCourt,
+    servingBoxName,
+    targetBoxName,
+    serverPlayerName: typeof activeServer === 'object' ? activeServer.name : String(activeServer || ''),
+    receiverPlayerName: typeof activeReceiver === 'object' ? activeReceiver.name : String(activeReceiver || ''),
+    playerLocations
+  };
+}
+
+/**
  * 1. Get Badminton Scorer Console State.
  */
 async function getScorerState(matchPublicId) {
@@ -74,6 +160,33 @@ async function getScorerState(matchPublicId) {
       state = { ...state, ...parsed };
     } catch (e) {}
   }
+
+  // Derive authoritative court state
+  const curG = Math.max(0, (state.currentGame || 1) - 1);
+  const curScoreA = state.gameScores?.[curG]?.teamA || 0;
+  const curScoreB = state.gameScores?.[curG]?.teamB || 0;
+  const courtState = computeAuthoritativeBadmintonCourtState({
+    format: state.matchFormat || 'DOUBLES',
+    gameScoreA: curScoreA,
+    gameScoreB: curScoreB,
+    lineup: state.lineup || { teamA: [], teamB: [] },
+    servingTeam: state.servingTeam || (state.currentServer === 'B' ? 'teamB' : 'teamA'),
+    teamA: { name: match.team_a_name },
+    teamB: { name: match.team_b_name },
+    existingPlayerLocations: state.playerLocations || null
+  });
+
+  state = {
+    ...state,
+    serverCourt: courtState.serverCourt,
+    receiverCourt: courtState.receiverCourt,
+    servingBoxName: courtState.servingBoxName,
+    targetBoxName: courtState.targetBoxName,
+    serverPlayerName: courtState.serverPlayerName,
+    receiverPlayerName: courtState.receiverPlayerName,
+    playerLocations: courtState.playerLocations,
+    courtState
+  };
 
   // Fetch squad rosters
   const teamAPlayers = await db.query(
@@ -156,19 +269,29 @@ async function setLineup(matchPublicId, { matchFormat = 'DOUBLES', teamALineup =
   };
 
   const isB = startingServingTeam === 'teamB' || startingServingTeam === 'B';
-  state.currentServer = isB ? 'B' : 'A';
-  state.servingTeam = isB ? 'teamB' : 'teamA';
-  state.startingServingTeam = state.servingTeam;
-  state.serverCourt = 'RIGHT';
+  const initialServingTeam = isB ? 'teamB' : 'teamA';
 
-  // Set initial server and receiver names
-  if (isB) {
-    if (teamBLineup.length > 0) state.serverPlayerName = teamBLineup[0].name;
-    if (teamALineup.length > 0) state.receiverPlayerName = teamALineup[0].name;
-  } else {
-    if (teamALineup.length > 0) state.serverPlayerName = teamALineup[0].name;
-    if (teamBLineup.length > 0) state.receiverPlayerName = teamBLineup[0].name;
-  }
+  const courtState = computeAuthoritativeBadmintonCourtState({
+    format: matchFormat,
+    gameScoreA: 0,
+    gameScoreB: 0,
+    lineup: state.lineup,
+    servingTeam: initialServingTeam,
+    teamA: { name: match.team_a_name },
+    teamB: { name: match.team_b_name }
+  });
+
+  state.currentServer = courtState.currentServer;
+  state.servingTeam = courtState.servingTeam;
+  state.startingServingTeam = courtState.servingTeam;
+  state.serverCourt = courtState.serverCourt;
+  state.receiverCourt = courtState.receiverCourt;
+  state.servingBoxName = courtState.servingBoxName;
+  state.targetBoxName = courtState.targetBoxName;
+  state.serverPlayerName = courtState.serverPlayerName;
+  state.receiverPlayerName = courtState.receiverPlayerName;
+  state.playerLocations = courtState.playerLocations;
+  state.courtState = courtState;
 
   await db.query(
     `UPDATE tournament_matches 
@@ -208,12 +331,31 @@ async function startMatch(matchPublicId, reqBodyOrUser, maybeUser) {
   const reqBody = (reqBodyOrUser && typeof reqBodyOrUser === 'object' && !reqBodyOrUser.role) ? reqBodyOrUser : {};
   const startingServingTeam = reqBody.startingServingTeam || state.startingServingTeam || state.servingTeam || (state.currentServer === 'B' ? 'teamB' : 'teamA');
   const isB = startingServingTeam === 'teamB' || startingServingTeam === 'B';
+  const initialServingTeam = isB ? 'teamB' : 'teamA';
 
   state.currentGame = state.currentGame || 1;
-  state.currentServer = isB ? 'B' : 'A';
-  state.servingTeam = isB ? 'teamB' : 'teamA';
-  state.startingServingTeam = state.servingTeam;
-  state.serverCourt = 'RIGHT';
+  const courtState = computeAuthoritativeBadmintonCourtState({
+    format: state.matchFormat || 'DOUBLES',
+    gameScoreA: 0,
+    gameScoreB: 0,
+    lineup: state.lineup || { teamA: [], teamB: [] },
+    servingTeam: initialServingTeam,
+    teamA: { name: match.team_a_name },
+    teamB: { name: match.team_b_name },
+    existingPlayerLocations: state.playerLocations || null
+  });
+
+  state.currentServer = courtState.currentServer;
+  state.servingTeam = courtState.servingTeam;
+  state.startingServingTeam = courtState.servingTeam;
+  state.serverCourt = courtState.serverCourt;
+  state.receiverCourt = courtState.receiverCourt;
+  state.servingBoxName = courtState.servingBoxName;
+  state.targetBoxName = courtState.targetBoxName;
+  state.serverPlayerName = courtState.serverPlayerName;
+  state.receiverPlayerName = courtState.receiverPlayerName;
+  state.playerLocations = courtState.playerLocations;
+  state.courtState = courtState;
 
   const scoreSummary = `Game 1: 0 - 0`;
   const serverTeamName = isB ? match.team_b_name : match.team_a_name;
@@ -279,19 +421,83 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
   const gIdx = (state.currentGame || 1) - 1;
   const currentGame = state.gameScores[gIdx] || { game: state.currentGame, teamA: 0, teamB: 0, winner: null };
 
+  const prevServingSide = state.currentServer || (state.servingTeam === 'teamB' ? 'B' : 'A');
+  const isServingTeamWinner = prevServingSide === scoringSide;
+
+  // Extract players
+  const isDoubles = String(state.matchFormat || 'DOUBLES').toUpperCase() !== 'SINGLES';
+  const rawA = Array.isArray(state.lineup?.teamA) ? state.lineup.teamA : [];
+  const rawB = Array.isArray(state.lineup?.teamB) ? state.lineup.teamB : [];
+  const pA1 = typeof rawA[0] === 'string' ? rawA[0] : (rawA[0]?.name || `${match.team_a_name} 1`);
+  const pA2 = typeof rawA[1] === 'string' ? rawA[1] : (rawA[1]?.name || `${match.team_a_name} 2`);
+  const pB1 = typeof rawB[0] === 'string' ? rawB[0] : (rawB[0]?.name || `${match.team_b_name} 1`);
+  const pB2 = typeof rawB[1] === 'string' ? rawB[1] : (rawB[1]?.name || `${match.team_b_name} 2`);
+
+  let nextLocations = { ...(state.playerLocations || {}) };
+  if (!nextLocations[pA1]) {
+    nextLocations[pA1] = (typeof rawA[0] === 'object' && rawA[0]?.startCourt) ? String(rawA[0].startCourt).toUpperCase() : 'RIGHT';
+    if (isDoubles) nextLocations[pA2] = (typeof rawA[1] === 'object' && rawA[1]?.startCourt) ? String(rawA[1].startCourt).toUpperCase() : (nextLocations[pA1] === 'RIGHT' ? 'LEFT' : 'RIGHT');
+    nextLocations[pB1] = (typeof rawB[0] === 'object' && rawB[0]?.startCourt) ? String(rawB[0].startCourt).toUpperCase() : 'RIGHT';
+    if (isDoubles) nextLocations[pB2] = (typeof rawB[1] === 'object' && rawB[1]?.startCourt) ? String(rawB[1].startCourt).toUpperCase() : (nextLocations[pB1] === 'RIGHT' ? 'LEFT' : 'RIGHT');
+  }
+
   // Increment point
   if (scoringSide === 'A') {
     currentGame.teamA++;
-    state.currentServer = 'A';
-    // BWF rule: Even score serves from right, odd score from left
-    state.serverCourt = currentGame.teamA % 2 === 0 ? 'RIGHT' : 'LEFT';
   } else {
     currentGame.teamB++;
-    state.currentServer = 'B';
-    state.serverCourt = currentGame.teamB % 2 === 0 ? 'RIGHT' : 'LEFT';
   }
-  state.servingTeam = state.currentServer === 'A' ? 'teamA' : 'teamB';
+
+  // BWF Doubles Rotation Rules:
+  // 1. If serving team wins rally: Serving team partners SWAP courts (Right <-> Left). Same server serves from new court. Receiving team DOES NOT swap!
+  // 2. If receiving team wins rally: Service transfers to receiving team. NEITHER TEAM SWAPS! Server is whoever is in the court matching new score.
+  let nextServingTeam = prevServingSide === 'A' ? 'teamA' : 'teamB';
+  if (isServingTeamWinner) {
+    if (isDoubles) {
+      const sP1 = prevServingSide === 'A' ? pA1 : pB1;
+      const sP2 = prevServingSide === 'A' ? pA2 : pB2;
+      const loc1 = nextLocations[sP1] || 'RIGHT';
+      const loc2 = nextLocations[sP2] || 'LEFT';
+      nextLocations[sP1] = loc2;
+      nextLocations[sP2] = loc1;
+    }
+  } else {
+    nextServingTeam = scoringSide === 'A' ? 'teamA' : 'teamB';
+  }
+
+  if (!isDoubles) {
+    nextLocations[pA1] = (currentGame.teamA % 2 === 0) ? 'RIGHT' : 'LEFT';
+    nextLocations[pB1] = (currentGame.teamB % 2 === 0) ? 'RIGHT' : 'LEFT';
+  }
+
+  // Dual-key nextLocations by ID
+  if (typeof rawA[0] === 'object' && rawA[0]?.id && nextLocations[pA1]) nextLocations[rawA[0].id] = nextLocations[pA1];
+  if (typeof rawA[1] === 'object' && rawA[1]?.id && nextLocations[pA2]) nextLocations[rawA[1].id] = nextLocations[pA2];
+  if (typeof rawB[0] === 'object' && rawB[0]?.id && nextLocations[pB1]) nextLocations[rawB[0].id] = nextLocations[pB1];
+  if (typeof rawB[1] === 'object' && rawB[1]?.id && nextLocations[pB2]) nextLocations[rawB[1].id] = nextLocations[pB2];
+
+  let nextCourtState = computeAuthoritativeBadmintonCourtState({
+    format: state.matchFormat || 'DOUBLES',
+    gameScoreA: currentGame.teamA,
+    gameScoreB: currentGame.teamB,
+    lineup: state.lineup || { teamA: [], teamB: [] },
+    servingTeam: nextServingTeam,
+    teamA: { name: match.team_a_name },
+    teamB: { name: match.team_b_name },
+    existingPlayerLocations: nextLocations
+  });
+
+  state.currentServer = nextCourtState.currentServer;
+  state.servingTeam = nextCourtState.servingTeam;
   state.serverSide = state.currentServer;
+  state.serverCourt = nextCourtState.serverCourt;
+  state.receiverCourt = nextCourtState.receiverCourt;
+  state.servingBoxName = nextCourtState.servingBoxName;
+  state.targetBoxName = nextCourtState.targetBoxName;
+  state.serverPlayerName = nextCourtState.serverPlayerName;
+  state.receiverPlayerName = nextCourtState.receiverPlayerName;
+  state.playerLocations = nextCourtState.playerLocations;
+  state.courtState = nextCourtState;
 
   // Check Game Win Condition
   // Standard BWF: 21 pts, must win by 2; cap at 30 (30-29 wins)
@@ -354,7 +560,24 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
       // Advance to next game
       state.currentGame++;
       state.currentServer = gameWinner; // Winner of previous game serves first
-      state.serverCourt = 'RIGHT';
+      state.servingTeam = gameWinner === 'A' ? 'teamA' : 'teamB';
+      const resetCourtState = computeAuthoritativeBadmintonCourtState({
+        format: state.matchFormat || 'DOUBLES',
+        gameScoreA: 0,
+        gameScoreB: 0,
+        lineup: state.lineup || { teamA: [], teamB: [] },
+        servingTeam: state.servingTeam,
+        teamA: { name: match.team_a_name },
+        teamB: { name: match.team_b_name }
+      });
+      state.serverCourt = resetCourtState.serverCourt;
+      state.receiverCourt = resetCourtState.receiverCourt;
+      state.servingBoxName = resetCourtState.servingBoxName;
+      state.targetBoxName = resetCourtState.targetBoxName;
+      state.serverPlayerName = resetCourtState.serverPlayerName;
+      state.receiverPlayerName = resetCourtState.receiverPlayerName;
+      state.playerLocations = resetCourtState.playerLocations;
+      state.courtState = resetCourtState;
     }
   }
 
@@ -375,7 +598,17 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
       `GAME_${gIdx + 1}`,
       scoringSide === 'A' ? match.team_a_id : match.team_b_id,
       commentary,
-      JSON.stringify({ game: gIdx + 1, scoreA: currentGame.teamA, scoreB: currentGame.teamB, gameWinner })
+      JSON.stringify({
+        game: gIdx + 1,
+        scoringSide,
+        scoringTeam: scoringSide === 'A' ? 'teamA' : 'teamB',
+        scoreA: currentGame.teamA,
+        scoreB: currentGame.teamB,
+        gameWinner,
+        playerLocations: state.playerLocations,
+        currentServer: state.currentServer,
+        serverCourt: state.serverCourt
+      })
     ]
   );
 
@@ -490,46 +723,95 @@ async function undoPoint(matchPublicId, user) {
   state.gamesWonA = 0;
   state.gamesWonB = 0;
   state.currentGame = 1;
-  state.currentServer = 'A';
-  state.serverCourt = 'RIGHT';
+  const initServingTeam = state.startingServingTeam || 'teamA';
+  let curServingSide = initServingTeam === 'teamB' ? 'B' : 'A';
+
+  const isDoubles = String(state.matchFormat || 'DOUBLES').toUpperCase() !== 'SINGLES';
+  const rawA = Array.isArray(state.lineup?.teamA) ? state.lineup.teamA : [];
+  const rawB = Array.isArray(state.lineup?.teamB) ? state.lineup.teamB : [];
+  const pA1 = typeof rawA[0] === 'string' ? rawA[0] : (rawA[0]?.name || `${match.team_a_name} 1`);
+  const pA2 = typeof rawA[1] === 'string' ? rawA[1] : (rawA[1]?.name || `${match.team_a_name} 2`);
+  const pB1 = typeof rawB[0] === 'string' ? rawB[0] : (rawB[0]?.name || `${match.team_b_name} 1`);
+  const pB2 = typeof rawB[1] === 'string' ? rawB[1] : (rawB[1]?.name || `${match.team_b_name} 2`);
+
+  let replayLocations = {};
+  const resetLocations = () => {
+    replayLocations[pA1] = (typeof rawA[0] === 'object' && rawA[0]?.startCourt) ? String(rawA[0].startCourt).toUpperCase() : 'RIGHT';
+    if (isDoubles) replayLocations[pA2] = (typeof rawA[1] === 'object' && rawA[1]?.startCourt) ? String(rawA[1].startCourt).toUpperCase() : (replayLocations[pA1] === 'RIGHT' ? 'LEFT' : 'RIGHT');
+    replayLocations[pB1] = (typeof rawB[0] === 'object' && rawB[0]?.startCourt) ? String(rawB[0].startCourt).toUpperCase() : 'RIGHT';
+    if (isDoubles) replayLocations[pB2] = (typeof rawB[1] === 'object' && rawB[1]?.startCourt) ? String(rawB[1].startCourt).toUpperCase() : (replayLocations[pB1] === 'RIGHT' ? 'LEFT' : 'RIGHT');
+  };
+  resetLocations();
 
   for (const ev of remainingEvents) {
     const payload = typeof ev.payload === 'string' ? JSON.parse(ev.payload) : ev.payload;
     const gIdx = (payload.game || 1) - 1;
-    const evScoringSide = ev.team_id === match.team_a_id ? 'A' : 'B';
-    state.currentServer = evScoringSide;
+    const evScoringSide = payload.scoringSide || (ev.team_id === match.team_a_id ? 'A' : 'B');
+    const isServingWinner = curServingSide === evScoringSide;
+
+    if (payload.playerLocations) {
+      replayLocations = { ...payload.playerLocations };
+    } else {
+      if (isServingWinner) {
+        if (isDoubles) {
+          const sP1 = curServingSide === 'A' ? pA1 : pB1;
+          const sP2 = curServingSide === 'A' ? pA2 : pB2;
+          const loc1 = replayLocations[sP1] || 'RIGHT';
+          const loc2 = replayLocations[sP2] || 'LEFT';
+          replayLocations[sP1] = loc2;
+          replayLocations[sP2] = loc1;
+        }
+      }
+    }
+
+    curServingSide = evScoringSide;
+
     if (state.gameScores[gIdx]) {
       state.gameScores[gIdx].teamA = payload.scoreA;
       state.gameScores[gIdx].teamB = payload.scoreB;
-      const sScore = evScoringSide === 'A' ? payload.scoreA : payload.scoreB;
-      state.serverCourt = sScore % 2 === 0 ? 'RIGHT' : 'LEFT';
       if (payload.gameWinner) {
         state.gameScores[gIdx].winner = payload.gameWinner;
         if (payload.gameWinner === 'A') state.gamesWonA++;
         else state.gamesWonB++;
         state.currentGame = Math.min(3, gIdx + 2);
-        state.currentServer = payload.gameWinner;
-        state.serverCourt = 'RIGHT';
+        curServingSide = payload.gameWinner;
+        resetLocations();
       }
     }
   }
 
-  const curG = state.gameScores[(state.currentGame || 1) - 1] || { teamA: 0, teamB: 0 };
-  if (curG.teamA === 0 && curG.teamB === 0) {
-    if (state.currentGame === 1) {
-      state.currentServer = 'A';
-    } else {
-      const prevG = state.gameScores[state.currentGame - 2];
-      state.currentServer = prevG?.winner || 'A';
-    }
-    state.serverCourt = 'RIGHT';
-  } else {
-    const sScore = state.currentServer === 'A' ? curG.teamA : curG.teamB;
-    state.serverCourt = sScore % 2 === 0 ? 'RIGHT' : 'LEFT';
-  }
+  const curG = (state.currentGame || 1) - 1;
+  const curScoreA = state.gameScores[curG]?.teamA || 0;
+  const curScoreB = state.gameScores[curG]?.teamB || 0;
 
-  state.servingTeam = state.currentServer === 'A' ? 'teamA' : 'teamB';
+  // Dual-key replayLocations by ID
+  if (typeof rawA[0] === 'object' && rawA[0]?.id && replayLocations[pA1]) replayLocations[rawA[0].id] = replayLocations[pA1];
+  if (typeof rawA[1] === 'object' && rawA[1]?.id && replayLocations[pA2]) replayLocations[rawA[1].id] = replayLocations[pA2];
+  if (typeof rawB[0] === 'object' && rawB[0]?.id && replayLocations[pB1]) replayLocations[rawB[0].id] = replayLocations[pB1];
+  if (typeof rawB[1] === 'object' && rawB[1]?.id && replayLocations[pB2]) replayLocations[rawB[1].id] = replayLocations[pB2];
+
+  const finalCourtState = computeAuthoritativeBadmintonCourtState({
+    format: state.matchFormat || 'DOUBLES',
+    gameScoreA: curScoreA,
+    gameScoreB: curScoreB,
+    lineup: state.lineup || { teamA: [], teamB: [] },
+    servingTeam: curServingSide === 'A' ? 'teamA' : 'teamB',
+    teamA: { name: match.team_a_name },
+    teamB: { name: match.team_b_name },
+    existingPlayerLocations: replayLocations
+  });
+
+  state.currentServer = finalCourtState.currentServer;
+  state.servingTeam = finalCourtState.servingTeam;
   state.serverSide = state.currentServer;
+  state.serverCourt = finalCourtState.serverCourt;
+  state.receiverCourt = finalCourtState.receiverCourt;
+  state.servingBoxName = finalCourtState.servingBoxName;
+  state.targetBoxName = finalCourtState.targetBoxName;
+  state.serverPlayerName = finalCourtState.serverPlayerName;
+  state.receiverPlayerName = finalCourtState.receiverPlayerName;
+  state.playerLocations = finalCourtState.playerLocations;
+  state.courtState = finalCourtState;
 
   // Re-evaluate game point / match point flags
   const target = state.targetPoints || 21;
@@ -631,5 +913,6 @@ module.exports = {
   setLineup,
   startMatch,
   recordPoint,
-  undoPoint
+  undoPoint,
+  computeAuthoritativeBadmintonCourtState
 };
