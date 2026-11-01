@@ -461,6 +461,9 @@ router.post('/:id/fixtures/generate', authenticateUser, authorizeTournamentOrgan
 // 13. GET /api/tournaments/:id/standings - Multi-sport Standings & Rankings
 router.get('/:id/standings', async (req, res, next) => {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
     const data = await tournamentEngineService.getTournamentStandings(req.params.id);
     res.json({ success: true, data });
   } catch (error) {

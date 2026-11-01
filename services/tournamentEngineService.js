@@ -667,24 +667,143 @@ async function recalculateStandings(tournamentId, options = {}) {
   const drawPts = sportConfig.standingsFormula?.drawPoints ?? (sportConfig.standingsFormula?.tiePoints ?? 1);
   const lossPts = sportConfig.standingsFormula?.lossPoints ?? 0;
 
-  // 1. Fetch all registered teams
-  const teams = await db.query(
-    `SELECT tt.team_id, tm.name as team_name, tm.uuid as team_uuid, COALESCE(tt.group_name, 'Group 1') as group_name
+  // 1. Fetch all registered teams from tournament_teams
+  const registeredTeams = await db.query(
+    `SELECT tt.team_id, tm.name as team_name, tm.uuid as team_uuid, tm.logo_url as team_logo,
+            COALESCE(tt.group_name, 'Group 1') as group_name
      FROM tournament_teams tt
      JOIN teams tm ON tt.team_id = tm.id
-     WHERE tt.tournament_id = ? AND tt.registration_status = 'APPROVED'`,
+     WHERE tt.tournament_id = ? AND (tt.registration_status = 'APPROVED' OR tt.registration_status IS NULL)`,
     [tournament.id]
   );
 
-  // 2. Fetch all completed group/league matches (exclude knockout playoff matches from group standings)
+  // 1b. Fetch all teams appearing in fixtures for this tournament (to prevent dropping teams like Borivali Blasters)
+  const fixtureTeams = await db.query(
+    `SELECT DISTINCT tm.id as team_id, tm.name as team_name, tm.uuid as team_uuid, tm.logo_url as team_logo,
+            COALESCE(m.group_name, 'Group 1') as group_name
+     FROM tournament_matches m
+     JOIN teams tm ON (m.team_a_id = tm.id OR m.team_b_id = tm.id)
+     WHERE m.tournament_id = ?`,
+    [tournament.id]
+  );
+
+  // Helper to normalize strings for robust name matching
+  const norm = (s) => String(s || '').trim().toLowerCase();
+
+  const statsMap = {};
+  const teamIdToCanonicalId = {};
+  const teamNameToCanonicalId = {};
+
+  // Step A: Register all approved tournament_teams as canonical teams
+  for (const t of registeredTeams) {
+    const cId = t.team_id;
+    teamIdToCanonicalId[cId] = cId;
+    if (t.team_name) {
+      teamNameToCanonicalId[norm(t.team_name)] = cId;
+    }
+    statsMap[cId] = {
+      teamId: cId,
+      teamUuid: t.team_uuid,
+      teamName: t.team_name,
+      teamLogo: t.team_logo,
+      groupName: t.group_name || 'Group 1',
+      played: 0,
+      won: 0,
+      lost: 0,
+      drawn: 0,
+      points: 0,
+      gf: 0,
+      ga: 0,
+      gd: 0,
+      pf: 0,
+      pa: 0,
+      pdiff: 0,
+      setsWon: 0,
+      setsLost: 0,
+      runsScored: 0,
+      oversFaced: 0,
+      runsConceded: 0,
+      oversBowled: 0,
+      nrr: 0.000
+    };
+  }
+
+  // Step B: Resolve fixture teams (handle alias IDs e.g. A4 #21 -> #78, and auto-include unlisted teams e.g. Borivali Blasters #6)
+  for (const ft of fixtureTeams) {
+    const fId = ft.team_id;
+    const fNormName = norm(ft.team_name);
+
+    if (teamIdToCanonicalId[fId]) {
+      continue;
+    }
+
+    // Match by name to registered team if an alternate team ID was used in fixtures
+    if (fNormName && teamNameToCanonicalId[fNormName]) {
+      const canonicalId = teamNameToCanonicalId[fNormName];
+      teamIdToCanonicalId[fId] = canonicalId;
+      console.log(`🔗 [recalculateStandings] Aliasing fixture team #${fId} ("${ft.team_name}") to registered team #${canonicalId}.`);
+      continue;
+    }
+
+    // Fixture team not in tournament_teams: auto-include in standings and tournament_teams
+    const cId = fId;
+    teamIdToCanonicalId[cId] = cId;
+    if (fNormName) {
+      teamNameToCanonicalId[fNormName] = cId;
+    }
+    const assignedGroup = ft.group_name || 'Group 1';
+    statsMap[cId] = {
+      teamId: cId,
+      teamUuid: ft.team_uuid,
+      teamName: ft.team_name,
+      teamLogo: ft.team_logo,
+      groupName: assignedGroup,
+      played: 0,
+      won: 0,
+      lost: 0,
+      drawn: 0,
+      points: 0,
+      gf: 0,
+      ga: 0,
+      gd: 0,
+      pf: 0,
+      pa: 0,
+      pdiff: 0,
+      setsWon: 0,
+      setsLost: 0,
+      runsScored: 0,
+      oversFaced: 0,
+      runsConceded: 0,
+      oversBowled: 0,
+      nrr: 0.000
+    };
+    console.log(`➕ [recalculateStandings] Auto-including fixture team #${cId} ("${ft.team_name}") in ${assignedGroup} standings.`);
+
+    try {
+      await db.query(
+        `INSERT IGNORE INTO tournament_teams (tournament_id, team_id, registration_status, group_name)
+         VALUES (?, ?, 'APPROVED', ?)`,
+        [tournament.id, cId, assignedGroup]
+      );
+    } catch (regErr) {
+      console.error(`⚠️ [recalculateStandings] Could not auto-insert tournament_teams row for #${cId}:`, regErr.message);
+    }
+  }
+
+  // 2. Fetch all completed group/league matches (case-insensitive & tolerant of stored values)
   const matches = await db.query(
     `SELECT tm.*, 
             COALESCE(tm.team_a_score, 0) as score_a,
             COALESCE(tm.team_b_score, 0) as score_b
      FROM tournament_matches tm
      WHERE tm.tournament_id = ? 
-       AND tm.status = 'COMPLETED'
-       AND (tm.counts_in_standings = 1 OR tm.counts_in_standings IS NULL OR tm.category = 'League' OR tm.stage = 'GROUP')`,
+       AND UPPER(TRIM(tm.status)) = 'COMPLETED'
+       AND UPPER(TRIM(tm.status)) NOT IN ('LIVE', 'SCHEDULED', 'READY', 'PAUSED', 'INNINGS_BREAK', 'CANCELLED', 'ABANDONED')
+       AND (tm.counts_in_standings = 1 OR tm.counts_in_standings IS NULL)
+       AND (
+         UPPER(TRIM(COALESCE(tm.category, 'LEAGUE'))) IN ('LEAGUE', 'GROUP', 'ROUND_ROBIN')
+         OR UPPER(TRIM(COALESCE(tm.stage, 'GROUP'))) IN ('GROUP', 'LEAGUE', 'ROUND_ROBIN')
+       )`,
     [tournament.id]
   );
 
@@ -712,7 +831,7 @@ async function recalculateStandings(tournamentId, options = {}) {
        FROM cricket_innings ci
        JOIN tournament_matches tm ON ci.match_id = tm.id
        LEFT JOIN cricket_matches cm ON cm.match_id = tm.id
-       WHERE tm.tournament_id = ? AND tm.status = 'COMPLETED'
+       WHERE tm.tournament_id = ? AND UPPER(TRIM(tm.status)) = 'COMPLETED'
        ORDER BY ci.match_id ASC, ci.innings_number ASC`,
       [tournament.id]
     );
@@ -722,40 +841,17 @@ async function recalculateStandings(tournamentId, options = {}) {
     }
   }
 
-  // Initialize team aggregates
-  const statsMap = {};
-  for (const t of teams) {
-    statsMap[t.team_id] = {
-      teamId: t.team_id,
-      teamUuid: t.team_uuid,
-      teamName: t.team_name,
-      groupName: t.group_name,
-      played: 0,
-      won: 0,
-      lost: 0,
-      drawn: 0,
-      points: 0,
-      gf: 0,
-      ga: 0,
-      gd: 0,
-      pf: 0,
-      pa: 0,
-      pdiff: 0,
-      setsWon: 0,
-      setsLost: 0,
-      runsScored: 0,
-      oversFaced: 0,
-      runsConceded: 0,
-      oversBowled: 0,
-      nrr: 0.000
-    };
-  }
-
   // Aggregate results from matches
   for (const m of matches) {
-    const tA = statsMap[m.team_a_id];
-    const tB = statsMap[m.team_b_id];
-    if (!tA || !tB) continue;
+    const canonicalAId = teamIdToCanonicalId[m.team_a_id] || m.team_a_id;
+    const canonicalBId = teamIdToCanonicalId[m.team_b_id] || m.team_b_id;
+
+    const tA = statsMap[canonicalAId];
+    const tB = statsMap[canonicalBId];
+    if (!tA || !tB) {
+      console.warn(`⚠️ [recalculateStandings] Match #${m.id} references unresolvable team IDs (Team A: ${m.team_a_id}, Team B: ${m.team_b_id})`);
+      continue;
+    }
 
     tA.played++;
     tB.played++;
@@ -824,19 +920,20 @@ async function recalculateStandings(tournamentId, options = {}) {
       }
     }
 
-    // Win, Loss, Draw determination with robust score fallback
+    // Win, Loss, Draw determination with robust score fallback and canonical mapping
     let winnerId = m.winner_team_id;
-    if (!winnerId) {
-      if (scoreA > scoreB) winnerId = m.team_a_id;
-      else if (scoreB > scoreA) winnerId = m.team_b_id;
+    let canonicalWinnerId = winnerId ? (teamIdToCanonicalId[winnerId] || winnerId) : null;
+    if (!canonicalWinnerId) {
+      if (scoreA > scoreB) canonicalWinnerId = canonicalAId;
+      else if (scoreB > scoreA) canonicalWinnerId = canonicalBId;
     }
 
-    if (winnerId === m.team_a_id) {
+    if (canonicalWinnerId === canonicalAId) {
       tA.won++;
       tA.points += winPts;
       tB.lost++;
       tB.points += lossPts;
-    } else if (winnerId === m.team_b_id) {
+    } else if (canonicalWinnerId === canonicalBId) {
       tB.won++;
       tB.points += winPts;
       tA.lost++;
@@ -1018,10 +1115,19 @@ async function getTournamentStandings(tournamentId) {
   const completedCount = Number(completedMatchMeta?.completed_count || 0);
   const totalPlayed = Number(standingsMeta?.total_played || 0);
 
-  // Self-heal: If completed matches exist but points_table has 0 total played matches, auto-heal!
-  if (completedCount > 0 && totalPlayed === 0) {
-    console.log(`⚡ [getTournamentStandings] Self-healing standings for tournament #${tournament.id} (${completedCount} completed matches detected).`);
-    await recalculateStandings(tournament.id, { force: true });
+  // 1. Authoritative Recalculation on Read: Keep standings dynamic and strictly derived from completed matches
+  if (!tournament.is_standings_frozen && tournament.status !== 'COMPLETED') {
+    try {
+      await recalculateStandings(tournament.id, { force: false });
+    } catch (recalcErr) {
+      console.error(`❌ [getTournamentStandings] Error recalculating standings on read for tournament #${tournament.id}:`, recalcErr);
+    }
+  } else {
+    // If frozen/completed but points_table has 0 played while completed matches exist, auto-heal:
+    if (completedCount > 0 && totalPlayed === 0) {
+      console.log(`⚡ [getTournamentStandings] Self-healing standings for tournament #${tournament.id} (${completedCount} completed matches detected).`);
+      await recalculateStandings(tournament.id, { force: true });
+    }
   }
 
   // 2. Determine freeze status
@@ -1064,15 +1170,25 @@ async function getTournamentStandings(tournamentId) {
     [tournament.id]
   );
 
-  // Fetch completed matches for head-to-head tiebreakers
+  // Fetch completed matches for head-to-head tiebreakers (with team names for alias tolerance)
   const completedMatches = await db.query(
-    `SELECT team_a_id, team_b_id, winner_team_id
-     FROM tournament_matches
-     WHERE tournament_id = ? AND status = 'COMPLETED'`,
+    `SELECT tm.team_a_id, tm.team_b_id, tm.winner_team_id,
+            tA.name as team_a_name, tB.name as team_b_name, tW.name as winner_name
+     FROM tournament_matches tm
+     LEFT JOIN teams tA ON tm.team_a_id = tA.id
+     LEFT JOIN teams tB ON tm.team_b_id = tB.id
+     LEFT JOIN teams tW ON tm.winner_team_id = tW.id
+     WHERE tm.tournament_id = ? AND UPPER(TRIM(tm.status)) = 'COMPLETED'`,
     [tournament.id]
   );
 
+  // Initialize all configured groups (e.g. Group 1, Group 2) so every group renders a separate table
+  const numGroups = Math.max(1, parseInt(tournament.groups_count || tournament.groupsCount || 1, 10));
   const groups = {};
+  for (let g = 1; g <= numGroups; g++) {
+    groups[`Group ${g}`] = [];
+  }
+
   for (const r of rows) {
     const gName = r.group_name || 'Group 1';
     if (!groups[gName]) groups[gName] = [];
@@ -1118,14 +1234,22 @@ async function getTournamentStandings(tournamentId) {
       list.sort((x, y) => {
         if (y.won !== x.won) return y.won - x.won;
         if (y.pointsFor !== x.pointsFor) return y.pointsFor - x.pointsFor;
-        // Head-to-head between x and y
-        const h2h = completedMatches.find(m =>
-          (m.team_a_id === x.internalTeamId && m.team_b_id === y.internalTeamId) ||
-          (m.team_a_id === y.internalTeamId && m.team_b_id === x.internalTeamId)
-        );
-        if (h2h && h2h.winner_team_id) {
-          if (h2h.winner_team_id === x.internalTeamId) return -1;
-          if (h2h.winner_team_id === y.internalTeamId) return 1;
+        // Head-to-head between x and y (tolerant of alternate team IDs by comparing IDs and names)
+        const xNorm = (x.name || '').toLowerCase().trim();
+        const yNorm = (y.name || '').toLowerCase().trim();
+        const h2h = completedMatches.find(m => {
+          const aNorm = (m.team_a_name || '').toLowerCase().trim();
+          const bNorm = (m.team_b_name || '').toLowerCase().trim();
+          const isA_X = m.team_a_id === x.internalTeamId || (aNorm && aNorm === xNorm);
+          const isB_Y = m.team_b_id === y.internalTeamId || (bNorm && bNorm === yNorm);
+          const isA_Y = m.team_a_id === y.internalTeamId || (aNorm && aNorm === yNorm);
+          const isB_X = m.team_b_id === x.internalTeamId || (bNorm && bNorm === xNorm);
+          return (isA_X && isB_Y) || (isA_Y && isB_X);
+        });
+        if (h2h) {
+          const wNorm = (h2h.winner_name || '').toLowerCase().trim();
+          if (h2h.winner_team_id === x.internalTeamId || (wNorm && wNorm === xNorm)) return -1;
+          if (h2h.winner_team_id === y.internalTeamId || (wNorm && wNorm === yNorm)) return 1;
         }
         if (y.pointDifference !== x.pointDifference) return y.pointDifference - x.pointDifference;
         return (x.name || '').localeCompare(y.name || '');
