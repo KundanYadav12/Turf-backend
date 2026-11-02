@@ -161,6 +161,8 @@ async function getScorerState(matchPublicId) {
     } catch (e) {}
   }
 
+  state.trackPlayerPoints = Boolean(match.track_player_points || state.trackPlayerPoints);
+
   // Derive authoritative court state
   const curG = Math.max(0, (state.currentGame || 1) - 1);
   const curScoreA = state.gameScores?.[curG]?.teamA || 0;
@@ -390,9 +392,11 @@ async function startMatch(matchPublicId, reqBodyOrUser, maybeUser) {
 /**
  * 4. Record Point (+1 Team A or +1 Team B).
  */
-async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALLY' }, user) {
+async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALLY', scoredByPlayerId, playerId }, user) {
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
+
+  const candidatePlayerId = scoredByPlayerId || playerId;
 
   let state = {
     currentGame: 1,
@@ -423,6 +427,48 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
 
   const prevServingSide = state.currentServer || (state.servingTeam === 'teamB' ? 'B' : 'A');
   const isServingTeamWinner = prevServingSide === scoringSide;
+
+  // Validate and resolve credited player if requested
+  let attributedPlayerId = null;
+  let attributedPlayerName = null;
+
+  if (candidatePlayerId) {
+    const scoringTeamId = scoringSide === 'A' ? match.team_a_id : match.team_b_id;
+    const scoringTeamLineup = scoringSide === 'A' ? (state.lineup?.teamA || []) : (state.lineup?.teamB || []);
+
+    const memberRows = await db.query(
+      `SELECT tm.id, tm.team_id, tm.user_id, tm.player_name, u.full_name 
+       FROM team_members tm 
+       LEFT JOIN users u ON tm.user_id = u.id 
+       WHERE tm.team_id = ? AND (tm.id = ? OR tm.user_id = ?)`,
+      [scoringTeamId, candidatePlayerId, candidatePlayerId]
+    );
+
+    if (!memberRows || memberRows.length === 0) {
+      throw { statusCode: 400, message: "Selected player does not belong to the scoring team." };
+    }
+
+    const member = memberRows[0];
+    attributedPlayerId = member.id;
+    attributedPlayerName = member.full_name || member.player_name || 'Player';
+
+    // Verify player is in match lineup if lineup is specified
+    if (scoringTeamLineup.length > 0) {
+      const inLineup = scoringTeamLineup.some(p => {
+        if (!p) return false;
+        if (typeof p === 'object') {
+          return (p.id && (p.id === member.id || p.id === member.user_id)) ||
+                 (p.member_id && (p.member_id === member.id)) ||
+                 (p.name && (p.name.toLowerCase() === (member.full_name || '').toLowerCase() || p.name.toLowerCase() === (member.player_name || '').toLowerCase()));
+        }
+        return String(p).toLowerCase() === (member.full_name || '').toLowerCase() || String(p).toLowerCase() === (member.player_name || '').toLowerCase();
+      });
+
+      if (!inLineup) {
+        throw { statusCode: 400, message: "Player is not in the active lineup for this match." };
+      }
+    }
+  }
 
   // Extract players
   const isDoubles = String(state.matchFormat || 'DOUBLES').toUpperCase() !== 'SINGLES';
@@ -585,18 +631,20 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
 
   // Insert event log
   const scoringTeamName = scoringSide === 'A' ? match.team_a_name : match.team_b_name;
+  const playerPrefix = attributedPlayerName ? ` (${attributedPlayerName})` : '';
   const commentary = gameWinner
-    ? `🏆 ${scoringTeamName} wins Game ${gIdx + 1} (${currentGame.teamA}-${currentGame.teamB})!`
-    : `🏸 Point to ${scoringTeamName} (${currentGame.teamA}-${currentGame.teamB})`;
+    ? `🏆 ${scoringTeamName}${playerPrefix} wins Game ${gIdx + 1} (${currentGame.teamA}-${currentGame.teamB})!`
+    : `🏸 Point to ${scoringTeamName}${playerPrefix} (${currentGame.teamA}-${currentGame.teamB})`;
 
   await db.query(
     `INSERT INTO sport_match_events (
-      match_id, sport_slug, event_type, period, team_id, commentary, payload
-    ) VALUES (?, 'badminton', 'POINT', ?, ?, ?, ?)`,
+      match_id, sport_slug, event_type, period, team_id, player_id, commentary, payload
+    ) VALUES (?, 'badminton', 'POINT', ?, ?, ?, ?, ?)`,
     [
       match.id,
       `GAME_${gIdx + 1}`,
       scoringSide === 'A' ? match.team_a_id : match.team_b_id,
+      attributedPlayerId || null,
       commentary,
       JSON.stringify({
         game: gIdx + 1,
@@ -607,10 +655,30 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
         gameWinner,
         playerLocations: state.playerLocations,
         currentServer: state.currentServer,
-        serverCourt: state.serverCourt
+        serverCourt: state.serverCourt,
+        scoredByPlayerId: attributedPlayerId || null,
+        scoredByPlayerName: attributedPlayerName || null
       })
     ]
   );
+
+  // Record player point attribution in dedicated table
+  if (attributedPlayerId) {
+    await db.query(
+      `INSERT INTO match_point_attributions 
+        (match_id, tournament_id, team_id, player_id, game_number, score_after, event_seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        match.id,
+        match.tournament_id,
+        scoringSide === 'A' ? match.team_a_id : match.team_b_id,
+        attributedPlayerId,
+        state.currentGame,
+        `${currentGame.teamA}-${currentGame.teamB}`,
+        state.eventSeq || 0
+      ]
+    );
+  }
 
   const completedGamesStr = state.gameScores
     .filter(g => g.winner)
@@ -669,7 +737,9 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
     isMatchPoint: state.isMatchPoint,
     status: newStatus,
     state,
-    eventSeq: state.eventSeq
+    eventSeq: state.eventSeq,
+    scoredByPlayerId: attributedPlayerId || null,
+    scoredByPlayerName: attributedPlayerName || null
   });
 
   return {
@@ -701,7 +771,21 @@ async function undoPoint(matchPublicId, user) {
   }
 
   const lastEvent = lastEvents[0];
+  let lastPayload = {};
+  try {
+    lastPayload = typeof lastEvent.payload === 'string' ? JSON.parse(lastEvent.payload) : (lastEvent.payload || {});
+  } catch (e) {}
+
   await db.query(`DELETE FROM sport_match_events WHERE id = ?`, [lastEvent.id]);
+
+  if (lastPayload.scoredByPlayerId) {
+    await db.query(
+      `DELETE FROM match_point_attributions 
+       WHERE match_id = ? AND player_id = ? 
+       ORDER BY id DESC LIMIT 1`,
+      [match.id, lastPayload.scoredByPlayerId]
+    );
+  }
 
   let state = {};
   try {

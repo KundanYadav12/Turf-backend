@@ -5,6 +5,8 @@ const cricketScorerService = require('../services/cricketScorerService');
 const universalUndoService = require('../services/universalUndoService');
 const { authenticateUser, optionalAuthenticateUser } = require('../middleware/authMiddleware');
 const { requireScorerForMatch } = require('../middleware/scorerAuthMiddleware');
+const db = require('../config/database');
+const { getIO } = require('../services/socketService');
 
 // 0. GET /api/matches/live - All active LIVE matches across the platform (concurrent/multi-tournament)
 router.get('/live', async (req, res, next) => {
@@ -48,7 +50,8 @@ router.get('/', async (req, res, next) => {
 // 1. GET /api/matches/:id - Single Match Detailed State (Public / Viewers)
 router.get('/:id', async (req, res, next) => {
   try {
-    const match = await matchService.getMatchByPublicId(req.params.id);
+    const tournamentId = req.query.tournamentId || req.query.tournament_id;
+    const match = await matchService.getMatchByPublicId(req.params.id, tournamentId);
     if (!match) {
       return res.status(404).json({ success: false, message: 'Match not found.' });
     }
@@ -377,7 +380,7 @@ router.get('/:id/pickleball', async (req, res, next) => {
 });
 
 // 12. POST /api/matches/:id/pickleball/lineup - Select Singles / Doubles Active Lineup
-router.post('/:id/pickleball/lineup', authenticateUser, async (req, res, next) => {
+router.post('/:id/pickleball/lineup', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await pickleballService.setLineup(req.params.id, req.body, req.user);
     res.json({ success: true, message: 'Lineup saved successfully!', data });
@@ -387,7 +390,7 @@ router.post('/:id/pickleball/lineup', authenticateUser, async (req, res, next) =
 });
 
 // 13. POST /api/matches/:id/pickleball/start - Start Match Live
-router.post('/:id/pickleball/start', authenticateUser, async (req, res, next) => {
+router.post('/:id/pickleball/start', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await pickleballService.startMatch(req.params.id, req.body, req.user);
     res.json({ success: true, message: 'Match started!', data });
@@ -397,7 +400,7 @@ router.post('/:id/pickleball/start', authenticateUser, async (req, res, next) =>
 });
 
 // 14. POST /api/matches/:id/pickleball/point - Record Point (+1 Team A / +1 Team B)
-router.post('/:id/pickleball/point', authenticateUser, async (req, res, next) => {
+router.post('/:id/pickleball/point', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await pickleballService.recordPoint(req.params.id, req.body, req.user);
     res.json({ success: true, message: 'Point recorded!', data });
@@ -407,7 +410,7 @@ router.post('/:id/pickleball/point', authenticateUser, async (req, res, next) =>
 });
 
 // 15. POST /api/matches/:id/pickleball/undo - Undo Last Point
-router.post('/:id/pickleball/undo', authenticateUser, async (req, res, next) => {
+router.post('/:id/pickleball/undo', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await pickleballService.undoPoint(req.params.id, req.user);
     res.json({ success: true, message: 'Last action undone!', data });
@@ -417,7 +420,7 @@ router.post('/:id/pickleball/undo', authenticateUser, async (req, res, next) => 
 });
 
 // 16. POST /api/matches/:id/pickleball/correct - Correct Score (Authorized correction)
-router.post('/:id/pickleball/correct', authenticateUser, async (req, res, next) => {
+router.post('/:id/pickleball/correct', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await pickleballService.correctScore(req.params.id, req.body, req.user);
     res.json({ success: true, message: 'Score corrected successfully!', data });
@@ -427,7 +430,7 @@ router.post('/:id/pickleball/correct', authenticateUser, async (req, res, next) 
 });
 
 // 16b. POST /api/matches/:id/pickleball/rule - Toggle Rotation / Playing Rule (OFFICIAL vs BADMINTON)
-router.post('/:id/pickleball/rule', authenticateUser, async (req, res, next) => {
+router.post('/:id/pickleball/rule', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await pickleballService.setRotationRule(req.params.id, req.body, req.user);
     res.json({ success: true, message: 'Playing rule updated successfully!', data });
@@ -453,7 +456,7 @@ router.get('/:id/football', async (req, res, next) => {
 });
 
 // 18. POST /api/matches/:id/football/lineup - Set Lineups (XI + Subs)
-router.post('/:id/football/lineup', authenticateUser, async (req, res, next) => {
+router.post('/:id/football/lineup', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await footballScorerService.setLineups(req.params.id, req.body, req.user);
     res.json(data);
@@ -463,7 +466,7 @@ router.post('/:id/football/lineup', authenticateUser, async (req, res, next) => 
 });
 
 // 19. POST /api/matches/:id/football/period - Change Match Period / Clock
-router.post('/:id/football/period', authenticateUser, async (req, res, next) => {
+router.post('/:id/football/period', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await footballScorerService.updatePeriod(req.params.id, req.body, req.user);
     res.json(data);
@@ -473,7 +476,7 @@ router.post('/:id/football/period', authenticateUser, async (req, res, next) => 
 });
 
 // 20. POST /api/matches/:id/football/goal - Record Goal
-router.post('/:id/football/goal', authenticateUser, async (req, res, next) => {
+router.post('/:id/football/goal', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await footballScorerService.recordGoal(req.params.id, req.body, req.user);
     res.json(data);
@@ -483,7 +486,7 @@ router.post('/:id/football/goal', authenticateUser, async (req, res, next) => {
 });
 
 // 21. POST /api/matches/:id/football/card - Record Yellow/Red Card
-router.post('/:id/football/card', authenticateUser, async (req, res, next) => {
+router.post('/:id/football/card', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await footballScorerService.recordCard(req.params.id, req.body, req.user);
     res.json(data);
@@ -493,7 +496,7 @@ router.post('/:id/football/card', authenticateUser, async (req, res, next) => {
 });
 
 // 22. POST /api/matches/:id/football/sub - Record Substitution
-router.post('/:id/football/sub', authenticateUser, async (req, res, next) => {
+router.post('/:id/football/sub', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await footballScorerService.recordSubstitution(req.params.id, req.body, req.user);
     res.json(data);
@@ -503,7 +506,7 @@ router.post('/:id/football/sub', authenticateUser, async (req, res, next) => {
 });
 
 // 23. POST /api/matches/:id/football/undo - Undo Last Event
-router.post('/:id/football/undo', authenticateUser, async (req, res, next) => {
+router.post('/:id/football/undo', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await footballScorerService.undoLastEvent(req.params.id, req.user);
     res.json(data);
@@ -513,7 +516,7 @@ router.post('/:id/football/undo', authenticateUser, async (req, res, next) => {
 });
 
 // 24. POST /api/matches/:id/football/complete - Complete Match & Recalculate Standings
-router.post('/:id/football/complete', authenticateUser, async (req, res, next) => {
+router.post('/:id/football/complete', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await footballScorerService.completeMatch(req.params.id, req.body, req.user);
     res.json(data);
@@ -539,7 +542,7 @@ router.get('/:id/badminton', async (req, res, next) => {
 });
 
 // 26. POST /api/matches/:id/badminton/lineup - Set Singles or Doubles Lineup
-router.post('/:id/badminton/lineup', authenticateUser, async (req, res, next) => {
+router.post('/:id/badminton/lineup', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await badmintonScorerService.setLineup(req.params.id, req.body, req.user);
     res.json(data);
@@ -549,7 +552,7 @@ router.post('/:id/badminton/lineup', authenticateUser, async (req, res, next) =>
 });
 
 // 27. POST /api/matches/:id/badminton/start - Start Match Live
-router.post('/:id/badminton/start', authenticateUser, async (req, res, next) => {
+router.post('/:id/badminton/start', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await badmintonScorerService.startMatch(req.params.id, req.user);
     res.json(data);
@@ -559,7 +562,7 @@ router.post('/:id/badminton/start', authenticateUser, async (req, res, next) => 
 });
 
 // 28. POST /api/matches/:id/badminton/point - Record Point (+1 Side A / Side B)
-router.post('/:id/badminton/point', authenticateUser, async (req, res, next) => {
+router.post('/:id/badminton/point', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await badmintonScorerService.recordPoint(req.params.id, req.body, req.user);
     res.json(data);
@@ -569,7 +572,7 @@ router.post('/:id/badminton/point', authenticateUser, async (req, res, next) => 
 });
 
 // 29. POST /api/matches/:id/badminton/undo - Undo Last Point
-router.post('/:id/badminton/undo', authenticateUser, async (req, res, next) => {
+router.post('/:id/badminton/undo', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
     const data = await badmintonScorerService.undoPoint(req.params.id, req.user);
     res.json(data);
@@ -577,5 +580,69 @@ router.post('/:id/badminton/undo', authenticateUser, async (req, res, next) => {
     next(error);
   }
 });
+
+// === TRACK POINTS BY PLAYER TOGGLE (COURT SPORTS) ===
+async function handleToggleTrackPlayerPoints(req, res, next) {
+  try {
+    const { enabled, trackPlayerPoints } = req.body;
+    const isEnabled = Boolean(trackPlayerPoints !== undefined ? trackPlayerPoints : enabled);
+    const matchId = req.params.id;
+
+    const rows = await db.query(
+      `SELECT id, uuid, tournament_id, sport_state FROM tournament_matches WHERE uuid = ? OR id = ?`,
+      [matchId, isNaN(matchId) ? -1 : parseInt(matchId, 10)]
+    );
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Match not found.' });
+    }
+    const match = rows[0];
+
+    let sportState = {};
+    if (match.sport_state) {
+      try {
+        sportState = typeof match.sport_state === 'string' ? JSON.parse(match.sport_state) : match.sport_state;
+      } catch (e) {}
+    }
+    sportState.trackPlayerPoints = isEnabled;
+
+    await db.query(
+      `UPDATE tournament_matches 
+       SET track_player_points = ?, sport_state = ? 
+       WHERE id = ?`,
+      [isEnabled ? 1 : 0, JSON.stringify(sportState), match.id]
+    );
+
+    try {
+      const io = getIO();
+      if (io) {
+        const payload = {
+          matchId: match.uuid,
+          internalMatchId: match.id,
+          tournamentId: match.tournament_id,
+          trackPlayerPoints: isEnabled
+        };
+        io.to(`match:${match.uuid}`).emit('match:trackPlayerPointsUpdated', payload);
+        io.to(`match:${match.id}`).emit('match:trackPlayerPointsUpdated', payload);
+        io.to(`tournament:${match.tournament_id}`).emit('match:trackPlayerPointsUpdated', payload);
+        io.emit('match:trackPlayerPointsUpdated', payload);
+      }
+    } catch (e) {
+      console.error('Socket emit error in track-player-points:', e);
+    }
+
+    res.json({
+      success: true,
+      message: `Point tracking by player ${isEnabled ? 'enabled' : 'disabled'}.`,
+      trackPlayerPoints: isEnabled
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+// 30. POST /api/matches/:id/track-player-points - Toggle player tracking
+router.post('/:id/track-player-points', authenticateUser, requireScorerForMatch, handleToggleTrackPlayerPoints);
+router.post('/:id/pickleball/track-player-points', authenticateUser, requireScorerForMatch, handleToggleTrackPlayerPoints);
+router.post('/:id/badminton/track-player-points', authenticateUser, requireScorerForMatch, handleToggleTrackPlayerPoints);
 
 module.exports = router;

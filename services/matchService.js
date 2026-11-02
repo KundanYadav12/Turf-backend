@@ -4,7 +4,16 @@ const { broadcastTournamentMatchUpdate, broadcastMatchBallEvent } = require('./s
 /**
  * Returns single match state.
  */
-const getMatchByPublicId = async (matchPublicId) => {
+const getMatchByPublicId = async (matchPublicId, expectedTournamentId = null) => {
+  const isTournNum = expectedTournamentId ? /^\d+$/.test(String(expectedTournamentId).trim()) : false;
+  const conditions = ['(tm.uuid = ? OR tm.id = ?)'];
+  const params = [matchPublicId, isNaN(matchPublicId) ? -1 : parseInt(matchPublicId, 10)];
+
+  if (expectedTournamentId) {
+    conditions.push('(t.uuid = ? OR t.id = ?)');
+    params.push(expectedTournamentId, isTournNum ? parseInt(expectedTournamentId, 10) : -1);
+  }
+
   const rows = await db.query(
     `SELECT 
       tm.id,
@@ -19,6 +28,7 @@ const getMatchByPublicId = async (matchPublicId) => {
       COALESCE(tm.live_score_summary, 'Yet to Start') as live_score_summary,
       tm.live_subtext,
       tm.sport_state,
+      t.id as tournament_id,
       t.uuid as tournament_public_id,
       t.name as tournament_name,
       s.slug as sport_slug,
@@ -35,8 +45,8 @@ const getMatchByPublicId = async (matchPublicId) => {
      LEFT JOIN venues v ON tm.venue_id = v.id
      JOIN teams ta ON tm.team_a_id = ta.id
      JOIN teams tb ON tm.team_b_id = tb.id
-     WHERE tm.uuid = ? OR tm.id = ?`,
-    [matchPublicId, isNaN(matchPublicId) ? -1 : parseInt(matchPublicId, 10)]
+     WHERE ${conditions.join(' AND ')}`,
+    params
   );
 
   if (!rows || rows.length === 0) {
@@ -288,7 +298,7 @@ const recordScoreEvent = async ({
  * Guarantees zero limit, returning all concurrent live matches.
  */
 const getAllLiveMatches = async ({ tournamentId = null, sport = null, limit = 100 } = {}) => {
-  const conditions = ["tm.status = 'LIVE'"];
+  const conditions = ["tm.status = 'LIVE'", "(tm.is_standalone = 0 OR tm.is_standalone IS NULL)"];
   const params = [];
 
   if (tournamentId) {

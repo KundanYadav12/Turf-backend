@@ -899,6 +899,368 @@ async function searchPlayers({ query = '', sport = '', city = '', role = '', lim
   }));
 }
 
+/**
+ * 10. Get Tournament Player Scoring Leaderboard.
+ */
+async function getTournamentPlayerLeaderboard(tournamentId, { search, teamId, page = 1, limit = 20 } = {}) {
+  const [tournament] = await db.query(
+    `SELECT id, uuid, name FROM tournaments WHERE uuid = ? OR id = ?`,
+    [tournamentId, /^\d+$/.test(String(tournamentId).trim()) ? parseInt(tournamentId, 10) : -1]
+  );
+  if (!tournament) throw { statusCode: 404, message: 'Tournament not found.' };
+
+  // Fetch all registered teams for filter dropdown
+  const teams = await db.query(
+    `SELECT t.id, t.uuid, t.name, t.logo_url as logoUrl
+     FROM tournament_teams tt
+     JOIN teams t ON tt.team_id = t.id
+     WHERE tt.tournament_id = ?
+     ORDER BY t.name ASC`,
+    [tournament.id]
+  );
+
+  // Fetch all players from tournament squads
+  const rawPlayers = await db.query(
+    `SELECT tm.id as player_id,
+            COALESCE(u.full_name, tm.player_name, 'Player') as player_name,
+            COALESCE(u.profile_photo, tm.photo_url, NULL) as photo_url,
+            t.id as team_id,
+            t.uuid as team_uuid,
+            t.name as team_name
+     FROM tournament_teams tt
+     JOIN teams t ON tt.team_id = t.id
+     JOIN team_members tm ON tm.team_id = t.id AND tm.deleted_at IS NULL
+     LEFT JOIN users u ON tm.user_id = u.id
+     WHERE tt.tournament_id = ?`,
+    [tournament.id]
+  );
+
+  // Fetch all attributed points for this tournament
+  const pointsRows = await db.query(
+    `SELECT player_id, COUNT(*) as points_scored
+     FROM match_point_attributions
+     WHERE tournament_id = ? AND is_voided = 0
+     GROUP BY player_id`,
+    [tournament.id]
+  );
+
+  const pointsMap = {};
+  for (const r of pointsRows) {
+    pointsMap[r.player_id] = parseInt(r.points_scored, 10) || 0;
+  }
+
+  // Fetch all completed matches to calculate Played, Won, Lost
+  const completedMatches = await db.query(
+    `SELECT id, team_a_id, team_b_id, team_a_lineup, team_b_lineup, winner_team_id
+     FROM tournament_matches
+     WHERE tournament_id = ? AND status = 'COMPLETED'`,
+    [tournament.id]
+  );
+
+  // Helper to test if player was in lineup
+  const isPlayerInLineup = (lineupRaw, playerId, playerName) => {
+    if (!lineupRaw) return false;
+    let lineup = [];
+    try {
+      lineup = typeof lineupRaw === 'string' ? JSON.parse(lineupRaw) : lineupRaw;
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(lineup)) return false;
+    const normName = String(playerName || '').trim().toLowerCase();
+    return lineup.some(p => {
+      if (typeof p === 'object' && p !== null) {
+        if (p.id && String(p.id) === String(playerId)) return true;
+        if (p.name && String(p.name).trim().toLowerCase() === normName) return true;
+      } else if (typeof p === 'string') {
+        if (p.trim().toLowerCase() === normName) return true;
+      }
+      return false;
+    });
+  };
+
+  // Build aggregated stats per player
+  const playerStats = {};
+  for (const p of rawPlayers) {
+    playerStats[p.player_id] = { matchesPlayed: 0, matchesWon: 0, matchesLost: 0 };
+  }
+
+  for (const m of completedMatches) {
+    for (const p of rawPlayers) {
+      if (p.team_id === m.team_a_id) {
+        if (isPlayerInLineup(m.team_a_lineup, p.player_id, p.player_name)) {
+          playerStats[p.player_id].matchesPlayed += 1;
+          if (m.winner_team_id === m.team_a_id) {
+            playerStats[p.player_id].matchesWon += 1;
+          } else if (m.winner_team_id !== null) {
+            playerStats[p.player_id].matchesLost += 1;
+          }
+        }
+      } else if (p.team_id === m.team_b_id) {
+        if (isPlayerInLineup(m.team_b_lineup, p.player_id, p.player_name)) {
+          playerStats[p.player_id].matchesPlayed += 1;
+          if (m.winner_team_id === m.team_b_id) {
+            playerStats[p.player_id].matchesWon += 1;
+          } else if (m.winner_team_id !== null) {
+            playerStats[p.player_id].matchesLost += 1;
+          }
+        }
+      }
+    }
+  }
+
+  // Combine player data
+  const allPlayers = rawPlayers.map(p => {
+    const stats = playerStats[p.player_id] || { matchesPlayed: 0, matchesWon: 0, matchesLost: 0 };
+    return {
+      id: p.player_id,
+      playerId: p.player_id,
+      name: p.player_name,
+      playerName: p.player_name,
+      photo: p.photo_url || null,
+      photoUrl: p.photo_url || null,
+      teamId: p.team_id,
+      teamUuid: p.team_uuid,
+      teamName: p.team_name,
+      pointsScored: pointsMap[p.player_id] || 0,
+      matchesPlayed: stats.matchesPlayed,
+      matchesWon: stats.matchesWon,
+      matchesLost: stats.matchesLost
+    };
+  });
+
+  const hasAttributedPoints = allPlayers.some(p => p.pointsScored > 0);
+
+  // Sort: Points Scored DESC, more wins DESC, fewer matches played ASC, player name ASC
+  allPlayers.sort((a, b) => {
+    if (b.pointsScored !== a.pointsScored) return b.pointsScored - a.pointsScored;
+    if (b.matchesWon !== a.matchesWon) return b.matchesWon - a.matchesWon;
+    if (a.matchesPlayed !== b.matchesPlayed) return a.matchesPlayed - b.matchesPlayed;
+    return a.playerName.localeCompare(b.playerName);
+  });
+
+  // Assign overall tournament ranks
+  allPlayers.forEach((p, idx) => {
+    p.rank = idx + 1;
+  });
+
+  // Filter by team
+  let filtered = allPlayers;
+  if (teamId) {
+    const isNum = /^\d+$/.test(String(teamId).trim());
+    filtered = filtered.filter(p => (isNum ? p.teamId === parseInt(teamId, 10) : p.teamUuid === teamId));
+  }
+
+  // Filter by search
+  if (search && String(search).trim()) {
+    const q = String(search).trim().toLowerCase();
+    filtered = filtered.filter(p =>
+      p.playerName.toLowerCase().includes(q) ||
+      p.teamName.toLowerCase().includes(q)
+    );
+  }
+
+  // Pagination
+  const safePage = Math.max(1, parseInt(page, 10) || 1);
+  const safeLimit = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+  const total = filtered.length;
+  const totalPages = Math.ceil(total / safeLimit) || 1;
+  const startIndex = (safePage - 1) * safeLimit;
+  const pagedItems = filtered.slice(startIndex, startIndex + safeLimit);
+
+  return {
+    leaderboard: pagedItems,
+    players: pagedItems,
+    pagination: {
+      total,
+      page: safePage,
+      limit: safeLimit,
+      totalPages
+    },
+    hasAttributedPoints,
+    teams: teams.map(t => ({ id: t.id, uuid: t.uuid, name: t.name, logoUrl: t.logoUrl }))
+  };
+}
+
+/**
+ * 11. Get Player Scoring History within a Tournament.
+ * Privacy-guarded: never exposes DOB, email, phone, Aadhaar, address.
+ */
+async function getPlayerScoringHistory(tournamentId, playerId) {
+  const [tournament] = await db.query(
+    `SELECT id, uuid, name FROM tournaments WHERE uuid = ? OR id = ?`,
+    [tournamentId, /^\d+$/.test(String(tournamentId).trim()) ? parseInt(tournamentId, 10) : -1]
+  );
+  if (!tournament) throw { statusCode: 404, message: 'Tournament not found.' };
+
+  const isPlayerNum = /^\d+$/.test(String(playerId).trim());
+  const [player] = await db.query(
+    `SELECT tm.id as player_id,
+            COALESCE(u.full_name, tm.player_name, 'Player') as player_name,
+            COALESCE(u.profile_photo, tm.photo_url, NULL) as photo_url,
+            t.id as team_id,
+            t.uuid as team_uuid,
+            t.name as team_name
+     FROM team_members tm
+     JOIN teams t ON tm.team_id = t.id
+     LEFT JOIN users u ON tm.user_id = u.id
+     WHERE tm.id = ? AND tm.deleted_at IS NULL`,
+    [isPlayerNum ? parseInt(playerId, 10) : -1]
+  );
+  if (!player) throw { statusCode: 404, message: 'Player not found.' };
+
+  // Fetch matches in this tournament where player's team participated
+  const matches = await db.query(
+    `SELECT m.id, m.uuid, m.match_number, m.status, m.stage, m.round_number, m.group_name,
+            m.team_a_id, m.team_b_id, m.team_a_lineup, m.team_b_lineup,
+            m.team_a_score, m.team_b_score, m.winner_team_id, m.live_score_summary,
+            m.result_summary, m.created_at, m.match_date,
+            ta.name as team_a_name, tb.name as team_b_name
+     FROM tournament_matches m
+     JOIN teams ta ON m.team_a_id = ta.id
+     JOIN teams tb ON m.team_b_id = tb.id
+     WHERE m.tournament_id = ? AND (m.team_a_id = ? OR m.team_b_id = ?)
+     ORDER BY m.created_at DESC, m.id DESC`,
+    [tournament.id, player.team_id, player.team_id]
+  );
+
+  // Fetch all non-voided point attributions for this player in this tournament
+  const attributions = await db.query(
+    `SELECT match_id, game_number, COUNT(*) as points
+     FROM match_point_attributions
+     WHERE tournament_id = ? AND player_id = ? AND is_voided = 0
+     GROUP BY match_id, game_number
+     ORDER BY game_number ASC`,
+    [tournament.id, player.player_id]
+  );
+
+  // Group attributions by match_id
+  const matchPointsMap = {};
+  for (const a of attributions) {
+    if (!matchPointsMap[a.match_id]) {
+      matchPointsMap[a.match_id] = { total: 0, games: [] };
+    }
+    const pts = parseInt(a.points, 10) || 0;
+    matchPointsMap[a.match_id].total += pts;
+    matchPointsMap[a.match_id].games.push({
+      gameNumber: a.game_number || 1,
+      points: pts
+    });
+  }
+
+  // Helper to test if player was in lineup
+  const isPlayerInLineup = (lineupRaw) => {
+    if (!lineupRaw) return false;
+    let lineup = [];
+    try {
+      lineup = typeof lineupRaw === 'string' ? JSON.parse(lineupRaw) : lineupRaw;
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(lineup)) return false;
+    const normName = String(player.player_name || '').trim().toLowerCase();
+    return lineup.some(p => {
+      if (typeof p === 'object' && p !== null) {
+        if (p.id && String(p.id) === String(player.player_id)) return true;
+        if (p.name && String(p.name).trim().toLowerCase() === normName) return true;
+      } else if (typeof p === 'string') {
+        if (p.trim().toLowerCase() === normName) return true;
+      }
+      return false;
+    });
+  };
+
+  let totalPointsScored = 0;
+  let matchesPlayed = 0;
+  let matchesWon = 0;
+  let matchesLost = 0;
+
+  const history = [];
+
+  for (const m of matches) {
+    const isTeamA = m.team_a_id === player.team_id;
+    const playerLineup = isTeamA ? m.team_a_lineup : m.team_b_lineup;
+    const inLineup = isPlayerInLineup(playerLineup);
+    const matchAttributions = matchPointsMap[m.id];
+    const matchPoints = matchAttributions ? matchAttributions.total : 0;
+
+    // Count towards completed match record if in lineup
+    if (m.status === 'COMPLETED' && inLineup) {
+      matchesPlayed += 1;
+      if (m.winner_team_id === player.team_id) {
+        matchesWon += 1;
+      } else if (m.winner_team_id !== null) {
+        matchesLost += 1;
+      }
+    }
+
+    totalPointsScored += matchPoints;
+
+    // Only include in history if player was in the lineup OR had points scored
+    if (inLineup || matchPoints > 0) {
+      let result = 'Scheduled';
+      if (m.status === 'COMPLETED') {
+        result = m.winner_team_id === player.team_id ? 'Won' : (m.winner_team_id ? 'Lost' : 'Draw');
+      } else if (m.status === 'LIVE') {
+        result = 'In Progress';
+      }
+
+      const stageDisplay = m.stage || (m.round_number ? `Round ${m.round_number}` : m.group_name) || 'Match';
+
+      history.push({
+        matchId: m.uuid || m.id,
+        internalMatchId: m.id,
+        matchUuid: m.uuid,
+        matchNumber: m.match_number,
+        matchName: `${m.team_a_name} vs ${m.team_b_name}`,
+        date: m.match_date || m.created_at,
+        round: stageDisplay,
+        status: m.status,
+        teamAName: m.team_a_name,
+        teamBName: m.team_b_name,
+        playerTeam: player.team_name,
+        playerTeamName: player.team_name,
+        opponentTeamName: isTeamA ? m.team_b_name : m.team_a_name,
+        result,
+        scoreSummary: m.live_score_summary || `${m.team_a_score || 0} - ${m.team_b_score || 0}`,
+        playerPoints: matchPoints,
+        pointsScored: matchPoints,
+        gameBreakdown: matchAttributions ? matchAttributions.games.map(g => ({ game: g.gameNumber, points: g.points })) : [],
+        matchLink: `/matches/${m.uuid}`
+      });
+    }
+  }
+
+  return {
+    player: {
+      id: player.player_id,
+      playerId: player.player_id,
+      name: player.player_name,
+      photo: player.photo_url || null,
+      photoUrl: player.photo_url || null,
+      team: player.team_name,
+      teamId: player.team_id,
+      teamUuid: player.team_uuid,
+      teamName: player.team_name,
+      summary: {
+        totalPoints: totalPointsScored,
+        pointsScored: totalPointsScored,
+        matchesPlayed,
+        matchesWon,
+        matchesLost
+      }
+    },
+    summary: {
+      totalPoints: totalPointsScored,
+      pointsScored: totalPointsScored,
+      matchesPlayed,
+      matchesWon,
+      matchesLost
+    },
+    history
+  };
+}
+
 module.exports = {
   computeTournamentAwards,
   getTournamentAwards,
@@ -909,6 +1271,9 @@ module.exports = {
   getPlayerProfile,
   updatePlayerProfile,
   getPlayerMatchHistory,
-  searchPlayers
+  searchPlayers,
+  getTournamentPlayerLeaderboard,
+  getPlayerScoringHistory
 };
+
 

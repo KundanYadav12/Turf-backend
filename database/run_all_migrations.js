@@ -17,6 +17,8 @@ const migrations = [
   'migrate_team_joining_links.js',
   'migrate_standings_frozen_columns.js',
   'migrate_password_resets.js',
+  'migrate_tournament_data_isolation.js',
+  'migrate_player_point_tracking.js',
   'seed_superadmin.js'
 ];
 

@@ -63,31 +63,6 @@ async function getDisplayData(req, res, next) {
           theme: 'dark',
           animation_speed: 'normal'
         };
-      } else {
-        // Fallback: Pick default active tournament
-        const defaultTourns = await db.query('SELECT id, uuid, name FROM tournaments ORDER BY id ASC LIMIT 1');
-        if (defaultTourns.length > 0) {
-          tournamentId = defaultTourns[0].id;
-          tvConfig = {
-            id: null,
-            uuid: 'tv_default_preview',
-            name: `${defaultTourns[0].name} Live TV`,
-            tournament_id: tournamentId,
-            layout_type: 'AUTO',
-            orientation: 'AUTO',
-            sidebars_mode: 'STRIP',
-            match_count: 4,
-            rotation_enabled: true,
-            rotation_interval: 15,
-            active_scenes: ['SCOREBOARD', 'FIXTURES', 'STANDINGS', 'SPONSORS', 'RESULTS'],
-            ad_top_enabled: true,
-            ad_bottom_enabled: true,
-            ad_sidebars_enabled: true,
-            ad_center_enabled: false,
-            theme: 'dark',
-            animation_speed: 'normal'
-          };
-        }
       }
     }
 
@@ -109,70 +84,13 @@ async function getDisplayData(req, res, next) {
 
     const tournament = tourRows[0] || null;
 
-    // 3. Fetch Live Matches (Respect showOnDisplay filter)
+    // 3. Fetch Live Matches from authoritative shared tournament service function
     let liveMatches = await tournamentService.getTournamentLiveMatches(tournamentId);
     liveMatches = (liveMatches || []).filter(m => m.showOnDisplay !== false);
 
-    // If show_completed_matches is enabled or there are fewer live matches than match_count,
-    // fetch upcoming or recently completed matches to provide a populated TV grid
-    if (liveMatches.length < (tvConfig.match_count || 4)) {
-      const extraNeeded = (tvConfig.match_count || 4) - liveMatches.length;
-      const extraRows = await db.query(`
-        SELECT 
-          tm.id as match_id, tm.uuid as match_uuid, tm.match_number, tm.status,
-          tm.show_on_display, tm.category,
-          tm.live_score_summary, tm.live_subtext, tm.sport_state,
-          c.name as court_name, v.name as venue_name,
-          ta.uuid as team_a_id, ta.name as team_a_name, ta.logo_url as team_a_logo,
-          tb.uuid as team_b_id, tb.name as team_b_name, tb.logo_url as team_b_logo,
-          s.slug as sport_slug
-        FROM tournament_matches tm
-        JOIN tournaments t ON tm.tournament_id = t.id
-        JOIN sports s ON t.sport_id = s.id
-        LEFT JOIN courts c ON tm.court_id = c.id
-        LEFT JOIN venues v ON tm.venue_id = v.id
-        JOIN teams ta ON tm.team_a_id = ta.id
-        JOIN teams tb ON tm.team_b_id = tb.id
-        WHERE tm.tournament_id = ? AND tm.status != 'LIVE' AND (tm.show_on_display = 1 OR tm.show_on_display IS NULL)
-        ORDER BY 
-          CASE 
-            WHEN tm.status = 'COMPLETED' THEN 1
-            WHEN tm.status = 'SCHEDULED' THEN 2
-            ELSE 3
-          END,
-          tm.match_number ASC
-        LIMIT ?
-      `, [tournamentId, extraNeeded]);
-
-      const formattedExtras = extraRows.map(m => {
-        let parsedSportState = null;
-        try {
-          parsedSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : m.sport_state;
-        } catch {}
-
-        return {
-          id: m.match_id,
-          matchNumber: m.match_number,
-          status: m.status,
-          courtName: m.court_name || 'Court',
-          venueName: m.venue_name || 'Arena',
-          sportSlug: m.sport_slug,
-          teamA: { id: m.team_a_id, name: m.team_a_name, logo: m.team_a_logo },
-          teamB: { id: m.team_b_id, name: m.team_b_name, logo: m.team_b_logo },
-          score: {
-            summary: m.live_score_summary || (m.status === 'SCHEDULED' ? 'Upcoming' : 'Result'),
-            subtext: m.live_subtext || '',
-            details: parsedSportState
-          }
-        };
-      });
-
-      liveMatches = [...liveMatches, ...formattedExtras];
-    }
-
-    // 4. Featured Match and Selected Matches Ordering
+    // 4. Featured Match and Selected Matches Ordering (IDs only)
     if (tvConfig.featured_match_id) {
-      const featIdx = liveMatches.findIndex(m => m.id === tvConfig.featured_match_id || m.matchNumber === tvConfig.featured_match_id);
+      const featIdx = liveMatches.findIndex(m => m.id === tvConfig.featured_match_id || m.uuid === tvConfig.featured_match_id);
       if (featIdx > 0) {
         const [featMatch] = liveMatches.splice(featIdx, 1);
         liveMatches.unshift(featMatch);

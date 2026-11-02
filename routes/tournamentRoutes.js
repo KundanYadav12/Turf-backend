@@ -137,34 +137,14 @@ router.get(['/live', '/live-all'], async (req, res, next) => {
   }
 });
 
-// 3. GET /api/tournaments/:id/live - Active Live match summaries
-router.get('/:id/live', async (req, res, next) => {
-  try {
-    const matches = await tournamentService.getTournamentLiveMatches(req.params.id);
-    res.json({ success: true, data: { items: matches } });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// 4. GET /api/tournaments/:id/matches - Fixtures and Schedule
-router.get('/:id/matches', async (req, res, next) => {
-  try {
-    const matches = await tournamentService.getTournamentFixtures(req.params.id);
-    res.json({ success: true, data: { items: matches } });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// 4-live. GET /api/tournaments/:id/live & /:id/live-matches - All current LIVE matches in this tournament
+// 3. GET /api/tournaments/:id/live & /:id/live-matches - Active Live match summaries
 const getTournamentLiveMatchesHandler = async (req, res, next) => {
   try {
-    const matches = await matchService.getAllLiveMatches({
-      tournamentId: req.params.id,
-      sport: req.query.sport,
-      limit: req.query.limit
-    });
+    const tournament = await tournamentService.getTournamentByPublicId(req.params.id);
+    if (!tournament) {
+      return res.status(404).json({ success: false, message: 'Tournament not found.' });
+    }
+    const matches = await tournamentService.getTournamentLiveMatches(req.params.id);
     res.json({
       success: true,
       data: {
@@ -178,6 +158,34 @@ const getTournamentLiveMatchesHandler = async (req, res, next) => {
 };
 router.get('/:id/live', getTournamentLiveMatchesHandler);
 router.get('/:id/live-matches', getTournamentLiveMatchesHandler);
+
+// 4. GET /api/tournaments/:id/matches - Fixtures and Schedule
+router.get('/:id/matches', async (req, res, next) => {
+  try {
+    const tournament = await tournamentService.getTournamentByPublicId(req.params.id);
+    if (!tournament) {
+      return res.status(404).json({ success: false, message: 'Tournament not found.' });
+    }
+    const matches = await tournamentService.getTournamentFixtures(req.params.id);
+    res.json({ success: true, data: { items: matches } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 4-alias. GET /api/tournaments/:id/fixtures - Direct Alias for Fixtures & Schedule
+router.get('/:id/fixtures', async (req, res, next) => {
+  try {
+    const tournament = await tournamentService.getTournamentByPublicId(req.params.id);
+    if (!tournament) {
+      return res.status(404).json({ success: false, message: 'Tournament not found.' });
+    }
+    const matches = await tournamentService.getTournamentFixtures(req.params.id);
+    res.json({ success: true, data: { items: matches } });
+  } catch (error) {
+    next(error);
+  }
+});
 
 // 4a. PUT /api/tournaments/:id/matches/display-bulk - Bulk Match Display Selection (Protected)
 router.put('/:id/matches/display-bulk', authenticateUser, async (req, res, next) => {
@@ -564,6 +572,32 @@ router.put('/:id/awards/:awardId', authenticateUser, authorizeTournamentOrganize
   try {
     const data = await statisticsAwardsService.overrideAward(req.params.awardId, req.body, req.user);
     res.json(data);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 16b. GET /api/tournaments/:id/player-leaderboard - Authoritative Player Scoring Leaderboard
+router.get('/:id/player-leaderboard', async (req, res, next) => {
+  try {
+    const { search, teamId, page, limit } = req.query;
+    const data = await statisticsAwardsService.getTournamentPlayerLeaderboard(req.params.id, {
+      search,
+      teamId,
+      page,
+      limit
+    });
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 16c. GET /api/tournaments/:id/players/:playerId/scoring-history - Player Match-by-Match Scoring History
+router.get('/:id/players/:playerId/scoring-history', async (req, res, next) => {
+  try {
+    const data = await statisticsAwardsService.getPlayerScoringHistory(req.params.id, req.params.playerId);
+    res.json({ success: true, data });
   } catch (error) {
     next(error);
   }

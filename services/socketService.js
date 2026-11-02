@@ -81,7 +81,7 @@ function initSocket(server) {
       }
     });
 
-    // 8. Forward Live Point Scored Ball Motion across Match, TV, and Signage
+    // 8. Forward Live Point Scored Ball Motion across Match, TV, and Signage (Strictly scoped)
     socket.on('match:pointScored', (payload) => {
       if (payload && payload.matchId) {
         const enriched = {
@@ -94,9 +94,11 @@ function initSocket(server) {
         io.to(`match:${payload.matchId}`).emit('score:updated', enriched);
 
         if (payload.tournamentId) {
-          io.to(`tournament:${payload.tournamentId}`).emit('match:pointScored', enriched);
-          io.to(`tournament:${payload.tournamentId}`).emit('tournament:matchUpdated', {
+          const tRoom = `tournament:${payload.tournamentId}`;
+          io.to(tRoom).emit('match:pointScored', enriched);
+          io.to(tRoom).emit('tournament:matchUpdated', {
             matchId: payload.matchId,
+            tournamentId: payload.tournamentId,
             liveScoreSummary: payload.scoreSummary,
             liveSubtext: payload.subtext,
             status: payload.status,
@@ -104,30 +106,32 @@ function initSocket(server) {
             celebration: payload.celebration,
             eventSeq: enriched.eventSeq
           });
+          io.to(tRoom).emit('signage:pointScored', enriched);
+          io.to(tRoom).emit('signage:matchUpdate', {
+            matchId: payload.matchId,
+            tournamentId: payload.tournamentId,
+            liveScoreSummary: payload.scoreSummary,
+            liveSubtext: payload.subtext,
+            status: payload.status,
+            eventSeq: enriched.eventSeq
+          });
         }
-        io.emit('signage:pointScored', enriched);
-        io.emit('signage:matchUpdate', {
-          matchId: payload.matchId,
-          liveScoreSummary: payload.scoreSummary,
-          liveSubtext: payload.subtext,
-          status: payload.status,
-          eventSeq: enriched.eventSeq
-        });
       }
     });
 
-    // 9. Forward Undo Point across TV and Signage
+    // 9. Forward Undo Point across TV and Signage (Strictly scoped)
     socket.on('match:undoPoint', (payload) => {
       if (payload && payload.matchId) {
         const undoPayload = { ...payload, type: 'UNDO', timestamp: Date.now() };
         io.to(`match:${payload.matchId}`).emit('match:undoPoint', undoPayload);
         io.to(`match:${payload.matchId}`).emit('match:undone', undoPayload);
         if (payload.tournamentId) {
-          io.to(`tournament:${payload.tournamentId}`).emit('match:undoPoint', undoPayload);
-          io.to(`tournament:${payload.tournamentId}`).emit('tournament:matchUpdated', undoPayload);
+          const tRoom = `tournament:${payload.tournamentId}`;
+          io.to(tRoom).emit('match:undoPoint', undoPayload);
+          io.to(tRoom).emit('tournament:matchUpdated', undoPayload);
+          io.to(tRoom).emit('signage:pointScored', undoPayload);
+          io.to(tRoom).emit('signage:matchUpdate', undoPayload);
         }
-        io.emit('signage:pointScored', undoPayload);
-        io.emit('signage:matchUpdate', undoPayload);
       }
     });
 
@@ -387,10 +391,6 @@ function broadcastTournamentMatchUpdate(tournamentPublicId, matchData) {
     ioInstance.to(matchRoom).emit('match:statusChanged', eventPayload);
     ioInstance.to(matchRoom).emit('score:updated', eventPayload);
   }
-
-  // 3. Global broadcast to all connected Signage & Smart TV displays
-  ioInstance.emit('signage:matchUpdate', eventPayload);
-  ioInstance.emit('tournament:matchUpdated', eventPayload);
 }
 
 /**
@@ -413,25 +413,13 @@ function broadcastMatchBallEvent(matchPublicId, eventData) {
   ioInstance.to(matchRoom).emit('score:updated', enriched);
   ioInstance.to(matchRoom).emit('match:pointScored', enriched);
 
-  // Global Signage / TV event
-  ioInstance.emit('signage:pointScored', enriched);
-  ioInstance.emit('signage:matchUpdate', {
-    matchId: matchPublicId,
-    status: eventData.status || 'LIVE',
-    liveScoreSummary: eventData.scoreSummary,
-    liveSubtext: eventData.subtext,
-    celebration: eventData.celebration,
-    type: eventData.type,
-    state: eventData.state,
-    eventSeq
-  });
-
-  // Cross-post to tournament room if tournament ID is provided
+  // Cross-post strictly to tournament room if tournament ID is provided
   const tId = eventData.tournamentId || eventData.tournamentPublicId || eventData.tournament_uuid;
   if (tId) {
     const tRoom = `tournament:${tId}`;
     ioInstance.to(tRoom).emit('tournament:matchUpdated', {
       matchId: matchPublicId,
+      tournamentId: tId,
       status: eventData.status || 'LIVE',
       liveScoreSummary: eventData.scoreSummary,
       liveSubtext: eventData.subtext,
@@ -442,6 +430,18 @@ function broadcastMatchBallEvent(matchPublicId, eventData) {
     });
     ioInstance.to(tRoom).emit('match:ballEvent', enriched);
     ioInstance.to(tRoom).emit('score:updated', enriched);
+    ioInstance.to(tRoom).emit('signage:pointScored', enriched);
+    ioInstance.to(tRoom).emit('signage:matchUpdate', {
+      matchId: matchPublicId,
+      tournamentId: tId,
+      status: eventData.status || 'LIVE',
+      liveScoreSummary: eventData.scoreSummary,
+      liveSubtext: eventData.subtext,
+      celebration: eventData.celebration,
+      type: eventData.type,
+      state: eventData.state,
+      eventSeq
+    });
   }
 }
 
@@ -450,11 +450,10 @@ function broadcastMatchBallEvent(matchPublicId, eventData) {
  */
 function broadcastSignageEvent(eventName, data, tournamentPublicId = null) {
   if (!ioInstance) return;
-  // Emit globally to all connected signage boards
-  ioInstance.emit(eventName, data);
-  // Also emit specifically to tournament room if targeted
   if (tournamentPublicId) {
     ioInstance.to(`tournament:${tournamentPublicId}`).emit(eventName, data);
+  } else {
+    ioInstance.emit(eventName, data);
   }
 }
 
@@ -476,6 +475,7 @@ function broadcastPickleballScore(matchPublicId, tournamentPublicId, payload) {
   const eventSeq = payload.eventSeq || (payload.state?.eventSeq || Date.now());
   const enrichedPayload = {
     matchId: matchPublicId,
+    tournamentId: tournamentPublicId,
     eventSeq,
     type: payload.type || 'POINT',
     scoreSummary: payload.scoreSummary || `${payload.teamAScore} - ${payload.teamBScore}`,
@@ -487,6 +487,7 @@ function broadcastPickleballScore(matchPublicId, tournamentPublicId, payload) {
     const ptEvent = payload.pointEvent || {
       type: 'POINT_SCORED',
       matchId: matchPublicId,
+      tournamentId: tournamentPublicId,
       eventId: payload.eventId || `pt-${matchPublicId}-${eventSeq}`,
       seq: eventSeq,
       from: payload.from,
@@ -494,16 +495,22 @@ function broadcastPickleballScore(matchPublicId, tournamentPublicId, payload) {
       timestamp: Date.now()
     };
     ioInstance.to(matchRoom).emit('match:pointScored', ptEvent);
-    ioInstance.emit('signage:pointScored', ptEvent);
+    if (tournamentPublicId) {
+      ioInstance.to(`tournament:${tournamentPublicId}`).emit('signage:pointScored', ptEvent);
+    }
   } else if (payload.type === 'UNDO') {
-    ioInstance.to(matchRoom).emit('match:undoPoint', { matchId: matchPublicId, type: 'UNDO', timestamp: Date.now() });
-    ioInstance.emit('signage:pointScored', { matchId: matchPublicId, type: 'UNDO', timestamp: Date.now() });
+    const undoEvent = { matchId: matchPublicId, tournamentId: tournamentPublicId, type: 'UNDO', timestamp: Date.now() };
+    ioInstance.to(matchRoom).emit('match:undoPoint', undoEvent);
+    if (tournamentPublicId) {
+      ioInstance.to(`tournament:${tournamentPublicId}`).emit('signage:pointScored', undoEvent);
+    }
   }
 
   if (tournamentPublicId) {
     const tourneyRoom = `tournament:${tournamentPublicId}`;
     ioInstance.to(tourneyRoom).emit('tournament:matchUpdated', {
       matchId: matchPublicId,
+      tournamentId: tournamentPublicId,
       status: payload.status,
       liveScoreSummary: enrichedPayload.scoreSummary,
       liveSubtext: payload.liveSubtext,

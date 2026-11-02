@@ -223,8 +223,23 @@ const getTournamentByPublicId = async (publicId) => {
  * Used by Tournament Live Screen and Signage.
  */
 const getTournamentLiveMatches = async (publicId) => {
+  if (!publicId) return [];
+
+  // 1. Validate tournament exists
+  const isNum = /^\d+$/.test(String(publicId).trim());
+  const tourRows = await db.query(
+    'SELECT id, uuid FROM tournaments WHERE uuid = ? OR id = ?',
+    [publicId, isNum ? parseInt(publicId, 10) : -1]
+  );
+  if (!tourRows || tourRows.length === 0) {
+    return [];
+  }
+  const tournament = tourRows[0];
+
+  // 2. Query strictly by internal tournament_id
   const rows = await db.query(
     `SELECT 
+      tm.id as match_internal_id,
       tm.uuid as match_id,
       tm.match_number,
       tm.status,
@@ -237,7 +252,9 @@ const getTournamentLiveMatches = async (publicId) => {
       v.name as venue_name,
       ta.uuid as team_a_id, ta.name as team_a_name, ta.logo_url as team_a_logo,
       tb.uuid as team_b_id, tb.name as team_b_name, tb.logo_url as team_b_logo,
-      s.slug as sport_slug
+      s.slug as sport_slug,
+      t.id as tournament_id,
+      t.uuid as tournament_uuid
      FROM tournament_matches tm
      JOIN tournaments t ON tm.tournament_id = t.id
      JOIN sports s ON t.sport_id = s.id
@@ -245,9 +262,9 @@ const getTournamentLiveMatches = async (publicId) => {
      LEFT JOIN venues v ON tm.venue_id = v.id
      JOIN teams ta ON tm.team_a_id = ta.id
      JOIN teams tb ON tm.team_b_id = tb.id
-     WHERE (t.uuid = ? OR t.id = ?) AND tm.status = 'LIVE'
+     WHERE tm.tournament_id = ? AND tm.status = 'LIVE' AND (tm.is_standalone = 0 OR tm.is_standalone IS NULL)
      ORDER BY tm.match_number ASC`,
-    [publicId, /^\d+$/.test(String(publicId).trim()) ? parseInt(publicId, 10) : -1]
+    [tournament.id]
   );
 
   return rows.map(m => {
@@ -260,7 +277,12 @@ const getTournamentLiveMatches = async (publicId) => {
 
     return {
       id: m.match_id,
+      uuid: m.match_id,
+      internalId: m.match_internal_id,
       matchNumber: m.match_number,
+      tournamentId: m.tournament_uuid,
+      tournament_id: m.tournament_id,
+      tournament_uuid: m.tournament_uuid,
       status: m.status,
       showOnDisplay: m.show_on_display === null || m.show_on_display === undefined ? true : Boolean(m.show_on_display),
       category: m.category || 'League',
@@ -1366,6 +1388,7 @@ const removeTeamFromTournament = async (tournamentPublicId, teamPublicId, { mode
       await db.query(`DELETE FROM cricket_overs WHERE match_id IN (?)`, [mIds]).catch(() => {});
       await db.query(`DELETE FROM cricket_innings WHERE match_id IN (?)`, [mIds]).catch(() => {});
       await db.query(`DELETE FROM pickleball_score_logs WHERE match_id IN (?)`, [mIds]).catch(() => {});
+      await db.query(`DELETE FROM match_point_attributions WHERE match_id IN (?)`, [mIds]).catch(() => {});
       await db.query(`DELETE FROM tournament_matches WHERE id IN (?)`, [mIds]);
     }
   } else if (scheduledFixturesCount > 0) {
@@ -1717,6 +1740,7 @@ const deleteTournament = async ({ tournamentId, user, force = false }) => {
       await conn.query(`DELETE FROM score_events WHERE match_id IN (${matchInClause})`);
       await conn.query(`DELETE FROM score_corrections WHERE match_id IN (${matchInClause})`);
       await conn.query(`DELETE FROM pickleball_score_logs WHERE match_id IN (${matchInClause})`);
+      await conn.query(`DELETE FROM match_point_attributions WHERE match_id IN (${matchInClause})`).catch(() => {});
       await conn.query(`DELETE FROM sport_match_events WHERE match_id IN (${matchInClause})`);
       await conn.query(`DELETE FROM scoring_undo_audit WHERE match_id IN (${matchInClause})`);
       await conn.query(`DELETE FROM match_mentions WHERE match_id IN (${matchInClause})`);

@@ -601,7 +601,7 @@ const getMatchEntity = async (matchId) => {
     `SELECT tm.id, tm.uuid, tm.tournament_id, tm.match_number, tm.status,
             tm.team_a_id, tm.team_b_id, tm.team_a_score, tm.team_b_score,
             tm.team_a_lineup, tm.team_b_lineup, tm.group_name, tm.winner_team_id,
-            tm.result_summary, tm.live_score_summary, tm.sport_state,
+            tm.result_summary, tm.live_score_summary, tm.sport_state, tm.track_player_points,
             t.uuid as tournament_uuid, t.name as tournament_name,
             t.match_format, t.target_score, t.win_by_two, t.max_score, t.sport_config, t.rules as tournament_rules,
             ta.uuid as team_a_uuid, ta.name as team_a_name, ta.logo_url as team_a_logo,
@@ -647,12 +647,16 @@ const getScorerState = async (matchId) => {
     [m.team_b_id]
   );
 
-  // Fetch all score logs in chronological order
+  // Fetch all score logs in chronological order with player attribution details
   const logs = await db.query(
-    `SELECT id, sequence_number, point_to, team_a_score, team_b_score, notes, event_type, created_at
-     FROM pickleball_score_logs
-     WHERE match_id = ?
-     ORDER BY sequence_number ASC`,
+    `SELECT l.id, l.sequence_number, l.point_to, l.team_a_score, l.team_b_score, l.notes, l.event_type, l.created_at,
+            l.scored_by_player_id,
+            COALESCE(u.full_name, tm.player_name, NULL) as scored_by_player_name
+     FROM pickleball_score_logs l
+     LEFT JOIN team_members tm ON l.scored_by_player_id = tm.id
+     LEFT JOIN users u ON tm.user_id = u.id
+     WHERE l.match_id = ?
+     ORDER BY l.sequence_number ASC`,
     [m.id]
   );
 
@@ -731,6 +735,7 @@ const getScorerState = async (matchId) => {
     matchNumber: m.match_number,
     groupName: m.group_name || 'Group 1',
     status: m.status,
+    trackPlayerPoints: Boolean(m.track_player_points || sportState?.trackPlayerPoints),
     tournament: {
       id: m.tournament_uuid,
       name: m.tournament_name
@@ -1146,7 +1151,7 @@ function replayMatchFromLogs(m, logs = []) {
 /**
  * 10. Record Point (+1 to Team A or Team B).
  */
-const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = null, to = null, eventId = null, seq = null }, user) => {
+const recordPoint = async (matchId, { pointTo, scoredByPlayerId = null, playerId = null, notes = 'Point scored', from = null, to = null, eventId = null, seq = null }, user) => {
   // Auto-end match break when live scoring resumes
   try {
     const matchBreakService = require('./matchBreakService');
@@ -1175,6 +1180,53 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = nu
     currentSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
   } catch {}
 
+  let parsedALineup = null;
+  let parsedBLineup = null;
+  try {
+    parsedALineup = typeof m.team_a_lineup === 'string' ? JSON.parse(m.team_a_lineup) : m.team_a_lineup;
+    parsedBLineup = typeof m.team_b_lineup === 'string' ? JSON.parse(m.team_b_lineup) : m.team_b_lineup;
+  } catch {}
+
+  // Server-side validation of credited player
+  let validatedPlayer = null;
+  const targetPlayerId = scoredByPlayerId || playerId;
+  if (targetPlayerId) {
+    const scoringTeamId = pointTo === 'team_a' ? m.team_a_id : m.team_b_id;
+    const [member] = await db.query(
+      `SELECT tm.id, tm.team_id, tm.player_name, u.full_name
+       FROM team_members tm
+       LEFT JOIN users u ON tm.user_id = u.id
+       WHERE tm.id = ? AND tm.team_id = ? AND tm.deleted_at IS NULL`,
+      [targetPlayerId, scoringTeamId]
+    );
+
+    if (!member) {
+      throw { statusCode: 400, message: 'Invalid player: Credited player does not belong to the scoring team.' };
+    }
+
+    const parsedLineup = pointTo === 'team_a' ? parsedALineup : parsedBLineup;
+    const memberName = (member.full_name || member.player_name || '').trim().toLowerCase();
+    const inLineup = Array.isArray(parsedLineup) && parsedLineup.some(p => {
+      if (typeof p === 'object' && p !== null) {
+        if (p.id && String(p.id) === String(targetPlayerId)) return true;
+        if (p.name && String(p.name).trim().toLowerCase() === memberName) return true;
+      } else if (typeof p === 'string') {
+        if (p.trim().toLowerCase() === memberName) return true;
+      }
+      return false;
+    });
+
+    if (!inLineup) {
+      throw { statusCode: 400, message: "Invalid player: Credited player is not in the active match lineup." };
+    }
+
+    validatedPlayer = {
+      id: member.id,
+      name: member.full_name || member.player_name || 'Player',
+      teamId: scoringTeamId
+    };
+  }
+
   const rotationRule = currentSportState?.rotationRule || sportConfig?.rotationRule || 'OFFICIAL';
   const isBadmintonRule = String(rotationRule).toUpperCase() === 'BADMINTON';
   const scoringMode = isBadmintonRule ? 'RALLY' : (sportConfig?.scoringMode || currentSportState?.scoringMode || 'RALLY');
@@ -1191,12 +1243,6 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = nu
   const winningTeamKey = pointTo === 'team_a' ? 'teamA' : 'teamB';
   const isServingTeamWinner = winningTeamKey === curServing;
 
-  let parsedALineup = null;
-  let parsedBLineup = null;
-  try {
-    parsedALineup = typeof m.team_a_lineup === 'string' ? JSON.parse(m.team_a_lineup) : m.team_a_lineup;
-    parsedBLineup = typeof m.team_b_lineup === 'string' ? JSON.parse(m.team_b_lineup) : m.team_b_lineup;
-  } catch {}
 
   const pA1 = typeof parsedALineup?.[0] === 'string' ? parsedALineup[0] : (parsedALineup?.[0]?.name || `${m.team_a_name || 'Team A'} 1`);
   const pA2 = typeof parsedALineup?.[1] === 'string' ? parsedALineup[1] : (parsedALineup?.[1]?.name || `${m.team_a_name || 'Team A'} 2`);
@@ -1375,12 +1421,25 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = nu
   const nextSeq = (lastSeqRows[0]?.max_seq || 0) + 1;
 
   // Insert log
-  await db.query(
+  const logNotes = validatedPlayer ? `Point scored by ${validatedPlayer.name}` : notes;
+  const logInsertRes = await db.query(
     `INSERT INTO pickleball_score_logs (
-      match_id, sequence_number, point_to, team_a_score, team_b_score, scorer_id, event_type, notes
-    ) VALUES (?, ?, ?, ?, ?, ?, 'POINT', ?)`,
-    [m.id, nextSeq, pointTo, newScoreA, newScoreB, user ? user.id : null, notes]
+      match_id, sequence_number, point_to, team_a_score, team_b_score, scorer_id, event_type, notes, scored_by_player_id
+    ) VALUES (?, ?, ?, ?, ?, ?, 'POINT', ?, ?)`,
+    [m.id, nextSeq, pointTo, newScoreA, newScoreB, user ? user.id : null, logNotes, validatedPlayer ? validatedPlayer.id : null]
   );
+  const logId = logInsertRes.insertId;
+
+  // Insert point attribution record if player was credited
+  if (validatedPlayer) {
+    await db.query(
+      `INSERT INTO match_point_attributions (
+        match_id, tournament_id, team_id, player_id, game_number,
+        score_after, point_to, sequence_number, log_id, is_voided
+      ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, 0)`,
+      [m.id, m.tournament_id, validatedPlayer.teamId, validatedPlayer.id, liveScoreSummary, pointTo, nextSeq, logId]
+    );
+  }
 
   // Recalculate standings if completed and auto-clear any break
   if (isCompleted) {
@@ -1399,6 +1458,8 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = nu
     tournamentId: m.tournament_uuid,
     eventId: eventId || `pt-${m.id}-${nextSeq}-${Date.now()}`,
     seq: seq || nextSeq,
+    scoredByPlayerId: validatedPlayer ? validatedPlayer.id : null,
+    scoredByPlayerName: validatedPlayer ? validatedPlayer.name : null,
     from: from || {
       side: nextCourtState.servingTeam === 'teamA' ? 'left' : 'right',
       box: nextCourtState.serviceCourt === 'RIGHT' ? (nextCourtState.servingTeam === 'teamA' ? 'bottom' : 'top') : (nextCourtState.servingTeam === 'teamA' ? 'top' : 'bottom'),
@@ -1426,7 +1487,9 @@ const recordPoint = async (matchId, { pointTo, notes = 'Point scored', from = nu
     sportState: updatedSportState,
     courtState: nextCourtState,
     state,
-    pointEvent
+    pointEvent,
+    scoredByPlayerId: validatedPlayer ? validatedPlayer.id : null,
+    scoredByPlayerName: validatedPlayer ? validatedPlayer.name : null
   });
 
   return state;
@@ -1458,6 +1521,12 @@ const undoPoint = async (matchId, user) => {
 
   // Delete the undone log
   await db.query(`DELETE FROM pickleball_score_logs WHERE id = ?`, [currentLog.id]);
+
+  // Remove player attribution for this undone sequence number
+  await db.query(
+    `DELETE FROM match_point_attributions WHERE match_id = ? AND sequence_number = ?`,
+    [m.id, currentLog.sequence_number]
+  );
 
   // Fetch all remaining logs in sequence order
   const remainingLogs = await db.query(
@@ -1647,6 +1716,40 @@ const correctScore = async (matchId, { teamAScore, teamBScore, notes = 'Score Co
      WHERE id = ?`,
     [newScoreA, newScoreB, newStatus, winnerTeamId, resultSummary, liveScoreSummary, JSON.stringify(updatedSportState), m.id]
   );
+
+  // If score was lowered, void/delete most recent attributed points of that team
+  const oldScoreA = m.team_a_score || 0;
+  const oldScoreB = m.team_b_score || 0;
+  if (newScoreA < oldScoreA) {
+    const diffA = oldScoreA - newScoreA;
+    await db.query(
+      `DELETE FROM match_point_attributions 
+       WHERE id IN (
+         SELECT id FROM (
+           SELECT id FROM match_point_attributions 
+           WHERE match_id = ? AND team_id = ? AND is_voided = 0 
+           ORDER BY sequence_number DESC, id DESC 
+           LIMIT ?
+         ) as tmp
+       )`,
+      [m.id, m.team_a_id, diffA]
+    );
+  }
+  if (newScoreB < oldScoreB) {
+    const diffB = oldScoreB - newScoreB;
+    await db.query(
+      `DELETE FROM match_point_attributions 
+       WHERE id IN (
+         SELECT id FROM (
+           SELECT id FROM match_point_attributions 
+           WHERE match_id = ? AND team_id = ? AND is_voided = 0 
+           ORDER BY sequence_number DESC, id DESC 
+           LIMIT ?
+         ) as tmp
+       )`,
+      [m.id, m.team_b_id, diffB]
+    );
+  }
 
   const lastSeqRows = await db.query(
     `SELECT MAX(sequence_number) as max_seq FROM pickleball_score_logs WHERE match_id = ?`,
