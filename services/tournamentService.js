@@ -1124,8 +1124,9 @@ const createTournament = async ({
   const crypto = require('crypto');
 
   // 1. Role validation
-  if (!user || !['ADMIN', 'VENUE_OWNER'].includes(user.role)) {
-    throw { statusCode: 403, message: 'Forbidden. Only administrators and venue owners can create tournaments.' };
+  const roleUpper = String(user?.role || '').toUpperCase();
+  if (!user || !['ADMIN', 'SUPER_ADMIN', 'VENUE_OWNER', 'PLAYER', 'USER'].includes(roleUpper)) {
+    throw { statusCode: 403, message: 'Forbidden. Insufficient permissions to create a tournament.' };
   }
 
   // 2. Name validation
@@ -1255,6 +1256,11 @@ const createTournament = async ({
     ...(typeof sportConfig === 'object' && sportConfig !== null ? sportConfig : {}),
     scoringMode: resolvedScoringMode
   };
+  if (resolvedSportId === 6 || sportSlug === 'pickleball') {
+    resolvedSportConfig.goldenPointEnabled = sportConfig?.goldenPointEnabled !== undefined
+      ? Boolean(sportConfig.goldenPointEnabled)
+      : true;
+  }
 
   // 13. Persistence
   await db.query(

@@ -19,6 +19,7 @@ const migrations = [
   'migrate_password_resets.js',
   'migrate_tournament_data_isolation.js',
   'migrate_player_point_tracking.js',
+  'migrate_golden_point.js',
   'seed_superadmin.js'
 ];
 

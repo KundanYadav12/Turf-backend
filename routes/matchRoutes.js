@@ -439,6 +439,36 @@ router.post('/:id/pickleball/rule', authenticateUser, requireScorerForMatch, asy
   }
 });
 
+// 16c. POST /api/matches/:id/pickleball/golden-target - Set / Edit Golden Point Target (Scorer only)
+router.post('/:id/pickleball/golden-target', authenticateUser, requireScorerForMatch, async (req, res, next) => {
+  try {
+    const data = await pickleballService.setGoldenPointTarget(req.params.id, req.body, req.user);
+    res.json({ success: true, message: 'Golden Point target confirmed successfully!', data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 16d. POST /api/matches/:id/pickleball/golden-point-toggle - Toggle Golden Point Enabled before tie (Scorer only)
+router.post('/:id/pickleball/golden-point-toggle', authenticateUser, requireScorerForMatch, async (req, res, next) => {
+  try {
+    const data = await pickleballService.setGoldenPointSetting(req.params.id, req.body, req.user);
+    res.json({ success: true, message: 'Golden Point setting updated successfully!', data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 16e. POST /api/matches/:id/pickleball/switch-ends - Switch court ends / sidesSwapped (Scorer only)
+router.post('/:id/pickleball/switch-ends', authenticateUser, requireScorerForMatch, async (req, res, next) => {
+  try {
+    const data = await pickleballService.setSidesSwapped(req.params.id, req.body, req.user);
+    res.json({ success: true, message: 'Court ends switched successfully!', data });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ==========================================
 // === FOOTBALL SCORER ROUTES ===
 // ==========================================

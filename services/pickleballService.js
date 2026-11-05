@@ -594,6 +594,213 @@ function computeAuthoritativeCourtState(options = {}) {
 }
 
 /**
+ * Determine if Golden Point is enabled for a match.
+ * Default is ON for new pickleball matches, and OFF for existing matches.
+ */
+function resolveGoldenPointEnabled(sportState, sportConfig) {
+  if (sportState?.goldenPointEnabled !== undefined) {
+    return Boolean(sportState.goldenPointEnabled);
+  }
+  if (sportConfig?.goldenPointEnabled !== undefined) {
+    return Boolean(sportConfig.goldenPointEnabled);
+  }
+  return false;
+}
+
+/**
+ * Compute the Golden Point Phase state deterministically from match configuration,
+ * current scores, and chronological score logs.
+ */
+function computeGoldenPointStatus(opts, goldenPointTargetArg, targetScoreArg, goldenPointEnabledArg) {
+  let optsObj = opts || {};
+  if (Array.isArray(opts) || (typeof opts === 'object' && opts !== null && opts.targetScore === undefined && opts.goldenPointEnabled === undefined && opts.logs === undefined)) {
+    optsObj = {
+      logs: Array.isArray(opts) ? opts : [],
+      goldenPointTarget: goldenPointTargetArg,
+      targetScore: targetScoreArg,
+      goldenPointEnabled: goldenPointEnabledArg
+    };
+  }
+
+  const {
+    targetScore = 15,
+    goldenPointEnabled = false,
+    goldenPointTarget = null,
+    lastGoldenPointTarget = null,
+    scoreA = 0,
+    scoreB = 0,
+    logs = [],
+    teamAName = 'Team A',
+    teamBName = 'Team B'
+  } = optsObj;
+
+  let effectiveScoreA = scoreA;
+  let effectiveScoreB = scoreB;
+  if (effectiveScoreA === 0 && effectiveScoreB === 0 && Array.isArray(logs) && logs.length > 0) {
+    const lastLog = logs[logs.length - 1];
+    if (lastLog.team_a_score != null) effectiveScoreA = lastLog.team_a_score;
+    if (lastLog.team_b_score != null) effectiveScoreB = lastLog.team_b_score;
+  }
+
+  const tieThreshold = Math.max(1, (parseInt(targetScore, 10) || 15) - 1);
+  const isTieReached = effectiveScoreA >= tieThreshold && effectiveScoreB >= tieThreshold;
+  const isGoldenActive = Boolean(goldenPointEnabled && isTieReached);
+
+  if (!isGoldenActive) {
+    return {
+      enabled: Boolean(goldenPointEnabled),
+      active: false,
+      tieThreshold,
+      isTieReached,
+      needsTargetPrompt: false,
+      target: null,
+      lastTarget: lastGoldenPointTarget ? parseInt(lastGoldenPointTarget, 10) : 21,
+      streakTeam: null,
+      streakCount: 0,
+      streakTeamName: null,
+      isWinner: false,
+      winnerTeamKey: null,
+      winReason: null,
+      isGamePoint: false,
+      gamePointTeam: null
+    };
+  }
+
+  // Golden phase IS active!
+  const target = goldenPointTarget ? parseInt(goldenPointTarget, 10) : null;
+  const needsTargetPrompt = !target || isNaN(target);
+
+  // Derive consecutive scoring streak from logs after tie was first reached
+  let rA = 0;
+  let rB = 0;
+  let tieLogIndex = -1;
+  const sortedLogs = [...logs].sort((a, b) => (a.sequence_number || 0) - (b.sequence_number || 0));
+
+  for (let i = 0; i < sortedLogs.length; i++) {
+    const l = sortedLogs[i];
+    if (l.event_type === 'CORRECTION') {
+      if (l.team_a_score != null) rA = l.team_a_score;
+      if (l.team_b_score != null) rB = l.team_b_score;
+    } else {
+      if (l.team_a_score != null && l.team_b_score != null) {
+        rA = l.team_a_score;
+        rB = l.team_b_score;
+      } else {
+        const pTo = (l.point_to === 'team_b' || l.pointTo === 'teamB') ? 'teamB' : 'teamA';
+        if (pTo === 'teamA') rA += 1;
+        else rB += 1;
+      }
+    }
+    if (rA >= tieThreshold && rB >= tieThreshold && tieLogIndex === -1) {
+      tieLogIndex = i;
+    }
+  }
+
+  let streakTeam = null; // 'teamA' or 'teamB'
+  let streakCount = 0;
+  let goldenWinner = null;
+  let winReason = null;
+
+  if (tieLogIndex !== -1) {
+    let prevScoreA = tieThreshold;
+    let prevScoreB = tieThreshold;
+
+    for (let i = tieLogIndex + 1; i < sortedLogs.length; i++) {
+      const l = sortedLogs[i];
+      let curScoreA = l.team_a_score != null ? l.team_a_score : prevScoreA;
+      let curScoreB = l.team_b_score != null ? l.team_b_score : prevScoreB;
+
+      const scoredA = curScoreA > prevScoreA;
+      const scoredB = curScoreB > prevScoreB;
+
+      prevScoreA = curScoreA;
+      prevScoreB = curScoreB;
+
+      // Side-outs do not change score, so side-outs do NOT break or add to streak!
+      if (!scoredA && !scoredB) continue;
+
+      const scoringTeam = scoredA ? 'teamA' : 'teamB';
+      if (streakTeam === scoringTeam) {
+        streakCount += 1;
+      } else {
+        streakTeam = scoringTeam;
+        streakCount = 1;
+      }
+
+      // Check winning conditions:
+      // Condition 1: Target reached
+      if (target) {
+        if ((scoringTeam === 'teamA' && curScoreA >= target) ||
+            (scoringTeam === 'teamB' && curScoreB >= target)) {
+          goldenWinner = scoringTeam;
+          winReason = 'TARGET_REACHED';
+          break;
+        }
+      }
+
+      // Condition 2: 2 points in a row
+      if (streakCount >= 2) {
+        goldenWinner = scoringTeam;
+        winReason = 'CONSECUTIVE_STREAK';
+        break;
+      }
+    }
+  }
+
+  // Also check if current score already reaches target
+  if (!goldenWinner && target) {
+    if (scoreA >= target) {
+      goldenWinner = 'teamA';
+      winReason = 'TARGET_REACHED';
+    } else if (scoreB >= target) {
+      goldenWinner = 'teamB';
+      winReason = 'TARGET_REACHED';
+    }
+  }
+
+  // Game Point detection in Golden Point:
+  // A team shows "GAME POINT" when one more point would win by either condition:
+  // - at streak 1 (next point gives streak 2 = win)
+  // - at target - 1 (next point reaches target = win)
+  let isGamePoint = false;
+  let gamePointTeam = null;
+
+  if (!goldenWinner && target) {
+    if (streakCount === 1 && streakTeam) {
+      isGamePoint = true;
+      gamePointTeam = streakTeam;
+    }
+    if (scoreA === target - 1) {
+      isGamePoint = true;
+      gamePointTeam = 'teamA';
+    } else if (scoreB === target - 1) {
+      isGamePoint = true;
+      gamePointTeam = 'teamB';
+    }
+  }
+
+  const streakTeamName = streakTeam === 'teamA' ? teamAName : (streakTeam === 'teamB' ? teamBName : null);
+
+  return {
+    enabled: true,
+    active: true,
+    tieThreshold,
+    isTieReached: true,
+    needsTargetPrompt,
+    target,
+    lastTarget: target || (lastGoldenPointTarget ? parseInt(lastGoldenPointTarget, 10) : 21),
+    streakTeam,
+    streakCount,
+    streakTeamName,
+    isWinner: Boolean(goldenWinner),
+    winnerTeamKey: goldenWinner,
+    winReason,
+    isGamePoint,
+    gamePointTeam
+  };
+}
+
+/**
  * Helper to fetch match entity by public ID.
  */
 const getMatchEntity = async (matchId) => {
@@ -601,7 +808,7 @@ const getMatchEntity = async (matchId) => {
     `SELECT tm.id, tm.uuid, tm.tournament_id, tm.match_number, tm.status,
             tm.team_a_id, tm.team_b_id, tm.team_a_score, tm.team_b_score,
             tm.team_a_lineup, tm.team_b_lineup, tm.group_name, tm.winner_team_id,
-            tm.result_summary, tm.live_score_summary, tm.sport_state, tm.track_player_points,
+            tm.result_summary, tm.live_score_summary, tm.sport_state, tm.track_player_points, tm.golden_point_target,
             t.uuid as tournament_uuid, t.name as tournament_name,
             t.match_format, t.target_score, t.win_by_two, t.max_score, t.sport_config, t.rules as tournament_rules,
             ta.uuid as team_a_uuid, ta.name as team_a_name, ta.logo_url as team_a_logo,
@@ -730,12 +937,39 @@ const getScorerState = async (matchId) => {
     });
   }
 
+  const isGoldenPointEnabled = resolveGoldenPointEnabled(sportState, sportConfig);
+  const goldenPointTarget = m.golden_point_target != null ? m.golden_point_target : (sportState?.goldenPointTarget || null);
+  const lastGoldenPointTarget = sportState?.lastGoldenPointTarget || 21;
+
+  const goldenStatus = computeGoldenPointStatus({
+    targetScore: m.target_score != null ? m.target_score : 15,
+    goldenPointEnabled: isGoldenPointEnabled,
+    goldenPointTarget,
+    lastGoldenPointTarget,
+    scoreA: m.team_a_score || 0,
+    scoreB: m.team_b_score || 0,
+    logs: logs || [],
+    teamAName: m.team_a_name,
+    teamBName: m.team_b_name
+  });
+
+  if (goldenStatus.isGamePoint) {
+    courtState.isGamePoint = true;
+    courtState.gamePointTeam = goldenStatus.gamePointTeam;
+  }
+  if (goldenStatus.isWinner) {
+    courtState.isMatchWon = true;
+    courtState.winner = goldenStatus.winnerTeamKey;
+  }
+
   return {
     matchId: m.uuid,
     matchNumber: m.match_number,
     groupName: m.group_name || 'Group 1',
     status: m.status,
+    sidesSwapped: Boolean(sportState?.sidesSwapped || false),
     trackPlayerPoints: Boolean(m.track_player_points || sportState?.trackPlayerPoints),
+    goldenPoint: goldenStatus,
     tournament: {
       id: m.tournament_uuid,
       name: m.tournament_name
@@ -747,7 +981,9 @@ const getScorerState = async (matchId) => {
       targetScore: m.target_score != null ? m.target_score : 15,
       winByTwo: m.win_by_two != null ? Boolean(m.win_by_two) : true,
       maxScore: m.max_score || null,
-      tournamentRules: m.tournament_rules || null
+      tournamentRules: m.tournament_rules || null,
+      goldenPointEnabled: isGoldenPointEnabled,
+      goldenPointTarget: goldenStatus.target
     },
     scores: {
       teamA: m.team_a_score || 0,
@@ -790,7 +1026,11 @@ const getScorerState = async (matchId) => {
       servePoints: {
         teamA: authoritativeServePointsA,
         teamB: authoritativeServePointsB
-      }
+      },
+      goldenPointEnabled: isGoldenPointEnabled,
+      goldenPointTarget: goldenStatus.target,
+      lastGoldenPointTarget: goldenStatus.lastTarget,
+      sidesSwapped: Boolean(sportState?.sidesSwapped || false)
     },
     courtState,
     logs: [...logs].reverse()
@@ -874,7 +1114,8 @@ const setLineup = async (matchId, { teamALineup, teamBLineup, startingServingTea
     activeReceiverName: initialCourtState.activeReceiverName,
     playerLocations: initialCourtState.playerLocations,
     originalPositions: initialCourtState.originalPositions,
-    firstServeConfirmed: true
+    firstServeConfirmed: true,
+    goldenPointEnabled: resolveGoldenPointEnabled(currentSportState, sportConfig)
   };
 
   await db.query(
@@ -954,7 +1195,8 @@ const startMatch = async (matchId, body = {}, user) => {
     activeReceiverName: initialCourtState.activeReceiverName,
     playerLocations: initialCourtState.playerLocations,
     originalPositions: initialCourtState.originalPositions,
-    firstServeConfirmed: true
+    firstServeConfirmed: true,
+    goldenPointEnabled: resolveGoldenPointEnabled(currentSportState, sportConfig)
   };
 
   await db.query(
@@ -1167,8 +1409,15 @@ const recordPoint = async (matchId, { pointTo, scoredByPlayerId = null, playerId
     throw { statusCode: 400, message: 'Match is already completed. Score cannot be altered without correction.' };
   }
 
-  if (!['team_a', 'team_b'].includes(pointTo)) {
-    throw { statusCode: 400, message: 'Invalid pointTo value. Must be "team_a" or "team_b".' };
+  // Idempotency: Prevent duplicate scoring of the same client event
+  if (eventId) {
+    const existingLog = await db.query(
+      `SELECT id FROM pickleball_score_logs WHERE match_id = ? AND notes LIKE ? LIMIT 1`,
+      [m.id, `%[event:${eventId}]%`]
+    );
+    if (existingLog && existingLog.length > 0) {
+      return await getScorerState(m.uuid);
+    }
   }
 
   let sportConfig = null;
@@ -1179,6 +1428,23 @@ const recordPoint = async (matchId, { pointTo, scoredByPlayerId = null, playerId
   try {
     currentSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
   } catch {}
+
+  const targetScore = m.target_score != null ? m.target_score : 15;
+  const isGoldenPointEnabled = resolveGoldenPointEnabled(currentSportState, sportConfig);
+  const currentGoldenTarget = m.golden_point_target != null ? m.golden_point_target : (currentSportState?.goldenPointTarget || null);
+  const tieThreshold = Math.max(1, targetScore - 1);
+  const curScoreA_pre = m.team_a_score || 0;
+  const curScoreB_pre = m.team_b_score || 0;
+  const prevTieReached = curScoreA_pre >= tieThreshold && curScoreB_pre >= tieThreshold;
+
+  // Block scoring if Golden Point is active and winning target is not confirmed yet
+  if (isGoldenPointEnabled && prevTieReached && !currentGoldenTarget) {
+    throw { statusCode: 400, message: 'Golden Point! Set the winning target before recording further points.' };
+  }
+
+  if (!['team_a', 'team_b'].includes(pointTo)) {
+    throw { statusCode: 400, message: 'Invalid pointTo value. Must be "team_a" or "team_b".' };
+  }
 
   let parsedALineup = null;
   let parsedBLineup = null;
@@ -1335,7 +1601,6 @@ const recordPoint = async (matchId, { pointTo, scoredByPlayerId = null, playerId
   if (typeof parsedBLineup?.[0] === 'object' && parsedBLineup[0]?.id) nextLocations[parsedBLineup[0].id] = nextLocations[pB1];
   if (typeof parsedBLineup?.[1] === 'object' && parsedBLineup[1]?.id) nextLocations[parsedBLineup[1].id] = nextLocations[pB2];
 
-  const targetScore = m.target_score != null ? m.target_score : 15;
   const winByTwo = m.win_by_two != null ? Boolean(m.win_by_two) : true;
   const maxScore = m.max_score || null;
 
@@ -1344,23 +1609,56 @@ const recordPoint = async (matchId, { pointTo, scoredByPlayerId = null, playerId
   let winnerTeamId = null;
   let resultSummary = null;
 
-  // Condition 1: maxScore reached
-  if (maxScore && (newScoreA >= maxScore || newScoreB >= maxScore)) {
-    isCompleted = true;
-    winnerTeamId = newScoreA >= maxScore ? m.team_a_id : m.team_b_id;
-  }
-  // Condition 2: targetScore reached with win-by-two or normal
-  else if (newScoreA >= targetScore || newScoreB >= targetScore) {
-    const margin = Math.abs(newScoreA - newScoreB);
-    if (!winByTwo || margin >= 2) {
-      isCompleted = true;
-      winnerTeamId = newScoreA > newScoreB ? m.team_a_id : m.team_b_id;
-    }
-  }
+  const isGoldenActiveNow = isGoldenPointEnabled && (newScoreA >= tieThreshold && newScoreB >= tieThreshold);
 
-  if (isCompleted) {
-    const winnerName = winnerTeamId === m.team_a_id ? m.team_a_name : m.team_b_name;
-    resultSummary = `${winnerName} won ${newScoreA} - ${newScoreB}`;
+  if (isGoldenActiveNow) {
+    const existingLogs = await db.query(
+      `SELECT id, sequence_number, point_to, team_a_score, team_b_score, event_type FROM pickleball_score_logs WHERE match_id = ? ORDER BY sequence_number ASC`,
+      [m.id]
+    );
+    const simulatedLogs = [
+      ...(existingLogs || []),
+      { sequence_number: 999999, point_to: pointTo, team_a_score: newScoreA, team_b_score: newScoreB, event_type: 'POINT' }
+    ];
+
+    const goldenStatus = computeGoldenPointStatus({
+      targetScore,
+      goldenPointEnabled: isGoldenPointEnabled,
+      goldenPointTarget: currentGoldenTarget,
+      lastGoldenPointTarget: currentSportState?.lastGoldenPointTarget || 21,
+      scoreA: newScoreA,
+      scoreB: newScoreB,
+      logs: simulatedLogs,
+      teamAName: m.team_a_name,
+      teamBName: m.team_b_name
+    });
+
+    if (goldenStatus.isWinner) {
+      isCompleted = true;
+      winnerTeamId = goldenStatus.winnerTeamKey === 'teamA' ? m.team_a_id : m.team_b_id;
+      const winnerName = winnerTeamId === m.team_a_id ? m.team_a_name : m.team_b_name;
+      const reasonText = goldenStatus.winReason === 'CONSECUTIVE_STREAK' ? 'Golden Point - 2 in a row' : 'Golden Point Target';
+      resultSummary = `${winnerName} won ${newScoreA} - ${newScoreB} (${reasonText})`;
+    }
+  } else {
+    // Condition 1: maxScore reached
+    if (maxScore && (newScoreA >= maxScore || newScoreB >= maxScore)) {
+      isCompleted = true;
+      winnerTeamId = newScoreA >= maxScore ? m.team_a_id : m.team_b_id;
+    }
+    // Condition 2: targetScore reached with win-by-two or normal
+    else if (newScoreA >= targetScore || newScoreB >= targetScore) {
+      const margin = Math.abs(newScoreA - newScoreB);
+      if (!winByTwo || margin >= 2) {
+        isCompleted = true;
+        winnerTeamId = newScoreA > newScoreB ? m.team_a_id : m.team_b_id;
+      }
+    }
+
+    if (isCompleted) {
+      const winnerName = winnerTeamId === m.team_a_id ? m.team_a_name : m.team_b_name;
+      resultSummary = `${winnerName} won ${newScoreA} - ${newScoreB}`;
+    }
   }
 
   const newStatus = isCompleted ? 'COMPLETED' : 'LIVE';
@@ -1399,7 +1697,11 @@ const recordPoint = async (matchId, { pointTo, scoredByPlayerId = null, playerId
     firstServeConfirmed: true,
     servePointsA,
     servePointsB,
-    servePoints: { teamA: servePointsA, teamB: servePointsB }
+    servePoints: { teamA: servePointsA, teamB: servePointsB },
+    goldenPointEnabled: isGoldenPointEnabled,
+    goldenPointTarget: currentGoldenTarget,
+    lastGoldenPointTarget: currentSportState?.lastGoldenPointTarget || currentGoldenTarget || 21,
+    sidesSwapped: Boolean(currentSportState?.sidesSwapped || false)
   };
 
   // Update match in database
@@ -1421,7 +1723,9 @@ const recordPoint = async (matchId, { pointTo, scoredByPlayerId = null, playerId
   const nextSeq = (lastSeqRows[0]?.max_seq || 0) + 1;
 
   // Insert log
-  const logNotes = validatedPlayer ? `Point scored by ${validatedPlayer.name}` : notes;
+  const goldenPrefix = isGoldenActiveNow ? '[GOLDEN POINT] ' : '';
+  const eventTag = eventId ? ` [event:${eventId}]` : '';
+  const logNotes = validatedPlayer ? `${goldenPrefix}Point scored by ${validatedPlayer.name}${eventTag}` : `${goldenPrefix}${notes}${eventTag}`;
   const logInsertRes = await db.query(
     `INSERT INTO pickleball_score_logs (
       match_id, sequence_number, point_to, team_a_score, team_b_score, scorer_id, event_type, notes, scored_by_player_id
@@ -1576,6 +1880,21 @@ const undoPoint = async (matchId, user) => {
     existingPlayerLocations: replayed.playerLocations
   });
 
+  const isGoldenPointEnabled = resolveGoldenPointEnabled(currentSportState, sportConfig);
+  const targetScore = m.target_score != null ? m.target_score : 15;
+  const tieThreshold = Math.max(1, targetScore - 1);
+  const fallsBelowTie = (revertedA < tieThreshold || revertedB < tieThreshold);
+
+  let goldenTargetToSave = currentSportState?.goldenPointTarget || m.golden_point_target || null;
+  let lastGoldenTargetToSave = currentSportState?.lastGoldenPointTarget || goldenTargetToSave || 21;
+
+  if (fallsBelowTie) {
+    if (goldenTargetToSave) {
+      lastGoldenTargetToSave = goldenTargetToSave;
+    }
+    goldenTargetToSave = null;
+  }
+
   const updatedSportState = {
     scoringMode,
     rotationRule: revertedCourtState.rotationRule,
@@ -1590,16 +1909,21 @@ const undoPoint = async (matchId, user) => {
     activeReceiverName: revertedCourtState.activeReceiverName,
     playerLocations: revertedCourtState.playerLocations,
     originalPositions: revertedCourtState.originalPositions,
-    firstServeConfirmed: Boolean(currentSportState?.firstServeConfirmed)
+    firstServeConfirmed: Boolean(currentSportState?.firstServeConfirmed),
+    goldenPointEnabled: isGoldenPointEnabled,
+    goldenPointTarget: goldenTargetToSave,
+    lastGoldenPointTarget: lastGoldenTargetToSave,
+    sidesSwapped: Boolean(currentSportState?.sidesSwapped || false)
   };
 
   await db.query(
     `UPDATE tournament_matches
      SET team_a_score = ?, team_b_score = ?, status = 'LIVE',
          winner_team_id = NULL, result_summary = NULL, live_score_summary = ?,
-         sport_state = ?
+         sport_state = ?,
+         golden_point_target = ?
      WHERE id = ?`,
-    [revertedA, revertedB, liveScoreSummary, JSON.stringify(updatedSportState), m.id]
+    [revertedA, revertedB, liveScoreSummary, JSON.stringify(updatedSportState), goldenTargetToSave, m.id]
   );
 
   if (wasCompleted) {
@@ -1642,29 +1966,6 @@ const correctScore = async (matchId, { teamAScore, teamBScore, notes = 'Score Co
   const winByTwo = m.win_by_two != null ? Boolean(m.win_by_two) : true;
   const maxScore = m.max_score || null;
 
-  let isCompleted = false;
-  let winnerTeamId = null;
-  let resultSummary = null;
-
-  if (maxScore && (newScoreA >= maxScore || newScoreB >= maxScore)) {
-    isCompleted = true;
-    winnerTeamId = newScoreA >= maxScore ? m.team_a_id : m.team_b_id;
-  } else if (newScoreA >= targetScore || newScoreB >= targetScore) {
-    const margin = Math.abs(newScoreA - newScoreB);
-    if (!winByTwo || margin >= 2) {
-      isCompleted = true;
-      winnerTeamId = newScoreA > newScoreB ? m.team_a_id : m.team_b_id;
-    }
-  }
-
-  if (isCompleted) {
-    const winnerName = winnerTeamId === m.team_a_id ? m.team_a_name : m.team_b_name;
-    resultSummary = `${winnerName} won ${newScoreA} - ${newScoreB}`;
-  }
-
-  const newStatus = isCompleted ? 'COMPLETED' : 'LIVE';
-  const liveScoreSummary = `${newScoreA} - ${newScoreB}`;
-
   let sportConfig = null;
   try {
     sportConfig = typeof m.sport_config === 'string' ? JSON.parse(m.sport_config) : (m.sport_config || {});
@@ -1673,6 +1974,67 @@ const correctScore = async (matchId, { teamAScore, teamBScore, notes = 'Score Co
   try {
     currentSportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
   } catch {}
+
+  const isGoldenPointEnabled = resolveGoldenPointEnabled(currentSportState, sportConfig);
+  const tieThreshold = Math.max(1, targetScore - 1);
+  const isTieReached = newScoreA >= tieThreshold && newScoreB >= tieThreshold;
+
+  let goldenTargetToSave = currentSportState?.goldenPointTarget || m.golden_point_target || null;
+  let lastGoldenTargetToSave = currentSportState?.lastGoldenPointTarget || goldenTargetToSave || 21;
+
+  if (!isTieReached) {
+    if (goldenTargetToSave) lastGoldenTargetToSave = goldenTargetToSave;
+    goldenTargetToSave = null;
+  }
+
+  let isCompleted = false;
+  let winnerTeamId = null;
+  let resultSummary = null;
+
+  if (isGoldenPointEnabled && isTieReached) {
+    const logs = await db.query(
+      `SELECT id, sequence_number, point_to, team_a_score, team_b_score, event_type FROM pickleball_score_logs WHERE match_id = ? ORDER BY sequence_number ASC`,
+      [m.id]
+    );
+    const goldenStatus = computeGoldenPointStatus({
+      targetScore,
+      goldenPointEnabled: isGoldenPointEnabled,
+      goldenPointTarget: goldenTargetToSave,
+      lastGoldenPointTarget: lastGoldenTargetToSave,
+      scoreA: newScoreA,
+      scoreB: newScoreB,
+      logs: logs || [],
+      teamAName: m.team_a_name,
+      teamBName: m.team_b_name
+    });
+
+    if (goldenStatus.isWinner) {
+      isCompleted = true;
+      winnerTeamId = goldenStatus.winnerTeamKey === 'teamA' ? m.team_a_id : m.team_b_id;
+      const winnerName = winnerTeamId === m.team_a_id ? m.team_a_name : m.team_b_name;
+      const reasonText = goldenStatus.winReason === 'CONSECUTIVE_STREAK' ? 'Golden Point - 2 in a row' : 'Golden Point Target';
+      resultSummary = `${winnerName} won ${newScoreA} - ${newScoreB} (${reasonText})`;
+    }
+  } else {
+    if (maxScore && (newScoreA >= maxScore || newScoreB >= maxScore)) {
+      isCompleted = true;
+      winnerTeamId = newScoreA >= maxScore ? m.team_a_id : m.team_b_id;
+    } else if (newScoreA >= targetScore || newScoreB >= targetScore) {
+      const margin = Math.abs(newScoreA - newScoreB);
+      if (!winByTwo || margin >= 2) {
+        isCompleted = true;
+        winnerTeamId = newScoreA > newScoreB ? m.team_a_id : m.team_b_id;
+      }
+    }
+
+    if (isCompleted) {
+      const winnerName = winnerTeamId === m.team_a_id ? m.team_a_name : m.team_b_name;
+      resultSummary = `${winnerName} won ${newScoreA} - ${newScoreB}`;
+    }
+  }
+
+  const newStatus = isCompleted ? 'COMPLETED' : 'LIVE';
+  const liveScoreSummary = `${newScoreA} - ${newScoreB}`;
 
   const scoringMode = sportConfig?.scoringMode || currentSportState?.scoringMode || 'RALLY';
 
@@ -1705,16 +2067,21 @@ const correctScore = async (matchId, { teamAScore, teamBScore, notes = 'Score Co
     activeServerName: correctedCourtState.activeServerName,
     activeReceiverName: correctedCourtState.activeReceiverName,
     playerLocations: correctedCourtState.playerLocations,
-    originalPositions: correctedCourtState.originalPositions
+    originalPositions: correctedCourtState.originalPositions,
+    goldenPointEnabled: isGoldenPointEnabled,
+    goldenPointTarget: goldenTargetToSave,
+    lastGoldenPointTarget: lastGoldenTargetToSave,
+    sidesSwapped: Boolean(currentSportState?.sidesSwapped || false)
   };
 
   await db.query(
     `UPDATE tournament_matches
      SET team_a_score = ?, team_b_score = ?, status = ?,
          winner_team_id = ?, result_summary = ?, live_score_summary = ?,
-         sport_state = ?
+         sport_state = ?,
+         golden_point_target = ?
      WHERE id = ?`,
-    [newScoreA, newScoreB, newStatus, winnerTeamId, resultSummary, liveScoreSummary, JSON.stringify(updatedSportState), m.id]
+    [newScoreA, newScoreB, newStatus, winnerTeamId, resultSummary, liveScoreSummary, JSON.stringify(updatedSportState), goldenTargetToSave, m.id]
   );
 
   // If score was lowered, void/delete most recent attributed points of that team
@@ -1863,6 +2230,142 @@ const setRotationRule = async (matchId, body = {}, user) => {
   return await getScorerState(m.uuid);
 };
 
+/**
+ * 13. Set or edit the Golden Point winning target (Scorer only).
+ */
+const setGoldenPointTarget = async (matchId, { goldenPointTarget, goldenTarget }, user) => {
+  const m = await getMatchEntity(matchId);
+  if (!m) {
+    throw { statusCode: 404, message: 'Match not found.' };
+  }
+  const rawTarget = goldenPointTarget ?? goldenTarget;
+  const numTarget = parseInt(rawTarget, 10);
+  const targetScore = m.target_score != null ? m.target_score : 15;
+  const curScoreA = m.team_a_score || 0;
+  const curScoreB = m.team_b_score || 0;
+  const maxScore = Math.max(curScoreA, curScoreB);
+
+  if (isNaN(numTarget) || !Number.isInteger(Number(rawTarget))) {
+    throw { statusCode: 400, message: 'Golden target must be a valid whole number.' };
+  }
+  if (numTarget < 16) {
+    throw { statusCode: 400, message: 'Golden target must be a whole number of at least 16.' };
+  }
+  if (numTarget <= maxScore) {
+    throw { statusCode: 400, message: `Golden target must be strictly above current scores (greater than ${maxScore}).` };
+  }
+
+  let sportState = null;
+  try {
+    sportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {}
+  sportState = sportState || {};
+  sportState.goldenPointTarget = numTarget;
+  sportState.lastGoldenPointTarget = numTarget;
+
+  await db.query(
+    `UPDATE tournament_matches 
+     SET golden_point_target = ?, sport_state = ? 
+     WHERE id = ?`,
+    [numTarget, JSON.stringify(sportState), m.id]
+  );
+
+  const state = await getScorerState(m.uuid);
+
+  broadcastPickleballScore(m.uuid, m.tournament_uuid, {
+    status: m.status,
+    type: 'GOLDEN_TARGET_SET',
+    goldenPointTarget: numTarget,
+    goldenPoint: state.goldenPoint,
+    sportState,
+    state
+  });
+
+  return state;
+};
+
+/**
+ * 14. Toggle Golden Point setting before reaching the tie (Scorer only).
+ */
+const setGoldenPointSetting = async (matchId, { enabled }, user) => {
+  const m = await getMatchEntity(matchId);
+  if (!m) {
+    throw { statusCode: 404, message: 'Match not found.' };
+  }
+  const targetScore = m.target_score != null ? m.target_score : 15;
+  const tieThreshold = Math.max(1, targetScore - 1);
+  const curScoreA = m.team_a_score || 0;
+  const curScoreB = m.team_b_score || 0;
+
+  if (curScoreA >= tieThreshold && curScoreB >= tieThreshold) {
+    throw { statusCode: 400, message: 'Cannot modify Golden Point setting once the tie has been reached.' };
+  }
+
+  let sportState = null;
+  try {
+    sportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {}
+  sportState = sportState || {};
+  sportState.goldenPointEnabled = Boolean(enabled);
+
+  await db.query(
+    `UPDATE tournament_matches 
+     SET sport_state = ? 
+     WHERE id = ?`,
+    [JSON.stringify(sportState), m.id]
+  );
+
+  const state = await getScorerState(m.uuid);
+
+  broadcastPickleballScore(m.uuid, m.tournament_uuid, {
+    status: m.status,
+    type: 'GOLDEN_POINT_SETTING',
+    goldenPoint: state.goldenPoint,
+    sportState,
+    state
+  });
+
+  return state;
+};
+
+/**
+ * 15. Set Switch Ends / Sides Swapped (Scorer only).
+ * Orientation and display state only. Never touches scores, server, rules, or standings.
+ */
+const setSidesSwapped = async (matchId, { sidesSwapped }, user) => {
+  const m = await getMatchEntity(matchId);
+  if (!m) {
+    throw { statusCode: 404, message: 'Match not found.' };
+  }
+
+  let sportState = null;
+  try {
+    sportState = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : (m.sport_state || {});
+  } catch {}
+  sportState = sportState || {};
+  const isSwapped = Boolean(sidesSwapped);
+  sportState.sidesSwapped = isSwapped;
+
+  await db.query(
+    `UPDATE tournament_matches 
+     SET sport_state = ? 
+     WHERE id = ?`,
+    [JSON.stringify(sportState), m.id]
+  );
+
+  const state = await getScorerState(m.uuid);
+
+  broadcastPickleballScore(m.uuid, m.tournament_uuid, {
+    status: m.status,
+    type: 'SIDES_SWAPPED',
+    sidesSwapped: isSwapped,
+    sportState,
+    state
+  });
+
+  return state;
+};
+
 module.exports = {
   getTournamentGroups,
   updateGroupAssignments,
@@ -1877,6 +2380,11 @@ module.exports = {
   undoPoint,
   correctScore,
   setRotationRule,
+  setGoldenPointTarget,
+  setGoldenPointSetting,
+  setSidesSwapped,
+  computeGoldenPointStatus,
+  resolveGoldenPointEnabled,
   computeAuthoritativeCourtState,
   calculatePickleballDoublesPositions,
   replayMatchFromLogs

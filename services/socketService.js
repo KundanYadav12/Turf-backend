@@ -506,6 +506,18 @@ function broadcastPickleballScore(matchPublicId, tournamentPublicId, payload) {
     }
   }
 
+  if (payload.sidesSwapped !== undefined || payload.type === 'SIDES_SWAPPED') {
+    const sidesEvt = {
+      matchId: matchPublicId,
+      tournamentId: tournamentPublicId,
+      sidesSwapped: Boolean(payload.sidesSwapped ?? payload.sportState?.sidesSwapped ?? payload.state?.sidesSwapped)
+    };
+    ioInstance.to(matchRoom).emit('match:sidesSwapped', sidesEvt);
+    if (tournamentPublicId) {
+      ioInstance.to(`tournament:${tournamentPublicId}`).emit('match:sidesSwapped', sidesEvt);
+    }
+  }
+
   if (tournamentPublicId) {
     const tourneyRoom = `tournament:${tournamentPublicId}`;
     ioInstance.to(tourneyRoom).emit('tournament:matchUpdated', {

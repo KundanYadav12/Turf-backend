@@ -293,11 +293,11 @@ router.delete('/:id/teams/:teamId/players/:playerId', authenticateUser, async (r
   }
 });
 
-// 6. POST /api/tournaments - Create tournament (Protected: ADMIN, VENUE_OWNER)
+// 6. POST /api/tournaments - Create tournament (Protected: ADMIN, VENUE_OWNER, PLAYER, USER)
 router.post(
   '/',
   authenticateUser,
-  authorizeRoles('ADMIN', 'VENUE_OWNER'),
+  authorizeRoles('ADMIN', 'SUPER_ADMIN', 'VENUE_OWNER', 'PLAYER', 'USER'),
   (req, res, next) => {
     upload.single('banner')(req, res, (err) => {
       if (err) {
