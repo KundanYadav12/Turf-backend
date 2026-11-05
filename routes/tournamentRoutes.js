@@ -9,6 +9,7 @@ const auctionController = require('../controllers/auctionController');
 const { authenticateUser, optionalAuthenticateUser } = require('../middleware/authMiddleware');
 const { authorizeRoles } = require('../middleware/rbacMiddleware');
 const upload = require('../middleware/multerMiddleware');
+const { optimizeUpload } = require('../services/imageService');
 const tournamentAnalyticsController = require('../controllers/tournamentAnalyticsController');
 
 // 0. Tournament View Tracking & Public Summary (Deduped, non-blocking)
@@ -308,7 +309,16 @@ router.post(
   },
   async (req, res, next) => {
     try {
-      const bannerUrl = req.file ? `/uploads/${req.file.filename}` : req.body.bannerUrl;
+      let bannerUrl = req.body.bannerUrl;
+      if (req.file) {
+        try {
+          const processed = await optimizeUpload(req.file.path, { type: 'banner' });
+          bannerUrl = processed.url;
+        } catch (imgErr) {
+          console.warn('[TournamentUpload] Banner optimization fallback:', imgErr.message);
+          bannerUrl = `/uploads/${req.file.filename}`;
+        }
+      }
       const tournament = await tournamentService.createTournament({
         ...req.body,
         bannerUrl,
@@ -707,7 +717,13 @@ router.post(
     try {
       const data = { ...req.body };
       if (req.file) {
-        data.photoUrl = `/uploads/${req.file.filename}`;
+        try {
+          const processed = await optimizeUpload(req.file.path, { type: 'avatar' });
+          data.photoUrl = processed.url;
+        } catch (imgErr) {
+          console.warn('[PlayerPhotoUpload] Avatar optimization fallback:', imgErr.message);
+          data.photoUrl = `/uploads/${req.file.filename}`;
+        }
       }
       // If customFieldsData was sent as JSON string in multipart form, parse it
       if (typeof data.customFieldsData === 'string') {

@@ -524,6 +524,18 @@ const createTeam = async (req, res, next) => {
     const assignedCaptainId = captainId || userId;
     const inviteCode = generateInviteCode();
 
+    let finalLogoUrl = logoUrl || null;
+    if (req.file) {
+      try {
+        const { optimizeUpload } = require('../services/imageService');
+        const processed = await optimizeUpload(req.file.path, { type: 'logo' });
+        finalLogoUrl = processed.url;
+      } catch (err) {
+        console.warn('[TeamLogo] Optimization fallback:', err.message);
+        finalLogoUrl = `/uploads/${req.file.filename}`;
+      }
+    }
+
     // Create Team
     const insertRes = await db.query(
       `INSERT INTO teams (
@@ -533,7 +545,7 @@ const createTeam = async (req, res, next) => {
       ) VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         name.trim(),
-        logoUrl || null,
+        finalLogoUrl,
         assignedCaptainId,
         assignedOwnerId,
         assignedVenueId,
@@ -646,6 +658,18 @@ const updateTeam = async (req, res, next) => {
       captainId
     } = req.body;
 
+    let finalLogoUrl = logoUrl;
+    if (req.file) {
+      try {
+        const { optimizeUpload } = require('../services/imageService');
+        const processed = await optimizeUpload(req.file.path, { type: 'logo' });
+        finalLogoUrl = processed.url;
+      } catch (err) {
+        console.warn('[TeamLogo] Optimization fallback:', err.message);
+        finalLogoUrl = `/uploads/${req.file.filename}`;
+      }
+    }
+
     await db.query(
       `UPDATE teams SET
         name = COALESCE(?, name),
@@ -661,7 +685,7 @@ const updateTeam = async (req, res, next) => {
        WHERE id = ?`,
       [
         name ? name.trim() : null,
-        logoUrl,
+        finalLogoUrl,
         description,
         division,
         coachName,

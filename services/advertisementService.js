@@ -1,5 +1,21 @@
 const db = require('../config/database');
-const { broadcastSignageEvent } = require('./socketService');
+const { broadcastSignageEvent, getIO } = require('./socketService');
+
+// Helper to broadcast ad updates to live stream viewers and signage
+const notifyAdsUpdated = (extra = {}) => {
+  try {
+    const io = getIO();
+    if (io) {
+      io.emit('advertisements:updated', extra);
+      io.emit('stream:ads_updated', extra);
+      if (extra.tournamentId) {
+        io.to(`tournament:${extra.tournamentId}`).emit('stream:ads_updated', extra);
+      }
+    }
+  } catch (e) {
+    console.warn('[Ads] Socket notify failed:', e.message);
+  }
+};
 
 // Sensible defaults for signage display zones (backward-compatible)
 const DEFAULT_ZONE_SETTINGS = {
@@ -35,6 +51,7 @@ const DEFAULT_STREAM_ZONE_SETTINGS = {
   bottomSpeed: 45,        // in px/sec (range: 15-120)
   rotateInterval: 6,      // in seconds (range: 3-20)
   breakInterval: 5,       // in seconds (range: 3-15)
+  cornerLogoRotateInterval: 8, // in seconds (range: 3-30, default 8s)
   hideSidebarsOnMobile: true
 };
 
@@ -367,10 +384,17 @@ const formatAd = (row) => {
   const validPositions = [
     'TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS',
     'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM',
-    'STREAM_TOP', 'STREAM_BOTTOM', 'STREAM_LEFT', 'STREAM_RIGHT', 'STREAM_BREAK'
+    'STREAM_TOP', 'STREAM_BOTTOM', 'STREAM_LEFT', 'STREAM_RIGHT', 'STREAM_BREAK',
+    'STREAM_TOP_LEFT', 'STREAM_TOP_RIGHT', 'STREAM_CORNER_TOP_LEFT', 'STREAM_CORNER_TOP_RIGHT',
+    'TOP_LEFT', 'TOP_RIGHT'
   ];
-  const rawPos = (row.position || '').toUpperCase();
+  let rawPos = (row.position || '').toUpperCase();
+  if (rawPos === 'TOP_LEFT' || rawPos === 'STREAM_CORNER_TOP_LEFT') rawPos = 'STREAM_TOP_LEFT';
+  if (rawPos === 'TOP_RIGHT' || rawPos === 'STREAM_CORNER_TOP_RIGHT') rawPos = 'STREAM_TOP_RIGHT';
   const position = validPositions.includes(rawPos) ? rawPos : 'TOP';
+
+  const opacity = row.opacity != null ? Math.min(100, Math.max(30, parseInt(row.opacity, 10))) : 100;
+  const margin = row.margin || '2%';
 
   return {
     id: row.id,
@@ -379,9 +403,12 @@ const formatAd = (row) => {
     linkUrl: row.link_url || '',
     imageUrl: row.image_url,
     position,
+    opacity,
+    margin,
     width: row.width || (
       position === 'LEFT' || position === 'RIGHT' ? '240px' :
       position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' ? '140px' :
+      position === 'STREAM_TOP_LEFT' || position === 'STREAM_TOP_RIGHT' ? '12%' :
       position === 'COURT_MIDDLE' ? '80px' : '100%'
     ),
     height: row.height || (
@@ -389,13 +416,19 @@ const formatAd = (row) => {
       position === 'BOTTOM' ? '48px' :
       position === 'STREAM_TOP' ? '48px' :
       position === 'STREAM_BOTTOM' ? '52px' :
+      position === 'STREAM_TOP_LEFT' || position === 'STREAM_TOP_RIGHT' ? 'auto' :
       position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' || position === 'STREAM_BREAK' ? '100%' :
       position === 'COURT_MIDDLE' ? '240px' :
       position === 'MOBILE_TOP' ? '64px' :
       position === 'MOBILE_BOTTOM' ? '56px' : 'auto'
     ),
-    sizePreset: row.size_preset || 'RESPONSIVE',
-    imageFit: row.image_fit || (position === 'COURT_MIDDLE' ? 'cover' : 'contain'),
+    sizePreset: row.size_preset || (
+      position === 'STREAM_TOP_LEFT' || position === 'STREAM_TOP_RIGHT' ? 'MEDIUM' : 'RESPONSIVE'
+    ),
+    imageFit: row.image_fit || (
+      position === 'STREAM_TOP_LEFT' || position === 'STREAM_TOP_RIGHT' ? 'contain' :
+      position === 'COURT_MIDDLE' ? 'cover' : 'contain'
+    ),
     motionType: row.motion_type || (
       row.display_mode === 'MOTION' ? 'SCROLL' :
       (position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' || position === 'STREAM_BREAK') ? 'CROSSFADE' :
@@ -409,7 +442,7 @@ const formatAd = (row) => {
     displayMode: row.display_mode || (position === 'TOP' ? 'STATIC' : 'MOTION'),
     status: row.status || 'ACTIVE',
     sortOrder: row.sort_order ?? row.priority ?? 0,
-    speed: parseInt(row.speed || row.scroll_speed || (position === 'MOBILE_TOP' ? 50 : position === 'MOBILE_BOTTOM' ? 40 : position.startsWith('STREAM') ? 45 : 25), 10),
+    speed: parseInt(row.speed || row.scroll_speed || (position === 'MOBILE_TOP' ? 50 : position === 'MOBILE_BOTTOM' ? 40 : (typeof position === 'string' && position.startsWith('STREAM')) ? 45 : 25), 10),
     slideInterval: parseInt(row.slide_interval || 6, 10),
     pauseOnHover: row.pause_on_hover === 1 || row.pause_on_hover === true || row.pause_on_hover === undefined,
     targetPage: row.target_page || 'ALL',
@@ -468,10 +501,14 @@ const getActiveAds = async ({ tournamentId, venueId, device } = {}) => {
 
   let activeAds = allActiveRows.map(formatAd);
 
-  // Filter by device if specified (MOBILE, TV, SIGNAGE)
+  // Filter by device if specified (MOBILE, TV, SIGNAGE, STREAM)
   if (device && device !== 'ALL') {
     const devUpper = device.toUpperCase();
     activeAds = activeAds.filter(a => {
+      // If querying for stream ads, always include STREAM_* position ads
+      if (devUpper === 'STREAM' && typeof a.position === 'string' && (a.position.startsWith('STREAM_') || a.position === 'top_left' || a.position === 'top_right')) {
+        return true;
+      }
       if (!a.devices || a.devices.length === 0 || a.devices.includes('ALL')) return true;
       return a.devices.includes(devUpper);
     });
@@ -511,6 +548,8 @@ const getActiveAds = async ({ tournamentId, venueId, device } = {}) => {
   let streamLeftAds = resolvePositionPriority(activeAds.filter(a => a.position === 'STREAM_LEFT'));
   let streamRightAds = resolvePositionPriority(activeAds.filter(a => a.position === 'STREAM_RIGHT'));
   let streamBreakAds = resolvePositionPriority(activeAds.filter(a => a.position === 'STREAM_BREAK'));
+  let streamCornerTopLeftAds = resolvePositionPriority(activeAds.filter(a => a.position === 'STREAM_TOP_LEFT' || a.position === 'top_left' || a.position === 'STREAM_CORNER_TOP_LEFT'));
+  let streamCornerTopRightAds = resolvePositionPriority(activeAds.filter(a => a.position === 'STREAM_TOP_RIGHT' || a.position === 'top_right' || a.position === 'STREAM_CORNER_TOP_RIGHT'));
 
   const vKey = resolvedVenueId ? String(resolvedVenueId) : null;
   const resolvedZoneSettings = vKey && playbackState.venueZoneSettings[vKey]
@@ -552,6 +591,8 @@ const getActiveAds = async ({ tournamentId, venueId, device } = {}) => {
     streamLeftAds,
     streamRightAds,
     streamBreakAds,
+    streamCornerTopLeftAds,
+    streamCornerTopRightAds,
     allActiveAds: activeAds
   };
 };
@@ -602,14 +643,23 @@ const createAd = async (adData, userId = null) => {
   const validPositions = [
     'TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS',
     'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM',
-    'STREAM_TOP', 'STREAM_BOTTOM', 'STREAM_LEFT', 'STREAM_RIGHT', 'STREAM_BREAK'
+    'STREAM_TOP', 'STREAM_BOTTOM', 'STREAM_LEFT', 'STREAM_RIGHT', 'STREAM_BREAK',
+    'STREAM_TOP_LEFT', 'STREAM_TOP_RIGHT', 'STREAM_CORNER_TOP_LEFT', 'STREAM_CORNER_TOP_RIGHT',
+    'TOP_LEFT', 'TOP_RIGHT'
   ];
-  const posUpper = (adData.position || '').toUpperCase();
+  let posUpper = (adData.position || '').toUpperCase();
+  if (posUpper === 'TOP_LEFT' || posUpper === 'STREAM_CORNER_TOP_LEFT') posUpper = 'STREAM_TOP_LEFT';
+  if (posUpper === 'TOP_RIGHT' || posUpper === 'STREAM_CORNER_TOP_RIGHT') posUpper = 'STREAM_TOP_RIGHT';
   const position = validPositions.includes(posUpper) ? posUpper : 'TOP';
+
+  const isCornerLogo = position === 'STREAM_TOP_LEFT' || position === 'STREAM_TOP_RIGHT';
+  const opacity = adData.opacity != null ? Math.min(100, Math.max(30, parseInt(adData.opacity, 10) || 100)) : 100;
+  const margin = adData.margin || '2%';
 
   const width = adData.width || (
     position === 'LEFT' || position === 'RIGHT' ? '240px' :
     position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' ? '140px' :
+    isCornerLogo ? '12%' :
     position === 'COURT' ? '50%' :
     position === 'COURT_MIDDLE' ? '80px' : '100%'
   );
@@ -618,14 +668,15 @@ const createAd = async (adData, userId = null) => {
     position === 'BOTTOM' ? '48px' :
     position === 'STREAM_TOP' ? '48px' :
     position === 'STREAM_BOTTOM' ? '52px' :
+    isCornerLogo ? 'auto' :
     position === 'STREAM_LEFT' || position === 'STREAM_RIGHT' || position === 'STREAM_BREAK' ? '100%' :
     position === 'COURT' ? '80%' :
     position === 'COURT_MIDDLE' ? '240px' :
     position === 'MOBILE_TOP' ? '64px' :
     position === 'MOBILE_BOTTOM' ? '56px' : 'auto'
   );
-  const sizePreset = adData.sizePreset || adData.size_preset || 'RESPONSIVE';
-  const imageFit = ['contain', 'cover', 'fill', 'scale-down'].includes(adData.imageFit) ? adData.imageFit : (position === 'COURT_MIDDLE' ? 'cover' : 'contain');
+  const sizePreset = adData.sizePreset || adData.size_preset || (isCornerLogo ? 'MEDIUM' : 'RESPONSIVE');
+  const imageFit = ['contain', 'cover', 'fill', 'scale-down'].includes(adData.imageFit) ? adData.imageFit : (isCornerLogo ? 'contain' : position === 'COURT_MIDDLE' ? 'cover' : 'contain');
 
   const validMotionTypes = ['STATIC', 'SCROLL', 'SLIDE', 'CAROUSEL', 'MARQUEE', 'CROSSFADE'];
   const motionType = validMotionTypes.includes(adData.motionType)
@@ -640,12 +691,12 @@ const createAd = async (adData, userId = null) => {
 
   const displayMode = motionType === 'STATIC' ? 'STATIC' : 'MOTION';
   const speed = parseInt(adData.speed || adData.scrollSpeed || (position === 'MOBILE_TOP' ? 50 : position === 'MOBILE_BOTTOM' ? 40 : 25), 10);
-  const slideInterval = parseInt(adData.slideInterval || 6, 10);
+  const slideInterval = parseInt(adData.slideInterval || (isCornerLogo ? 8 : 6), 10);
   const pauseOnHover = adData.pauseOnHover === false || adData.pauseOnHover === 'false' || adData.pauseOnHover === 0 ? 0 : 1;
   const targetPage = adData.targetPage || 'ALL';
   const deviceTarget = adData.deviceTarget || 'ALL';
 
-  let devices = ['MOBILE', 'TV', 'SIGNAGE'];
+  let devices = position.startsWith('STREAM_') ? ['STREAM', 'MOBILE', 'TV', 'SIGNAGE'] : ['MOBILE', 'TV', 'SIGNAGE'];
   if (adData.devices) {
     if (typeof adData.devices === 'string') {
       try { devices = JSON.parse(adData.devices); }
@@ -655,6 +706,9 @@ const createAd = async (adData, userId = null) => {
     }
   } else if (adData.deviceTarget && adData.deviceTarget !== 'ALL') {
     devices = [adData.deviceTarget];
+  }
+  if (position.startsWith('STREAM_') && !devices.includes('STREAM')) {
+    devices.push('STREAM');
   }
   const devicesJson = JSON.stringify(devices);
 
@@ -696,9 +750,9 @@ const createAd = async (adData, userId = null) => {
 
   const result = await db.query(
     `INSERT INTO advertisements 
-     (title, name, description, link_url, image_url, width, height, size_preset, image_fit, position, display_mode, motion_type, movement_direction, speed, scroll_speed, slide_interval, pause_on_hover, venue_ids, tournament_ids, target_page, device_target, devices, status, sort_order, priority, start_date, end_date, tournament_id, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [title, title, description, linkUrl, imageUrl, width, height, sizePreset, imageFit, position, displayMode, motionType, movementDirection, speed, speed, slideInterval, pauseOnHover, venueIdsJson, tournamentIdsJson, targetPage, deviceTarget, devicesJson, status, sortOrder, sortOrder, startDate, endDate, tournamentId, userId]
+     (title, name, description, link_url, image_url, width, height, size_preset, image_fit, opacity, margin, position, display_mode, motion_type, movement_direction, speed, scroll_speed, slide_interval, pause_on_hover, venue_ids, tournament_ids, target_page, device_target, devices, status, sort_order, priority, start_date, end_date, tournament_id, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [title, title, description, linkUrl, imageUrl, width, height, sizePreset, imageFit, opacity, margin, position, displayMode, motionType, movementDirection, speed, speed, slideInterval, pauseOnHover, venueIdsJson, tournamentIdsJson, targetPage, deviceTarget, devicesJson, status, sortOrder, sortOrder, startDate, endDate, tournamentId, userId]
   );
 
   const insertedId = result.insertId;
@@ -708,6 +762,7 @@ const createAd = async (adData, userId = null) => {
   // Broadcast real-time update
   broadcastSignageEvent('signage:adAdded', { ad: formatted });
   broadcastSignageEvent('signage:adUpdated', { ad: formatted });
+  notifyAdsUpdated({ tournamentId, adId: insertedId });
 
   return formatted;
 };
@@ -730,18 +785,27 @@ const updateAd = async (id, adData) => {
   const validPositions = [
     'TOP', 'BOTTOM', 'LEFT', 'RIGHT', 'BOTH_SIDEBARS',
     'COURT', 'COURT_MIDDLE', 'MOBILE_TOP', 'MOBILE_BOTTOM',
-    'STREAM_TOP', 'STREAM_BOTTOM', 'STREAM_LEFT', 'STREAM_RIGHT', 'STREAM_BREAK'
+    'STREAM_TOP', 'STREAM_BOTTOM', 'STREAM_LEFT', 'STREAM_RIGHT', 'STREAM_BREAK',
+    'STREAM_TOP_LEFT', 'STREAM_TOP_RIGHT', 'STREAM_CORNER_TOP_LEFT', 'STREAM_CORNER_TOP_RIGHT',
+    'TOP_LEFT', 'TOP_RIGHT'
   ];
-  const posUpper = (adData.position || '').toUpperCase();
+  let posUpper = (adData.position || '').toUpperCase();
+  if (posUpper === 'TOP_LEFT' || posUpper === 'STREAM_CORNER_TOP_LEFT') posUpper = 'STREAM_TOP_LEFT';
+  if (posUpper === 'TOP_RIGHT' || posUpper === 'STREAM_CORNER_TOP_RIGHT') posUpper = 'STREAM_TOP_RIGHT';
   const position = posUpper && validPositions.includes(posUpper) ? posUpper : (existing.position || 'TOP');
+  const isCornerLogo = position === 'STREAM_TOP_LEFT' || position === 'STREAM_TOP_RIGHT';
+  const opacity = adData.opacity !== undefined ? Math.min(100, Math.max(30, parseInt(adData.opacity, 10) || 100)) : (existing.opacity ?? 100);
+  const margin = adData.margin !== undefined ? adData.margin : (existing.margin || '2%');
   const width = adData.width !== undefined ? adData.width : (
     existing.width || (
+      isCornerLogo ? '12%' :
       position === 'COURT_MIDDLE' ? '80px' :
       (position === 'STREAM_LEFT' || position === 'STREAM_RIGHT') ? '140px' : '100%'
     )
   );
   const height = adData.height !== undefined ? adData.height : (
     existing.height || (
+      isCornerLogo ? 'auto' :
       position === 'COURT_MIDDLE' ? '240px' :
       position === 'STREAM_TOP' ? '48px' :
       position === 'STREAM_BOTTOM' ? '52px' :
@@ -749,13 +813,13 @@ const updateAd = async (id, adData) => {
       'auto'
     )
   );
-  const sizePreset = adData.sizePreset || adData.size_preset || existing.size_preset || 'RESPONSIVE';
-  const imageFit = adData.imageFit || adData.image_fit || existing.image_fit || (position === 'COURT_MIDDLE' ? 'cover' : 'contain');
+  const sizePreset = adData.sizePreset || adData.size_preset || existing.size_preset || (isCornerLogo ? 'MEDIUM' : 'RESPONSIVE');
+  const imageFit = adData.imageFit || adData.image_fit || existing.image_fit || (isCornerLogo ? 'contain' : position === 'COURT_MIDDLE' ? 'cover' : 'contain');
   const motionType = adData.motionType || adData.motion_type || existing.motion_type || 'STATIC';
   const movementDirection = adData.movementDirection || adData.movement_direction || existing.movement_direction || 'RIGHT_TO_LEFT';
   const displayMode = motionType === 'STATIC' ? 'STATIC' : 'MOTION';
   const speed = adData.speed !== undefined ? parseInt(adData.speed, 10) : (existing.speed || existing.scroll_speed || 25);
-  const slideInterval = adData.slideInterval !== undefined ? parseInt(adData.slideInterval, 10) : (existing.slide_interval || 6);
+  const slideInterval = adData.slideInterval !== undefined ? parseInt(adData.slideInterval, 10) : (existing.slide_interval || (isCornerLogo ? 8 : 6));
   const pauseOnHover = adData.pauseOnHover !== undefined ? (adData.pauseOnHover ? 1 : 0) : (existing.pause_on_hover ?? 1);
   const targetPage = adData.targetPage !== undefined ? adData.targetPage : (existing.target_page || 'ALL');
   const deviceTarget = adData.deviceTarget !== undefined ? adData.deviceTarget : (existing.device_target || 'ALL');
@@ -815,11 +879,12 @@ const updateAd = async (id, adData) => {
   await db.query(
     `UPDATE advertisements
      SET title = ?, name = ?, description = ?, link_url = ?, image_url = ?, width = ?, height = ?, size_preset = ?, image_fit = ?,
+         opacity = ?, margin = ?,
          position = ?, display_mode = ?, motion_type = ?, movement_direction = ?, speed = ?, scroll_speed = ?,
          slide_interval = ?, pause_on_hover = ?, venue_ids = ?, tournament_ids = ?, target_page = ?, device_target = ?, devices = ?, status = ?,
          sort_order = ?, priority = ?, start_date = ?, end_date = ?, tournament_id = ?
      WHERE id = ?`,
-    [title, title, description, linkUrl, imageUrl, width, height, sizePreset, imageFit, position, displayMode, motionType, movementDirection, speed, speed, slideInterval, pauseOnHover, venueIdsJson, tournamentIdsJson, targetPage, deviceTarget, devicesJson, status, sortOrder, sortOrder, startDate, endDate, tournamentId, id]
+    [title, title, description, linkUrl, imageUrl, width, height, sizePreset, imageFit, opacity, margin, position, displayMode, motionType, movementDirection, speed, speed, slideInterval, pauseOnHover, venueIdsJson, tournamentIdsJson, targetPage, deviceTarget, devicesJson, status, sortOrder, sortOrder, startDate, endDate, tournamentId, id]
   );
 
   const [updatedRow] = await db.query('SELECT * FROM advertisements WHERE id = ?', [id]);
@@ -827,6 +892,7 @@ const updateAd = async (id, adData) => {
 
   // Broadcast real-time update
   broadcastSignageEvent('signage:adUpdated', { ad: formatted });
+  notifyAdsUpdated({ tournamentId, adId: id });
 
   return formatted;
 };
@@ -843,6 +909,7 @@ const deleteAd = async (id) => {
   await db.query('DELETE FROM advertisements WHERE id = ?', [id]);
 
   broadcastSignageEvent('signage:adRemoved', { id: parseInt(id, 10) });
+  notifyAdsUpdated({ adId: id });
 
   return { success: true, id };
 };
@@ -879,6 +946,8 @@ const getStreamAds = async ({ matchId, tournamentId, venueId } = {}) => {
     streamLeftAds: ads.streamLeftAds || [],
     streamRightAds: ads.streamRightAds || [],
     streamBreakAds: ads.streamBreakAds || [],
+    streamCornerTopLeftAds: ads.streamCornerTopLeftAds || [],
+    streamCornerTopRightAds: ads.streamCornerTopRightAds || [],
     streamZoneSettings: ads.streamZoneSettings || { ...DEFAULT_STREAM_ZONE_SETTINGS },
     state: ads.state || {}
   };

@@ -27,6 +27,8 @@ const playerRoutes = require('./routes/playerRoutes');
 const userRoutes = require('./routes/userRoutes');
 const privacyPolicyRoutes = require('./routes/privacyPolicyRoutes');
 const accountDeletionRoutes = require('./routes/accountDeletionRoutes');
+const appUpdateRoutes = require('./routes/appUpdateRoutes');
+const imageRoutes = require('./routes/imageRoutes');
 const errorHandler = require('./middleware/errorHandler');
 const { verifyConnection: verifyEmailConnection } = require('./services/emailService');
 
@@ -79,8 +81,17 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve static uploads
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// Serve static uploads with immutable browser/proxy caching and CORS
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
+  maxAge: '30d',
+  etag: true,
+  lastModified: true,
+  setHeaders: (res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
+  }
+}));
 
 // Health Check API
 app.get('/api/health', (req, res) => {
@@ -115,6 +126,9 @@ app.use('/api/notifications', userRoutes);
 app.use('/api/privacy-policy', privacyPolicyRoutes);
 app.use('/api/account', accountDeletionRoutes);
 app.use('/api/account-deletion', accountDeletionRoutes);
+app.use('/api/mobile-updates', appUpdateRoutes);
+app.use('/api/app-updates', appUpdateRoutes);
+app.use('/api/images', imageRoutes);
 const tvDisplayRoutes = require('./routes/tvDisplayRoutes');
 app.use('/api/tv', tvDisplayRoutes);
 const streamRoutes = require('./routes/streamRoutes');
@@ -142,7 +156,7 @@ server.listen(PORT, () => {
   console.log(`🚀 Local Port: ${PORT}`);
   console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`====================================================`);
-  
+
   // Verify SMTP Email Server Connection asynchronously
   verifyEmailConnection();
 });

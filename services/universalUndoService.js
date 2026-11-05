@@ -3,7 +3,7 @@ const cricketScorerService = require('./cricketScorerService');
 const footballScorerService = require('./footballScorerService');
 const badmintonScorerService = require('./badmintonScorerService');
 const pickleballService = require('./pickleballService');
-const { getIO } = require('./socketService');
+const { getIO, broadcastScoreSync } = require('./socketService');
 
 /**
  * Resolves match entity and identified sport slug.
@@ -261,25 +261,32 @@ async function performUndo(matchPublicId, user) {
   // 4. Fetch the new last action
   const nextLastAction = await getLastAction(matchPublicId);
 
-  // 5. Authoritative WebSocket broadcast
-  const io = getIO();
-  if (io) {
-    const eventPayload = {
-      matchId: match.uuid,
-      sportSlug,
-      undoneAction: undoneDesc,
-      liveScoreSummary: updatedMatch.live_score_summary,
-      status: updatedMatch.status,
-      state: typeof updatedMatch.sport_state === 'string' ? JSON.parse(updatedMatch.sport_state) : updatedMatch.sport_state,
-      canUndo: nextLastAction.canUndo,
-      lastAction: nextLastAction.lastAction
-    };
+  // 5. Authoritative WebSocket broadcast via broadcastScoreSync
+  const parsedState = typeof updatedMatch.sport_state === 'string'
+    ? JSON.parse(updatedMatch.sport_state)
+    : updatedMatch.sport_state;
 
-    io.to(`match:${match.uuid}`).emit('match:undone', eventPayload);
-    if (match.tournament_uuid) {
-      io.to(`tournament:${match.tournament_uuid}`).emit('tournament:matchUpdated', eventPayload);
-    }
-  }
+  const eventPayload = {
+    matchId: match.uuid,
+    id: match.id,
+    tournamentId: match.tournament_uuid || match.tournament_id,
+    sportSlug,
+    type: 'UNDO',
+    undoneAction: undoneDesc,
+    scoreSummary: updatedMatch.live_score_summary,
+    liveScoreSummary: updatedMatch.live_score_summary,
+    subtext: updatedMatch.live_subtext || '',
+    liveSubtext: updatedMatch.live_subtext || '',
+    status: updatedMatch.status,
+    state: parsedState,
+    sportState: parsedState,
+    canUndo: nextLastAction.canUndo,
+    lastAction: nextLastAction.lastAction
+  };
+
+  broadcastScoreSync(match.uuid, eventPayload).catch((e) => {
+    console.warn('[UniversalUndo] broadcastScoreSync note:', e.message);
+  });
 
   return {
     success: true,

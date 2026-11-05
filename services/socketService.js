@@ -1,6 +1,112 @@
 let ioInstance = null;
 const broadcasterDisconnectTimers = new Map();
 
+// High-speed In-Memory Identifier Mapping Cache (numeric ID <-> UUID)
+const matchIdentifierCache = new Map();
+const tournamentIdentifierCache = new Map();
+
+/**
+ * Resolves both numeric ID and UUID for a match from memory or database.
+ * Prevents room fragmentation between screens referencing id vs uuid.
+ */
+async function resolveMatchIdentifiers(matchKey) {
+  if (!matchKey) return null;
+  const keyStr = String(matchKey).trim();
+  if (matchIdentifierCache.has(keyStr)) {
+    return matchIdentifierCache.get(keyStr);
+  }
+
+  try {
+    const db = require('../config/database');
+    const isNum = /^\d+$/.test(keyStr);
+    let rows;
+    if (isNum) {
+      const [r] = await db.query(
+        'SELECT id, uuid, tournament_id, sport_slug, status, live_score_summary, live_subtext, sport_state FROM tournament_matches WHERE id = ? LIMIT 1',
+        [parseInt(keyStr, 10)]
+      );
+      rows = r;
+    } else {
+      const [r] = await db.query(
+        'SELECT id, uuid, tournament_id, sport_slug, status, live_score_summary, live_subtext, sport_state FROM tournament_matches WHERE uuid = ? LIMIT 1',
+        [keyStr]
+      );
+      rows = r;
+    }
+
+    if (rows && rows.length > 0) {
+      const row = rows[0];
+      let tourneyUuid = null;
+      if (row.tournament_id) {
+        try {
+          const [tRows] = await db.query(
+            'SELECT id, uuid FROM tournaments WHERE id = ? LIMIT 1',
+            [row.tournament_id]
+          );
+          if (tRows && tRows.length > 0) tourneyUuid = tRows[0].uuid;
+        } catch (te) {}
+      }
+
+      const matchData = {
+        id: row.id,
+        uuid: row.uuid,
+        tournamentId: row.tournament_id,
+        tournamentUuid: tourneyUuid,
+        sportSlug: row.sport_slug,
+        status: row.status,
+        liveScoreSummary: row.live_score_summary,
+        liveSubtext: row.live_subtext,
+        sportState: row.sport_state
+      };
+
+      matchIdentifierCache.set(String(row.id), matchData);
+      matchIdentifierCache.set(String(row.uuid), matchData);
+      return matchData;
+    }
+  } catch (err) {
+    // Graceful fallback
+  }
+  return null;
+}
+
+/**
+ * Resolves both numeric ID and UUID for a tournament.
+ */
+async function resolveTournamentIdentifiers(tournKey) {
+  if (!tournKey) return null;
+  const keyStr = String(tournKey).trim();
+  if (tournamentIdentifierCache.has(keyStr)) {
+    return tournamentIdentifierCache.get(keyStr);
+  }
+
+  try {
+    const db = require('../config/database');
+    const isNum = /^\d+$/.test(keyStr);
+    let rows;
+    if (isNum) {
+      const [r] = await db.query(
+        'SELECT id, uuid FROM tournaments WHERE id = ? LIMIT 1',
+        [parseInt(keyStr, 10)]
+      );
+      rows = r;
+    } else {
+      const [r] = await db.query(
+        'SELECT id, uuid FROM tournaments WHERE uuid = ? LIMIT 1',
+        [keyStr]
+      );
+      rows = r;
+    }
+
+    if (rows && rows.length > 0) {
+      const tData = { id: rows[0].id, uuid: rows[0].uuid };
+      tournamentIdentifierCache.set(String(rows[0].id), tData);
+      tournamentIdentifierCache.set(String(rows[0].uuid), tData);
+      return tData;
+    }
+  } catch (err) {}
+  return null;
+}
+
 /**
  * Initializes Socket.IO with CORS and room partition architecture.
  */
@@ -26,36 +132,115 @@ function initSocket(server) {
   });
 
   io.on('connection', (socket) => {
-    // 1. Join Tournament Room
-    socket.on('join:tournament', ({ tournamentId }) => {
+    // 1. Join Tournament Room (Dual Room: numeric ID + UUID)
+    socket.on('join:tournament', async ({ tournamentId }) => {
       if (tournamentId) {
-        const room = `tournament:${tournamentId}`;
-        socket.join(room);
+        const rawKey = String(tournamentId).trim();
+        socket.join(`tournament:${rawKey}`);
+        
+        // Asynchronously resolve and auto-join the companion identifier room
+        try {
+          const tInfo = await resolveTournamentIdentifiers(rawKey);
+          if (tInfo) {
+            if (tInfo.id) socket.join(`tournament:${tInfo.id}`);
+            if (tInfo.uuid) socket.join(`tournament:${tInfo.uuid}`);
+          }
+        } catch (e) {}
       }
     });
 
     // 2. Leave Tournament Room
     socket.on('leave:tournament', ({ tournamentId }) => {
       if (tournamentId) {
-        const room = `tournament:${tournamentId}`;
-        socket.leave(room);
+        const rawKey = String(tournamentId).trim();
+        socket.leave(`tournament:${rawKey}`);
+        const tInfo = tournamentIdentifierCache.get(rawKey);
+        if (tInfo) {
+          if (tInfo.id) socket.leave(`tournament:${tInfo.id}`);
+          if (tInfo.uuid) socket.leave(`tournament:${tInfo.uuid}`);
+        }
       }
     });
 
-    // 3. Join Match Room
-    socket.on('join:match', ({ matchId }) => {
+    // 3. Join Match Room (Dual Room: numeric ID + UUID + Stream Room)
+    socket.on('join:match', async ({ matchId }) => {
       if (matchId) {
-        const room = `match:${matchId}`;
-        socket.join(room);
+        const rawKey = String(matchId).trim();
+        socket.join(`match:${rawKey}`);
+        socket.join(`stream:${rawKey}`);
+
+        if (!socket._joinedMatches) socket._joinedMatches = new Set();
+        socket._joinedMatches.add(rawKey);
+
+        // Asynchronously resolve and auto-join companion rooms
+        try {
+          const mInfo = await resolveMatchIdentifiers(rawKey);
+          if (mInfo) {
+            if (mInfo.id) {
+              socket.join(`match:${mInfo.id}`);
+              socket.join(`stream:${mInfo.id}`);
+              socket._joinedMatches.add(String(mInfo.id));
+            }
+            if (mInfo.uuid) {
+              socket.join(`match:${mInfo.uuid}`);
+              socket.join(`stream:${mInfo.uuid}`);
+              socket._joinedMatches.add(String(mInfo.uuid));
+            }
+            if (mInfo.tournamentId) socket.join(`tournament:${mInfo.tournamentId}`);
+            if (mInfo.tournamentUuid) socket.join(`tournament:${mInfo.tournamentUuid}`);
+          }
+        } catch (e) {}
       }
     });
 
     // 4. Leave Match Room
     socket.on('leave:match', ({ matchId }) => {
       if (matchId) {
-        const room = `match:${matchId}`;
-        socket.leave(room);
+        const rawKey = String(matchId).trim();
+        socket.leave(`match:${rawKey}`);
+        socket.leave(`stream:${rawKey}`);
+
+        if (socket._joinedMatches) {
+          socket._joinedMatches.delete(rawKey);
+        }
+
+        const mInfo = matchIdentifierCache.get(rawKey);
+        if (mInfo) {
+          if (mInfo.id) {
+            socket.leave(`match:${mInfo.id}`);
+            socket.leave(`stream:${mInfo.id}`);
+            if (socket._joinedMatches) socket._joinedMatches.delete(String(mInfo.id));
+          }
+          if (mInfo.uuid) {
+            socket.leave(`match:${mInfo.uuid}`);
+            socket.leave(`stream:${mInfo.uuid}`);
+            if (socket._joinedMatches) socket._joinedMatches.delete(String(mInfo.uuid));
+          }
+        }
       }
+    });
+
+    // 4b. Reconnection Match Sync Request
+    socket.on('match:requestSync', async ({ matchId }) => {
+      if (!matchId) return;
+      try {
+        const mInfo = await resolveMatchIdentifiers(matchId);
+        if (mInfo) {
+          const syncPayload = {
+            matchId: mInfo.uuid,
+            id: mInfo.id,
+            status: mInfo.status,
+            scoreSummary: mInfo.liveScoreSummary,
+            liveScoreSummary: mInfo.liveScoreSummary,
+            subtext: mInfo.liveSubtext,
+            liveSubtext: mInfo.liveSubtext,
+            sportState: typeof mInfo.sportState === 'string' ? JSON.parse(mInfo.sportState) : mInfo.sportState,
+            timestamp: Date.now()
+          };
+          socket.emit('score:updated', syncPayload);
+          socket.emit('match:ballEvent', syncPayload);
+        }
+      } catch (err) {}
     });
 
     // 5. Join Auction Room
@@ -163,12 +348,29 @@ function initSocket(server) {
     };
 
     // 11. Live Streaming WebRTC Signaling & Room Management
-    socket.on('stream:join', ({ matchId, isBroadcaster }) => {
+    socket.on('stream:join', async ({ matchId, isBroadcaster }) => {
       if (matchId) {
-        const streamRoom = `stream:${matchId}`;
+        const rawKey = String(matchId).trim();
+        const streamRoom = `stream:${rawKey}`;
         socket.join(streamRoom);
-        socket.streamMatchId = matchId;
+        socket.join(`match:${rawKey}`);
+        socket.streamMatchId = rawKey;
         socket.isBroadcaster = Boolean(isBroadcaster);
+
+        // Auto-join companion match rooms for reliable score synchronization
+        try {
+          const mInfo = await resolveMatchIdentifiers(rawKey);
+          if (mInfo) {
+            if (mInfo.id) {
+              socket.join(`stream:${mInfo.id}`);
+              socket.join(`match:${mInfo.id}`);
+            }
+            if (mInfo.uuid) {
+              socket.join(`stream:${mInfo.uuid}`);
+              socket.join(`match:${mInfo.uuid}`);
+            }
+          }
+        } catch (e) {}
 
         // Cancel pending broadcaster disconnect reaper timer if broadcaster reconnected
         if (socket.isBroadcaster && broadcasterDisconnectTimers.has(matchId)) {
@@ -354,95 +556,186 @@ function getIO() {
 }
 
 /**
- * Broadcast lightweight summary event to Tournament-level and Match-level subscribers.
- * Payload: ~80-120 bytes with monotonic sequence/timestamp.
+ * Master Real-Time Score Synchronizer
+ * Broadcasts authoritative match score updates simultaneously to:
+ * - Match rooms: match:{id} AND match:{uuid}
+ * - Stream rooms: stream:{id} AND stream:{uuid}
+ * - Tournament rooms: tournament:{tournamentId} AND tournament:{tournamentUuid}
+ *
+ * Emits with all universal and sport-specific event aliases so every screen,
+ * web component, mobile screen, TV display, digital signage, and streaming overlay
+ * updates instantly with zero refresh or polling.
  */
-function broadcastTournamentMatchUpdate(tournamentPublicId, matchData) {
+async function broadcastScoreSync(matchIdOrUuid, payload = {}) {
   if (!ioInstance) return;
-  const matchId = matchData.public_id || matchData.matchId || matchData.id;
-  const eventSeq = matchData.eventSeq || matchData.seq || Date.now();
-  const eventPayload = {
-    matchId,
-    public_id: matchId,
-    tournamentId: tournamentPublicId || matchData.tournamentId || matchData.tournament_id,
-    tournamentPublicId: tournamentPublicId || matchData.tournamentId || matchData.tournament_id,
-    eventSeq,
-    timestamp: Date.now(),
-    status: matchData.status,
-    liveScoreSummary: matchData.live_score_summary || matchData.liveScoreSummary,
-    liveSubtext: matchData.live_subtext || matchData.liveSubtext,
-    courtName: matchData.court_name || matchData.courtName,
-    celebration: matchData.celebration,
-    type: matchData.type,
-    state: matchData.state
-  };
+  const matchKey = String(matchIdOrUuid || payload.matchId || payload.matchUuid || payload.id || '').trim();
+  if (!matchKey) return;
 
-  // 1. Broadcast to Tournament Room
-  if (tournamentPublicId) {
-    const room = `tournament:${tournamentPublicId}`;
-    ioInstance.to(room).emit('tournament:matchUpdated', eventPayload);
-    ioInstance.to(room).emit('signage:matchUpdate', eventPayload);
+  // Resolve match and tournament metadata (from memory cache or DB)
+  let matchInfo = matchIdentifierCache.get(matchKey);
+  if (!matchInfo) {
+    matchInfo = await resolveMatchIdentifiers(matchKey);
   }
 
-  // 2. Broadcast to Match Room
-  if (matchId) {
-    const matchRoom = `match:${matchId}`;
-    ioInstance.to(matchRoom).emit('tournament:matchUpdated', eventPayload);
-    ioInstance.to(matchRoom).emit('match:statusChanged', eventPayload);
-    ioInstance.to(matchRoom).emit('score:updated', eventPayload);
+  const numericId = matchInfo?.id || (isNaN(Number(matchKey)) ? null : Number(matchKey));
+  const uuidStr = matchInfo?.uuid || (isNaN(Number(matchKey)) ? matchKey : null);
+  const tournamentId = payload.tournamentId || payload.tournament_id || matchInfo?.tournamentId || null;
+  const tournamentUuid = payload.tournamentUuid || payload.tournament_uuid || matchInfo?.tournamentUuid || null;
+
+  const eventSeq = payload.eventSeq || payload.seq || Date.now();
+  const timestamp = payload.timestamp || Date.now();
+
+  const scoreSummary = payload.scoreSummary || payload.liveScoreSummary || payload.summary ||
+    (payload.teamAScore !== undefined && payload.teamBScore !== undefined ? `${payload.teamAScore} - ${payload.teamBScore}` : '');
+  const subtext = payload.subtext || payload.liveSubtext || '';
+  const status = payload.status || matchInfo?.status || 'LIVE';
+  const sportState = payload.sportState || payload.state || payload.sport_state || matchInfo?.sportState || null;
+  const celebration = payload.celebration || null;
+  const type = payload.type || (payload.isWicket ? 'WICKET' : 'SCORE_UPDATE');
+
+  const enriched = {
+    matchId: uuidStr || numericId,
+    matchUuid: uuidStr,
+    matchNumericId: numericId,
+    id: numericId || uuidStr,
+    public_id: uuidStr || numericId,
+    uuid: uuidStr,
+    tournamentId: tournamentUuid || tournamentId,
+    tournamentNumericId: tournamentId,
+    tournamentUuid: tournamentUuid,
+    timestamp,
+    eventSeq,
+    status,
+    scoreSummary,
+    liveScoreSummary: scoreSummary,
+    subtext,
+    liveSubtext: subtext,
+    courtName: payload.courtName || payload.court_name || '',
+    celebration,
+    type,
+    state: sportState,
+    sportState,
+    sportSlug: payload.sportSlug || matchInfo?.sportSlug || null,
+    teamAScore: payload.teamAScore,
+    teamBScore: payload.teamBScore,
+    scoreA: payload.scoreA !== undefined ? payload.scoreA : payload.teamAScore,
+    scoreB: payload.scoreB !== undefined ? payload.scoreB : payload.teamBScore,
+    scores: payload.scores,
+    pickleball: payload.pickleball,
+    sidesSwapped: payload.sidesSwapped,
+    goldenPoint: payload.goldenPoint,
+    trackPlayerPoints: payload.trackPlayerPoints,
+    winnerTeamId: payload.winnerTeamId,
+    resultSummary: payload.resultSummary,
+    pointEvent: payload.pointEvent || null,
+    commentary: payload.commentary || null,
+    overCompleted: payload.overCompleted || false,
+    ballId: payload.ballId || null,
+    ...payload
+  };
+
+  // 1. Target Match and Stream Rooms (both numeric ID and UUID)
+  const matchRooms = new Set();
+  if (numericId) {
+    matchRooms.add(`match:${numericId}`);
+    matchRooms.add(`stream:${numericId}`);
+  }
+  if (uuidStr) {
+    matchRooms.add(`match:${uuidStr}`);
+    matchRooms.add(`stream:${uuidStr}`);
+  }
+  matchRooms.add(`match:${matchKey}`);
+  matchRooms.add(`stream:${matchKey}`);
+
+  // Emit to all match and stream rooms
+  for (const room of matchRooms) {
+    ioInstance.to(room).emit('score:updated', enriched);
+    ioInstance.to(room).emit('match:ballEvent', enriched);
+    ioInstance.to(room).emit('match:pointScored', enriched);
+    ioInstance.to(room).emit('tournament:matchUpdated', enriched);
+    ioInstance.to(room).emit('signage:matchUpdate', enriched);
+
+    if (enriched.type === 'UNDO') {
+      ioInstance.to(room).emit('match:undone', enriched);
+      ioInstance.to(room).emit('match:undoPoint', enriched);
+    }
+    if (enriched.sidesSwapped !== undefined) {
+      ioInstance.to(room).emit('match:sidesSwapped', enriched);
+    }
+    if (enriched.sportSlug === 'pickleball' || payload.pickleball || payload.teamAScore !== undefined) {
+      ioInstance.to(room).emit('match:pickleballScore', enriched);
+    }
+    if (enriched.sportSlug === 'badminton' || String(payload.type || '').includes('BADMINTON')) {
+      ioInstance.to(room).emit('match:badmintonEvent', enriched);
+      ioInstance.to(room).emit('match:badmintonPoint', enriched);
+    }
+    if (enriched.sportSlug === 'football' || String(payload.type || '').includes('FOOTBALL')) {
+      ioInstance.to(room).emit('match:footballEvent', enriched);
+    }
+    if (enriched.status) {
+      ioInstance.to(room).emit('match:statusChanged', enriched);
+    }
+    if (enriched.celebration) {
+      ioInstance.to(room).emit('signage:pointScored', enriched);
+    }
+  }
+
+  // 2. Target Tournament Rooms (for tournament scoreboard, digital signage, TV display)
+  const tourneyRooms = new Set();
+  if (tournamentId) tourneyRooms.add(`tournament:${tournamentId}`);
+  if (tournamentUuid) tourneyRooms.add(`tournament:${tournamentUuid}`);
+
+  for (const tRoom of tourneyRooms) {
+    ioInstance.to(tRoom).emit('tournament:matchUpdated', enriched);
+    ioInstance.to(tRoom).emit('signage:matchUpdate', enriched);
+    ioInstance.to(tRoom).emit('score:updated', enriched);
+    ioInstance.to(tRoom).emit('match:ballEvent', enriched);
+    ioInstance.to(tRoom).emit('match:pointScored', enriched);
+
+    if (enriched.type === 'UNDO') {
+      ioInstance.to(tRoom).emit('match:undone', enriched);
+      ioInstance.to(tRoom).emit('match:undoPoint', enriched);
+    }
+    if (enriched.sidesSwapped !== undefined) {
+      ioInstance.to(tRoom).emit('match:sidesSwapped', enriched);
+    }
+    if (enriched.sportSlug === 'pickleball' || payload.pickleball || payload.teamAScore !== undefined) {
+      ioInstance.to(tRoom).emit('match:pickleballScore', enriched);
+    }
+    if (enriched.sportSlug === 'badminton') {
+      ioInstance.to(tRoom).emit('match:badmintonEvent', enriched);
+    }
+    if (enriched.sportSlug === 'football') {
+      ioInstance.to(tRoom).emit('match:footballEvent', enriched);
+    }
+    if (enriched.celebration) {
+      ioInstance.to(tRoom).emit('signage:pointScored', enriched);
+    }
+    if (enriched.isCompleted || enriched.status === 'COMPLETED') {
+      ioInstance.to(tRoom).emit('tournament:standingsUpdated', {
+        tournamentId: tournamentUuid || tournamentId,
+        completedMatchId: uuidStr || numericId
+      });
+    }
   }
 }
 
 /**
- * Broadcast detailed ball/point event to Match and Tournament subscribers.
- * Includes score:updated, match:ballEvent, match:pointScored aliases for 100% display coverage.
+ * Backward-compatible helper for lightweight tournament match updates.
+ */
+function broadcastTournamentMatchUpdate(tournamentPublicId, matchData) {
+  const matchId = matchData.public_id || matchData.matchId || matchData.id;
+  broadcastScoreSync(matchId, {
+    tournamentId: tournamentPublicId,
+    ...matchData
+  }).catch(() => {});
+}
+
+/**
+ * Backward-compatible helper for detailed delivery/ball events.
  */
 function broadcastMatchBallEvent(matchPublicId, eventData) {
-  if (!ioInstance) return;
-  const matchRoom = `match:${matchPublicId}`;
-  const eventSeq = eventData.eventSeq || eventData.seq || Date.now();
-  const enriched = {
-    matchId: matchPublicId,
-    eventSeq,
-    timestamp: Date.now(),
-    ...eventData
-  };
-
-  // Emit to match room with all aliases used across web, mobile, TV, signage
-  ioInstance.to(matchRoom).emit('match:ballEvent', enriched);
-  ioInstance.to(matchRoom).emit('score:updated', enriched);
-  ioInstance.to(matchRoom).emit('match:pointScored', enriched);
-
-  // Cross-post strictly to tournament room if tournament ID is provided
-  const tId = eventData.tournamentId || eventData.tournamentPublicId || eventData.tournament_uuid;
-  if (tId) {
-    const tRoom = `tournament:${tId}`;
-    ioInstance.to(tRoom).emit('tournament:matchUpdated', {
-      matchId: matchPublicId,
-      tournamentId: tId,
-      status: eventData.status || 'LIVE',
-      liveScoreSummary: eventData.scoreSummary,
-      liveSubtext: eventData.subtext,
-      celebration: eventData.celebration,
-      type: eventData.type,
-      state: eventData.state,
-      eventSeq
-    });
-    ioInstance.to(tRoom).emit('match:ballEvent', enriched);
-    ioInstance.to(tRoom).emit('score:updated', enriched);
-    ioInstance.to(tRoom).emit('signage:pointScored', enriched);
-    ioInstance.to(tRoom).emit('signage:matchUpdate', {
-      matchId: matchPublicId,
-      tournamentId: tId,
-      status: eventData.status || 'LIVE',
-      liveScoreSummary: eventData.scoreSummary,
-      liveSubtext: eventData.subtext,
-      celebration: eventData.celebration,
-      type: eventData.type,
-      state: eventData.state,
-      eventSeq
-    });
-  }
+  broadcastScoreSync(matchPublicId, eventData).catch(() => {});
 }
 
 /**
@@ -467,87 +760,22 @@ function broadcastAuctionEvent(auctionPublicId, eventName, data) {
 }
 
 /**
- * Broadcast pickleball live score event to match and tournament rooms.
+ * Backward-compatible helper for pickleball live scoring.
  */
 function broadcastPickleballScore(matchPublicId, tournamentPublicId, payload) {
-  if (!ioInstance) return;
-  const matchRoom = `match:${matchPublicId}`;
-  const eventSeq = payload.eventSeq || (payload.state?.eventSeq || Date.now());
-  const enrichedPayload = {
-    matchId: matchPublicId,
+  broadcastScoreSync(matchPublicId, {
     tournamentId: tournamentPublicId,
-    eventSeq,
-    type: payload.type || 'POINT',
-    scoreSummary: payload.scoreSummary || `${payload.teamAScore} - ${payload.teamBScore}`,
+    sportSlug: 'pickleball',
     ...payload
-  };
-  ioInstance.to(matchRoom).emit('match:pickleballScore', enrichedPayload);
-
-  if (payload.pointEvent || payload.type === 'POINT_SCORED') {
-    const ptEvent = payload.pointEvent || {
-      type: 'POINT_SCORED',
-      matchId: matchPublicId,
-      tournamentId: tournamentPublicId,
-      eventId: payload.eventId || `pt-${matchPublicId}-${eventSeq}`,
-      seq: eventSeq,
-      from: payload.from,
-      to: payload.to,
-      timestamp: Date.now()
-    };
-    ioInstance.to(matchRoom).emit('match:pointScored', ptEvent);
-    if (tournamentPublicId) {
-      ioInstance.to(`tournament:${tournamentPublicId}`).emit('signage:pointScored', ptEvent);
-    }
-  } else if (payload.type === 'UNDO') {
-    const undoEvent = { matchId: matchPublicId, tournamentId: tournamentPublicId, type: 'UNDO', timestamp: Date.now() };
-    ioInstance.to(matchRoom).emit('match:undoPoint', undoEvent);
-    if (tournamentPublicId) {
-      ioInstance.to(`tournament:${tournamentPublicId}`).emit('signage:pointScored', undoEvent);
-    }
-  }
-
-  if (payload.sidesSwapped !== undefined || payload.type === 'SIDES_SWAPPED') {
-    const sidesEvt = {
-      matchId: matchPublicId,
-      tournamentId: tournamentPublicId,
-      sidesSwapped: Boolean(payload.sidesSwapped ?? payload.sportState?.sidesSwapped ?? payload.state?.sidesSwapped)
-    };
-    ioInstance.to(matchRoom).emit('match:sidesSwapped', sidesEvt);
-    if (tournamentPublicId) {
-      ioInstance.to(`tournament:${tournamentPublicId}`).emit('match:sidesSwapped', sidesEvt);
-    }
-  }
-
-  if (tournamentPublicId) {
-    const tourneyRoom = `tournament:${tournamentPublicId}`;
-    ioInstance.to(tourneyRoom).emit('tournament:matchUpdated', {
-      matchId: matchPublicId,
-      tournamentId: tournamentPublicId,
-      status: payload.status,
-      liveScoreSummary: enrichedPayload.scoreSummary,
-      liveSubtext: payload.liveSubtext,
-      teamAScore: payload.teamAScore,
-      teamBScore: payload.teamBScore,
-      winnerTeamId: payload.winnerTeamId,
-      resultSummary: payload.resultSummary,
-      state: payload.state,
-      eventSeq,
-      type: enrichedPayload.type,
-      pointEvent: payload.pointEvent
-    });
-
-    if (payload.isCompleted) {
-      ioInstance.to(tourneyRoom).emit('tournament:standingsUpdated', {
-        tournamentId: tournamentPublicId,
-        completedMatchId: matchPublicId
-      });
-    }
-  }
+  }).catch(() => {});
 }
 
 module.exports = {
   initSocket,
   getIO,
+  resolveMatchIdentifiers,
+  resolveTournamentIdentifiers,
+  broadcastScoreSync,
   broadcastTournamentMatchUpdate,
   broadcastMatchBallEvent,
   broadcastSignageEvent,

@@ -1,5 +1,5 @@
 const db = require('../config/database');
-const { broadcastTournamentMatchUpdate, getIO } = require('./socketService');
+const { broadcastTournamentMatchUpdate, getIO, broadcastScoreSync } = require('./socketService');
 const { recalculateStandings, advanceKnockoutWinner } = require('./tournamentEngineService');
 
 /**
@@ -954,42 +954,20 @@ async function undoPoint(matchPublicId, user) {
  * Socket.IO Broadcaster Helper for Badminton
  */
 function broadcastBadmintonEvent(match, payload) {
-  const io = getIO();
-  if (!io) return;
+  const matchId = match.uuid || match.id;
+  const tournamentId = match.tournament_public_id || match.tournament_id;
 
-  const matchRoom = `match:${match.uuid}`;
-  const tourneyRoom = `tournament:${match.tournament_public_id}`;
-
-  const eventSeq = payload.eventSeq || (payload.state?.eventSeq || Date.now());
-  const enrichedPayload = {
-    matchId: match.uuid,
-    eventSeq,
-    timestamp: Date.now(),
-    ...payload
-  };
-
-  io.to(matchRoom).emit('match:badmintonEvent', enrichedPayload);
-  io.to(matchRoom).emit('match:badmintonPoint', enrichedPayload);
-  io.to(matchRoom).emit('match:ballEvent', enrichedPayload);
-  io.to(matchRoom).emit('score:updated', enrichedPayload);
-  io.to(matchRoom).emit('match:pointScored', enrichedPayload);
-  io.emit('signage:pointScored', enrichedPayload);
-
-  const summaryPayload = {
-    matchId: match.uuid,
+  broadcastScoreSync(matchId, {
+    tournamentId,
+    sportSlug: 'badminton',
     status: payload.status || match.status,
-    liveScoreSummary: payload.scoreSummary || match.live_score_summary,
-    liveSubtext: payload.liveSubtext || match.live_subtext,
-    state: payload.state,
-    eventSeq,
-    type: payload.type || 'POINT',
-    scoringSide: payload.scoringSide,
+    scoreSummary: payload.scoreSummary || match.live_score_summary,
+    subtext: payload.liveSubtext || match.live_subtext,
     celebration: payload.celebration || (payload.isMatchPoint ? 'MATCH_POINT' : (payload.isGamePoint ? 'GAME_POINT' : null)),
-    timestamp: enrichedPayload.timestamp
-  };
-
-  io.to(tourneyRoom).emit('tournament:matchUpdated', summaryPayload);
-  io.emit('signage:matchUpdate', summaryPayload);
+    ...payload
+  }).catch((e) => {
+    console.warn('[BadmintonScorer] broadcastScoreSync note:', e.message);
+  });
 }
 
 module.exports = {

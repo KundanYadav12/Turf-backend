@@ -1,4 +1,5 @@
 const db = require('../config/database');
+const { optimizeUpload } = require('../services/imageService');
 
 const getAllVenues = async (req, res, next) => {
   try {
@@ -214,7 +215,13 @@ const createVenue = async (req, res, next) => {
 
     // Attach sample image if uploaded
     if (req.file) {
-      const imageUrl = `/uploads/${req.file.filename}`;
+      let imageUrl = `/uploads/${req.file.filename}`;
+      try {
+        const processed = await optimizeUpload(req.file.path, { type: 'venue' });
+        imageUrl = processed.url;
+      } catch (imgErr) {
+        console.warn('[VenueUpload] Optimization fallback:', imgErr.message);
+      }
       await db.query(
         `INSERT INTO venue_images (venue_id, image_url, is_primary) VALUES (?, ?, 1)`,
         [venueId, imageUrl]

@@ -20,6 +20,8 @@ const migrations = [
   'migrate_tournament_data_isolation.js',
   'migrate_player_point_tracking.js',
   'migrate_golden_point.js',
+  'migrate_mobile_app_updates.js',
+  'migrate_corner_logos.js',
   'seed_superadmin.js'
 ];
 

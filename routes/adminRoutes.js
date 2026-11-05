@@ -32,4 +32,22 @@ router.get('/account-deletions/:userId', accountDeletionController.getAdminDelet
 router.post('/account-deletions/:userId/restore', accountDeletionController.restoreAccount);
 router.post('/account-deletions/:userId/permanent-delete', accountDeletionController.permanentDeleteAccount);
 
+// Mobile App Update Management (Super Admin)
+const appUpdateController = require('../controllers/appUpdateController');
+const updateUpload = require('../middleware/updateUploadMiddleware');
+
+router.get('/mobile-updates/analytics', appUpdateController.getAnalytics);
+router.get('/mobile-updates/releases', appUpdateController.getReleases);
+router.post(
+  '/mobile-updates/releases',
+  updateUpload.fields([
+    { name: 'bundle', maxCount: 1 },
+    { name: 'apk', maxCount: 1 }
+  ]),
+  appUpdateController.createRelease
+);
+router.post('/mobile-updates/releases/:id/publish', appUpdateController.publishRelease);
+router.post('/mobile-updates/releases/:id/rollback', appUpdateController.rollbackRelease);
+router.delete('/mobile-updates/releases/:id', appUpdateController.deleteRelease);
+
 module.exports = router;

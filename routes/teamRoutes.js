@@ -20,10 +20,10 @@ router.get('/', optionalAuthenticateUser, teamController.discoverTeams);
 router.get('/:id', optionalAuthenticateUser, teamController.getTeamById);
 
 // 6. POST /api/teams - Create Team
-router.post('/', authenticateUser, teamController.createTeam);
+router.post('/', authenticateUser, upload.single('logo'), teamController.createTeam);
 
 // 7. PUT /api/teams/:id - Update Team
-router.put('/:id', authenticateUser, teamController.updateTeam);
+router.put('/:id', authenticateUser, upload.single('logo'), teamController.updateTeam);
 
 // 8. DELETE /api/teams/:id - Delete Team
 router.delete('/:id', authenticateUser, teamController.deleteTeam);

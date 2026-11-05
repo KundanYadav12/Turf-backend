@@ -8,6 +8,49 @@ const { requireScorerForMatch } = require('../middleware/scorerAuthMiddleware');
 const db = require('../config/database');
 const { getIO } = require('../services/socketService');
 
+// In-Memory Async Scoring Mutex per Match
+// Prevents duplicate score points from rapid double-clicks and guarantees strict sequential execution
+const matchScoringMutexes = new Map();
+const recentScoringActionSignatures = new Map();
+
+async function withMatchLock(matchId, actionFn) {
+  const key = String(matchId).trim();
+  const prevPromise = matchScoringMutexes.get(key) || Promise.resolve();
+  let release;
+  const nextLockPromise = new Promise((resolve) => { release = resolve; });
+  matchScoringMutexes.set(key, prevPromise.then(() => nextLockPromise));
+
+  try {
+    await prevPromise;
+    return await actionFn();
+  } finally {
+    release();
+    if (matchScoringMutexes.get(key) === nextLockPromise) {
+      matchScoringMutexes.delete(key);
+    }
+  }
+}
+
+/**
+ * Checks for rapid double-click idempotency within 300ms window
+ */
+function checkScoringDebounce(matchId, userId, actionKey) {
+  const key = `${matchId}_${userId}_${actionKey}`;
+  const now = Date.now();
+  const lastTime = recentScoringActionSignatures.get(key);
+  if (lastTime && (now - lastTime) < 300) {
+    return true; // Too fast, double click detected
+  }
+  recentScoringActionSignatures.set(key, now);
+  // Keep cache small
+  if (recentScoringActionSignatures.size > 1000) {
+    for (const [k, t] of recentScoringActionSignatures) {
+      if (now - t > 10000) recentScoringActionSignatures.delete(k);
+    }
+  }
+  return false;
+}
+
 // 0. GET /api/matches/live - All active LIVE matches across the platform (concurrent/multi-tournament)
 router.get('/live', async (req, res, next) => {
   try {
@@ -254,19 +297,28 @@ router.post('/:id/deliveries', authenticateUser, requireScorerForMatch, async (r
       commentary = null
     } = req.body;
 
-    const result = await cricketScorerService.recordDelivery({
-      matchPublicId: req.params.id,
-      runs,
-      extraType,
-      extraRuns: parseInt(extraRuns, 10) || 0,
-      isWicket: Boolean(isWicket),
-      wicketType,
-      dismissedPlayerId,
-      fielderId: fielderId || req.body.caughtById || req.body.runOutById || null,
-      newBatterId,
-      commentary,
-      userId: req.user.id,
-      userRole: req.user.role
+    // Check rapid duplicate submission
+    const actionSig = `ball_${runs}_${extraType}_${isWicket}`;
+    if (checkScoringDebounce(req.params.id, req.user?.id, actionSig)) {
+      const state = await cricketScorerService.getScorerState(req.params.id);
+      return res.json({ success: true, duplicated: true, state });
+    }
+
+    const result = await withMatchLock(req.params.id, async () => {
+      return await cricketScorerService.recordDelivery({
+        matchPublicId: req.params.id,
+        runs,
+        extraType,
+        extraRuns: parseInt(extraRuns, 10) || 0,
+        isWicket: Boolean(isWicket),
+        wicketType,
+        dismissedPlayerId,
+        fielderId: fielderId || req.body.caughtById || req.body.runOutById || null,
+        newBatterId,
+        commentary,
+        userId: req.user.id,
+        userRole: req.user.role
+      });
     });
 
     res.json(result);
@@ -314,7 +366,9 @@ router.get('/:id/undo-history', async (req, res, next) => {
 // 8. POST /api/matches/:id/undo - Universal Undo Last Action Atomically (Protected)
 router.post('/:id/undo', authenticateUser, async (req, res, next) => {
   try {
-    const result = await universalUndoService.performUndo(req.params.id, req.user);
+    const result = await withMatchLock(req.params.id, async () => {
+      return await universalUndoService.performUndo(req.params.id, req.user);
+    });
     res.json(result);
   } catch (error) {
     next(error);
@@ -324,7 +378,9 @@ router.post('/:id/undo', authenticateUser, async (req, res, next) => {
 // Also support sport-specific undo aliases for backwards compatibility
 router.post('/:id/cricket/undo', authenticateUser, async (req, res, next) => {
   try {
-    const result = await universalUndoService.performUndo(req.params.id, req.user);
+    const result = await withMatchLock(req.params.id, async () => {
+      return await universalUndoService.performUndo(req.params.id, req.user);
+    });
     res.json(result);
   } catch (error) {
     next(error);
@@ -402,7 +458,15 @@ router.post('/:id/pickleball/start', authenticateUser, requireScorerForMatch, as
 // 14. POST /api/matches/:id/pickleball/point - Record Point (+1 Team A / +1 Team B)
 router.post('/:id/pickleball/point', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
-    const data = await pickleballService.recordPoint(req.params.id, req.body, req.user);
+    const { teamScored, playerId } = req.body;
+    const actionSig = `pb_point_${teamScored}_${playerId || ''}`;
+    if (checkScoringDebounce(req.params.id, req.user?.id, actionSig)) {
+      const data = await pickleballService.getScorerState(req.params.id);
+      return res.json({ success: true, duplicated: true, message: 'Point recorded!', data });
+    }
+    const data = await withMatchLock(req.params.id, async () => {
+      return await pickleballService.recordPoint(req.params.id, req.body, req.user);
+    });
     res.json({ success: true, message: 'Point recorded!', data });
   } catch (error) {
     next(error);
@@ -412,7 +476,9 @@ router.post('/:id/pickleball/point', authenticateUser, requireScorerForMatch, as
 // 15. POST /api/matches/:id/pickleball/undo - Undo Last Point
 router.post('/:id/pickleball/undo', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
-    const data = await pickleballService.undoPoint(req.params.id, req.user);
+    const data = await withMatchLock(req.params.id, async () => {
+      return await pickleballService.undoPoint(req.params.id, req.user);
+    });
     res.json({ success: true, message: 'Last action undone!', data });
   } catch (error) {
     next(error);
@@ -508,7 +574,15 @@ router.post('/:id/football/period', authenticateUser, requireScorerForMatch, asy
 // 20. POST /api/matches/:id/football/goal - Record Goal
 router.post('/:id/football/goal', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
-    const data = await footballScorerService.recordGoal(req.params.id, req.body, req.user);
+    const { teamId, playerId } = req.body;
+    const actionSig = `fb_goal_${teamId}_${playerId || ''}`;
+    if (checkScoringDebounce(req.params.id, req.user?.id, actionSig)) {
+      const data = await footballScorerService.getScorerState(req.params.id);
+      return res.json({ success: true, duplicated: true, data });
+    }
+    const data = await withMatchLock(req.params.id, async () => {
+      return await footballScorerService.recordGoal(req.params.id, req.body, req.user);
+    });
     res.json(data);
   } catch (error) {
     next(error);
@@ -538,7 +612,9 @@ router.post('/:id/football/sub', authenticateUser, requireScorerForMatch, async 
 // 23. POST /api/matches/:id/football/undo - Undo Last Event
 router.post('/:id/football/undo', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
-    const data = await footballScorerService.undoLastEvent(req.params.id, req.user);
+    const data = await withMatchLock(req.params.id, async () => {
+      return await footballScorerService.undoLastEvent(req.params.id, req.user);
+    });
     res.json(data);
   } catch (error) {
     next(error);
@@ -594,7 +670,15 @@ router.post('/:id/badminton/start', authenticateUser, requireScorerForMatch, asy
 // 28. POST /api/matches/:id/badminton/point - Record Point (+1 Side A / Side B)
 router.post('/:id/badminton/point', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
-    const data = await badmintonScorerService.recordPoint(req.params.id, req.body, req.user);
+    const { sideScored, playerId } = req.body;
+    const actionSig = `bm_point_${sideScored}_${playerId || ''}`;
+    if (checkScoringDebounce(req.params.id, req.user?.id, actionSig)) {
+      const data = await badmintonScorerService.getScorerState(req.params.id);
+      return res.json({ success: true, duplicated: true, data });
+    }
+    const data = await withMatchLock(req.params.id, async () => {
+      return await badmintonScorerService.recordPoint(req.params.id, req.body, req.user);
+    });
     res.json(data);
   } catch (error) {
     next(error);
@@ -604,7 +688,9 @@ router.post('/:id/badminton/point', authenticateUser, requireScorerForMatch, asy
 // 29. POST /api/matches/:id/badminton/undo - Undo Last Point
 router.post('/:id/badminton/undo', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {
-    const data = await badmintonScorerService.undoPoint(req.params.id, req.user);
+    const data = await withMatchLock(req.params.id, async () => {
+      return await badmintonScorerService.undoPoint(req.params.id, req.user);
+    });
     res.json(data);
   } catch (error) {
     next(error);

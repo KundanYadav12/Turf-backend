@@ -1,5 +1,5 @@
 const db = require('../config/database');
-const { broadcastTournamentMatchUpdate, getIO } = require('./socketService');
+const { broadcastTournamentMatchUpdate, getIO, broadcastScoreSync } = require('./socketService');
 const { recalculateStandings, advanceKnockoutWinner } = require('./tournamentEngineService');
 
 /**
@@ -533,39 +533,20 @@ async function completeMatch(matchPublicId, { winnerTeamId, resultSummary }, use
  * Socket.IO Broadcaster Helper for Football Events
  */
 function broadcastFootballEvent(match, payload) {
-  const io = getIO();
-  if (!io) return;
+  const matchId = match.uuid || match.id;
+  const tournamentId = match.tournament_public_id || match.tournament_id;
 
-  const matchRoom = `match:${match.uuid}`;
-  const tourneyRoom = `tournament:${match.tournament_public_id}`;
-
-  const enriched = {
-    matchId: match.uuid,
-    timestamp: Date.now(),
-    eventSeq: payload.eventSeq || Date.now(),
-    ...payload
-  };
-
-  io.to(matchRoom).emit('match:footballEvent', enriched);
-  io.to(matchRoom).emit('match:ballEvent', enriched);
-  io.to(matchRoom).emit('score:updated', enriched);
-  io.to(matchRoom).emit('match:pointScored', enriched);
-
-  const summaryPayload = {
-    matchId: match.uuid,
+  broadcastScoreSync(matchId, {
+    tournamentId,
+    sportSlug: 'football',
     status: payload.status || match.status,
-    liveScoreSummary: payload.scoreSummary || match.live_score_summary,
-    liveSubtext: payload.commentary || payload.period || match.live_subtext,
-    celebration: payload.celebration || null,
-    eventSeq: enriched.eventSeq,
-    timestamp: enriched.timestamp
-  };
-
-  io.to(tourneyRoom).emit('tournament:matchUpdated', summaryPayload);
-  io.emit('signage:matchUpdate', summaryPayload);
-  if (payload.celebration || payload.type === 'GOAL') {
-    io.emit('signage:pointScored', enriched);
-  }
+    scoreSummary: payload.scoreSummary || match.live_score_summary,
+    subtext: payload.commentary || payload.period || match.live_subtext,
+    celebration: payload.celebration || (payload.type === 'GOAL' ? 'GOAL' : null),
+    ...payload
+  }).catch((e) => {
+    console.warn('[FootballScorer] broadcastScoreSync note:', e.message);
+  });
 }
 
 module.exports = {

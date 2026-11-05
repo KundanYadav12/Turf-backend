@@ -4,6 +4,7 @@ const advertisementService = require('../services/advertisementService');
 const { authenticateUser } = require('../middleware/authMiddleware');
 const { authorizeRoles } = require('../middleware/rbacMiddleware');
 const upload = require('../middleware/multerMiddleware');
+const { optimizeUpload } = require('../services/imageService');
 
 // 1. GET /api/advertisements/active - Public signage, TV & mobile active ads feed
 router.get('/active', async (req, res, next) => {
@@ -88,7 +89,13 @@ router.post(
     try {
       let imageUrl = req.body.imageUrl;
       if (req.file) {
-        imageUrl = `/uploads/${req.file.filename}`;
+        try {
+          const processed = await optimizeUpload(req.file.path, { type: 'advertisement' });
+          imageUrl = processed.url;
+        } catch (imgErr) {
+          console.warn('[AdUpload] Optimization fallback:', imgErr.message);
+          imageUrl = `/uploads/${req.file.filename}`;
+        }
       }
 
       if (!imageUrl) {
@@ -123,7 +130,13 @@ router.put(
     try {
       let imageUrl = req.body.imageUrl;
       if (req.file) {
-        imageUrl = `/uploads/${req.file.filename}`;
+        try {
+          const processed = await optimizeUpload(req.file.path, { type: 'advertisement' });
+          imageUrl = processed.url;
+        } catch (imgErr) {
+          console.warn('[AdUpload] Optimization fallback:', imgErr.message);
+          imageUrl = `/uploads/${req.file.filename}`;
+        }
       }
 
       const updated = await advertisementService.updateAd(req.params.id, {

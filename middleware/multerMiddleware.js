@@ -19,14 +19,15 @@ const storage = multer.diskStorage({
 });
 
 const fileFilter = (req, file, cb) => {
-  const allowedTypes = /jpeg|jpg|png|webp/;
+  const allowedTypes = /jpeg|jpg|png|webp|svg/;
   const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-  const mimetype = allowedTypes.test(file.mimetype);
+  const isSvg = file.mimetype === 'image/svg+xml' || path.extname(file.originalname).toLowerCase() === '.svg';
+  const mimetype = allowedTypes.test(file.mimetype) || isSvg;
 
   if (extname && mimetype) {
     return cb(null, true);
   } else {
-    cb(new Error('Only images (JPEG, JPG, PNG, WEBP) are allowed.'));
+    cb(new Error('Only images (JPEG, JPG, PNG, WEBP, SVG) are allowed.'));
   }
 };
 
