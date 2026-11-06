@@ -25,29 +25,30 @@ async function getDisplayData(req, res, next) {
     let tvConfig = null;
     let tournamentId = null;
 
-    // 1. Try to find existing TV display by UUID or ID
-    const displays = await db.query(`
-      SELECT * FROM tv_displays WHERE uuid = ? OR id = ?
-    `, [displayId, /^\d+$/.test(displayId) ? parseInt(displayId, 10) : -1]);
+    const strId = String(displayId || '').trim();
+    const isNum = /^\d+$/.test(strId);
 
-    if (displays.length > 0) {
+    // 1. Try to find existing TV display by UUID or ID (Strictly typed)
+    const displays = isNum
+      ? await db.query('SELECT * FROM tv_displays WHERE id = ? LIMIT 1', [parseInt(strId, 10)])
+      : await db.query('SELECT * FROM tv_displays WHERE uuid = ? LIMIT 1', [strId]);
+
+    if (displays && displays.length > 0) {
       tvConfig = displays[0];
       tournamentId = tvConfig.tournament_id;
       // Update last seen
       await db.query('UPDATE tv_displays SET last_seen_at = NOW() WHERE id = ?', [tvConfig.id]);
     } else {
-      // 2. Check if displayId matches a tournament UUID or ID
-      const tournaments = await db.query(`
-        SELECT id, uuid, name FROM tournaments WHERE uuid = ? OR id = ?
-      `, [displayId, /^\d+$/.test(displayId) ? parseInt(displayId, 10) : -1]);
+      // 2. Check if displayId matches a tournament UUID or ID strictly
+      const tour = await tournamentService.resolveTournamentStrict(strId);
 
-      if (tournaments.length > 0) {
-        tournamentId = tournaments[0].id;
+      if (tour) {
+        tournamentId = tour.id;
         // Default virtual TV config for this tournament
         tvConfig = {
           id: null,
-          uuid: `tv_tourn_${tournaments[0].uuid}`,
-          name: `${tournaments[0].name} TV Display`,
+          uuid: `tv_tourn_${tour.uuid}`,
+          name: `${tour.name} TV Display`,
           tournament_id: tournamentId,
           layout_type: 'AUTO',
           orientation: 'AUTO',
@@ -63,6 +64,39 @@ async function getDisplayData(req, res, next) {
           theme: 'dark',
           animation_speed: 'normal'
         };
+      } else {
+        // 3. Match fallback: if displayId matches a specific match, show its tournament with this match featured
+        const matchRows = isNum
+          ? await db.query('SELECT id, uuid, tournament_id FROM tournament_matches WHERE id = ? LIMIT 1', [parseInt(strId, 10)])
+          : await db.query('SELECT id, uuid, tournament_id FROM tournament_matches WHERE uuid = ? LIMIT 1', [strId]);
+
+        if (matchRows && matchRows.length > 0) {
+          const m = matchRows[0];
+          const matchTour = await tournamentService.resolveTournamentStrict(m.tournament_id);
+          if (matchTour) {
+            tournamentId = matchTour.id;
+            tvConfig = {
+              id: null,
+              uuid: `tv_match_${m.uuid || m.id}`,
+              name: `${matchTour.name} TV Display`,
+              tournament_id: tournamentId,
+              featured_match_id: m.uuid || String(m.id),
+              layout_type: 'AUTO',
+              orientation: 'AUTO',
+              sidebars_mode: 'STRIP',
+              match_count: 4,
+              rotation_enabled: true,
+              rotation_interval: 15,
+              active_scenes: ['SCOREBOARD', 'FIXTURES', 'STANDINGS', 'SPONSORS', 'RESULTS'],
+              ad_top_enabled: true,
+              ad_bottom_enabled: true,
+              ad_sidebars_enabled: true,
+              ad_center_enabled: false,
+              theme: 'dark',
+              animation_speed: 'normal'
+            };
+          }
+        }
       }
     }
 

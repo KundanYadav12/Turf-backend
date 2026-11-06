@@ -757,8 +757,21 @@ async function getOBSOverlayData(matchId) {
 /**
  * List all active streams across the platform (for Live Now tab)
  */
-async function getActiveLiveStreams() {
+async function getActiveLiveStreams(tournamentId = null) {
   try {
+    let whereClause = `WHERE ms.status IN ('LIVE', 'PREVIEW')`;
+    const params = [];
+    if (tournamentId) {
+      const str = String(tournamentId).trim();
+      const isNum = /^\d+$/.test(str);
+      if (isNum) {
+        whereClause += ` AND t.id = ?`;
+        params.push(parseInt(str, 10));
+      } else {
+        whereClause += ` AND t.uuid = ?`;
+        params.push(str);
+      }
+    }
     const rows = await db.query(
       `SELECT 
         ms.uuid as stream_id, ms.streaming_method, ms.status, ms.title,
@@ -774,8 +787,9 @@ async function getActiveLiveStreams() {
        JOIN sports s ON t.sport_id = s.id
        LEFT JOIN teams ta ON tm.team_a_id = ta.id
        LEFT JOIN teams tb ON tm.team_b_id = tb.id
-       WHERE ms.status IN ('LIVE', 'PREVIEW')
-       ORDER BY ms.status = 'LIVE' DESC, ms.viewer_count DESC, ms.actual_start DESC`
+       ${whereClause}
+       ORDER BY ms.status = 'LIVE' DESC, ms.viewer_count DESC, ms.actual_start DESC`,
+      params
     );
 
     return rows.map((r) => ({

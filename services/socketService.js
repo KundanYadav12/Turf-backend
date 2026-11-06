@@ -19,39 +19,33 @@ async function resolveMatchIdentifiers(matchKey) {
   try {
     const db = require('../config/database');
     const isNum = /^\d+$/.test(keyStr);
-    let rows;
-    if (isNum) {
-      const [r] = await db.query(
-        'SELECT id, uuid, tournament_id, sport_slug, status, live_score_summary, live_subtext, sport_state FROM tournament_matches WHERE id = ? LIMIT 1',
-        [parseInt(keyStr, 10)]
-      );
-      rows = r;
-    } else {
-      const [r] = await db.query(
-        'SELECT id, uuid, tournament_id, sport_slug, status, live_score_summary, live_subtext, sport_state FROM tournament_matches WHERE uuid = ? LIMIT 1',
-        [keyStr]
-      );
-      rows = r;
-    }
+    const rows = isNum
+      ? await db.query(
+          `SELECT tm.id, tm.uuid, tm.tournament_id, tm.status, tm.live_score_summary, tm.live_subtext, tm.sport_state,
+                  t.uuid as tournament_uuid, s.slug as sport_slug
+           FROM tournament_matches tm
+           LEFT JOIN tournaments t ON tm.tournament_id = t.id
+           LEFT JOIN sports s ON t.sport_id = s.id
+           WHERE tm.id = ? LIMIT 1`,
+          [parseInt(keyStr, 10)]
+        )
+      : await db.query(
+          `SELECT tm.id, tm.uuid, tm.tournament_id, tm.status, tm.live_score_summary, tm.live_subtext, tm.sport_state,
+                  t.uuid as tournament_uuid, s.slug as sport_slug
+           FROM tournament_matches tm
+           LEFT JOIN tournaments t ON tm.tournament_id = t.id
+           LEFT JOIN sports s ON t.sport_id = s.id
+           WHERE tm.uuid = ? LIMIT 1`,
+          [keyStr]
+        );
 
-    if (rows && rows.length > 0) {
+    if (Array.isArray(rows) && rows.length > 0) {
       const row = rows[0];
-      let tourneyUuid = null;
-      if (row.tournament_id) {
-        try {
-          const [tRows] = await db.query(
-            'SELECT id, uuid FROM tournaments WHERE id = ? LIMIT 1',
-            [row.tournament_id]
-          );
-          if (tRows && tRows.length > 0) tourneyUuid = tRows[0].uuid;
-        } catch (te) {}
-      }
-
       const matchData = {
         id: row.id,
         uuid: row.uuid,
         tournamentId: row.tournament_id,
-        tournamentUuid: tourneyUuid,
+        tournamentUuid: row.tournament_uuid,
         sportSlug: row.sport_slug,
         status: row.status,
         liveScoreSummary: row.live_score_summary,
@@ -82,22 +76,17 @@ async function resolveTournamentIdentifiers(tournKey) {
   try {
     const db = require('../config/database');
     const isNum = /^\d+$/.test(keyStr);
-    let rows;
-    if (isNum) {
-      const [r] = await db.query(
-        'SELECT id, uuid FROM tournaments WHERE id = ? LIMIT 1',
-        [parseInt(keyStr, 10)]
-      );
-      rows = r;
-    } else {
-      const [r] = await db.query(
-        'SELECT id, uuid FROM tournaments WHERE uuid = ? LIMIT 1',
-        [keyStr]
-      );
-      rows = r;
-    }
+    const rows = isNum
+      ? await db.query(
+          'SELECT id, uuid FROM tournaments WHERE id = ? LIMIT 1',
+          [parseInt(keyStr, 10)]
+        )
+      : await db.query(
+          'SELECT id, uuid FROM tournaments WHERE uuid = ? LIMIT 1',
+          [keyStr]
+        );
 
-    if (rows && rows.length > 0) {
+    if (Array.isArray(rows) && rows.length > 0) {
       const tData = { id: rows[0].id, uuid: rows[0].uuid };
       tournamentIdentifierCache.set(String(rows[0].id), tData);
       tournamentIdentifierCache.set(String(rows[0].uuid), tData);

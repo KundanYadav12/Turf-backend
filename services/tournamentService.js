@@ -131,38 +131,56 @@ const getTournamentsPaginated = async ({
 };
 
 /**
+ * Strict resolution of tournament by either numeric ID or string UUID.
+ * NEVER compares UUID against integer to prevent MySQL type coercion
+ * (e.g. '09f43f1b...' = 9 evaluates to TRUE in MySQL).
+ */
+const resolveTournamentStrict = async (idOrUuid) => {
+  if (!idOrUuid) return null;
+  const str = String(idOrUuid).trim();
+  const isNum = /^\d+$/.test(str);
+  const rows = isNum
+    ? await db.query(
+        `SELECT t.*, s.name as sport_name, s.slug as sport_slug,
+                v.name as venue_name, v.city as venue_city, v.owner_id as venue_owner_id
+         FROM tournaments t
+         LEFT JOIN sports s ON t.sport_id = s.id
+         LEFT JOIN venues v ON t.venue_id = v.id
+         WHERE t.id = ? LIMIT 1`,
+        [parseInt(str, 10)]
+      )
+    : await db.query(
+        `SELECT t.*, s.name as sport_name, s.slug as sport_slug,
+                v.name as venue_name, v.city as venue_city, v.owner_id as venue_owner_id
+         FROM tournaments t
+         LEFT JOIN sports s ON t.sport_id = s.id
+         LEFT JOIN venues v ON t.venue_id = v.id
+         WHERE t.uuid = ? LIMIT 1`,
+        [str]
+      );
+  return rows && rows.length > 0 ? rows[0] : null;
+};
+
+/**
  * Returns single tournament overview details.
  */
 const getTournamentByPublicId = async (publicId) => {
-  const rows = await db.query(
-    `SELECT 
-      t.id, t.uuid as public_id, t.name, t.description, t.format,
-      t.banner_url, t.max_teams, t.court_color,
-      t.start_date, t.end_date, t.status, t.rules, t.has_auction,
-      t.created_by, t.venue_id, v.owner_id as venue_owner_id,
-      t.match_format, t.target_score, t.win_by_two, t.max_score, t.roster_size, t.groups_count,
-      t.sport_config,
-      COALESCE(t.total_views, 0) as total_views,
-      COALESCE(t.unique_viewers, 0) as unique_viewers,
-      t.last_viewed_at,
-      COALESCE(v.city, 'Mumbai') as city,
-      s.name as sport_name, s.slug as sport_slug,
-      v.name as venue_name, v.address as venue_address,
-      (SELECT COUNT(*) FROM tournament_teams tt WHERE tt.tournament_id = t.id AND tt.registration_status = 'APPROVED') as registered_teams_count,
-      (SELECT uuid FROM tournament_auctions ta WHERE ta.tournament_id = t.id LIMIT 1) as auction_id,
-      (SELECT status FROM tournament_auctions ta WHERE ta.tournament_id = t.id LIMIT 1) as auction_status
-     FROM tournaments t
-     JOIN sports s ON t.sport_id = s.id
-     LEFT JOIN venues v ON t.venue_id = v.id
-     WHERE t.uuid = ? OR t.id = ?`,
-    [publicId, /^\d+$/.test(String(publicId).trim()) ? parseInt(publicId, 10) : -1]
-  );
-
-  if (!rows || rows.length === 0) {
+  const t = await resolveTournamentStrict(publicId);
+  if (!t) {
     return null;
   }
 
-  const t = rows[0];
+  const [counts] = await db.query(
+    `SELECT 
+      (SELECT COUNT(*) FROM tournament_teams tt WHERE tt.tournament_id = ? AND tt.registration_status = 'APPROVED') as registered_teams_count,
+      (SELECT uuid FROM tournament_auctions ta WHERE ta.tournament_id = ? LIMIT 1) as auction_id,
+      (SELECT status FROM tournament_auctions ta WHERE ta.tournament_id = ? LIMIT 1) as auction_status`,
+    [t.id, t.id, t.id]
+  );
+  const registeredTeamsCount = counts?.registered_teams_count || 0;
+  const auctionId = counts?.auction_id || null;
+  const auctionStatus = counts?.auction_status || null;
+
   let parsedSportConfig = {};
   try {
     parsedSportConfig = typeof t.sport_config === 'string' ? JSON.parse(t.sport_config) : (t.sport_config || {});
@@ -171,12 +189,13 @@ const getTournamentByPublicId = async (publicId) => {
   const scoringMode = parsedSportConfig?.scoringMode || 'RALLY';
 
   return {
-    id: t.public_id,
+    id: t.uuid,
+    public_id: t.uuid,
     internalId: t.id,
     name: t.name,
     description: t.description,
     format: t.format,
-    city: t.city,
+    city: t.venue_city || t.city || 'Mumbai',
     bannerUrl: t.banner_url,
     courtColor: t.court_color || '#0d5c3a',
     dates: {
@@ -185,19 +204,19 @@ const getTournamentByPublicId = async (publicId) => {
     },
     maxTeams: t.max_teams,
     totalTeams: t.max_teams,
-    registeredTeams: parseInt(t.registered_teams_count, 10) || 0,
-    registeredTeamsCount: parseInt(t.registered_teams_count, 10) || 0,
-    teamsCount: parseInt(t.registered_teams_count, 10) || 0,
-    totalViews: parseInt(t.total_views, 10) || 0,
-    uniqueViewers: parseInt(t.unique_viewers, 10) || 0,
+    registeredTeams: parseInt(registeredTeamsCount, 10) || 0,
+    registeredTeamsCount: parseInt(registeredTeamsCount, 10) || 0,
+    teamsCount: parseInt(registeredTeamsCount, 10) || 0,
+    totalViews: parseInt(t.total_views || 0, 10) || 0,
+    uniqueViewers: parseInt(t.unique_viewers || 0, 10) || 0,
     lastViewedAt: t.last_viewed_at || null,
     status: t.status,
     rules: t.rules,
     createdBy: t.created_by,
     venueOwnerId: t.venue_owner_id,
-    hasAuction: Boolean(t.has_auction || t.auction_id),
-    auctionId: t.auction_id || null,
-    auctionStatus: t.auction_status || null,
+    hasAuction: Boolean(t.has_auction || auctionId),
+    auctionId: auctionId,
+    auctionStatus: auctionStatus,
     matchFormat: t.match_format || 'DOUBLES',
     scoringMode,
     targetScore: t.target_score != null ? t.target_score : 15,
@@ -213,7 +232,7 @@ const getTournamentByPublicId = async (publicId) => {
     venue: t.venue_name ? {
       name: t.venue_name,
       address: t.venue_address,
-      city: t.city
+      city: t.venue_city || t.city || 'Mumbai'
     } : null
   };
 };
@@ -225,16 +244,11 @@ const getTournamentByPublicId = async (publicId) => {
 const getTournamentLiveMatches = async (publicId) => {
   if (!publicId) return [];
 
-  // 1. Validate tournament exists
-  const isNum = /^\d+$/.test(String(publicId).trim());
-  const tourRows = await db.query(
-    'SELECT id, uuid FROM tournaments WHERE uuid = ? OR id = ?',
-    [publicId, isNum ? parseInt(publicId, 10) : -1]
-  );
-  if (!tourRows || tourRows.length === 0) {
+  // 1. Validate tournament exists strictly
+  const tournament = await resolveTournamentStrict(publicId);
+  if (!tournament) {
     return [];
   }
-  const tournament = tourRows[0];
 
   // 2. Query strictly by internal tournament_id
   const rows = await db.query(
@@ -303,7 +317,14 @@ const getTournamentLiveMatches = async (publicId) => {
         summary: m.live_score_summary,
         subtext: m.live_subtext,
         details: parsedSportState
-      }
+      },
+      live_score_summary: m.live_score_summary,
+      liveScoreSummary: m.live_score_summary,
+      scoreSummary: m.live_score_summary,
+      live_subtext: m.live_subtext,
+      sport_state: parsedSportState,
+      sportState: parsedSportState,
+      sidesSwapped: parsedSportState?.sidesSwapped ?? false
     };
   });
 };
@@ -312,6 +333,10 @@ const getTournamentLiveMatches = async (publicId) => {
  * Returns tournament fixtures & schedule.
  */
 const getTournamentFixtures = async (publicId) => {
+  if (!publicId) return [];
+  const tournament = await resolveTournamentStrict(publicId);
+  if (!tournament) return [];
+
   const rows = await db.query(
     `SELECT 
       tm.id as internal_id,
@@ -355,9 +380,9 @@ const getTournamentFixtures = async (publicId) => {
      LEFT JOIN venues v ON tm.venue_id = v.id
      JOIN teams ta ON tm.team_a_id = ta.id
      JOIN teams tb ON tm.team_b_id = tb.id
-     WHERE t.uuid = ? OR t.id = ?
+     WHERE tm.tournament_id = ?
      ORDER BY tm.group_name ASC, tm.match_number ASC, tm.match_date ASC, tm.start_time ASC`,
-    [publicId, isNaN(publicId) ? -1 : parseInt(publicId, 10)]
+    [tournament.id]
   );
 
   return rows.map(m => {
@@ -407,6 +432,10 @@ const getTournamentFixtures = async (publicId) => {
  * Returns tournament teams list.
  */
 const getTournamentTeams = async (publicId) => {
+  if (!publicId) return [];
+  const tournament = await resolveTournamentStrict(publicId);
+  if (!tournament) return [];
+
   const rows = await db.query(
     `SELECT 
       tm.id as internal_team_id,
@@ -419,9 +448,9 @@ const getTournamentTeams = async (publicId) => {
      FROM tournament_teams tt
      JOIN tournaments t ON tt.tournament_id = t.id
      JOIN teams tm ON tt.team_id = tm.id
-     WHERE t.uuid = ? OR t.id = ?
+     WHERE tt.tournament_id = ?
      ORDER BY tt.group_name ASC, tt.seed_number ASC, tm.name ASC`,
-    [publicId, /^\d+$/.test(String(publicId).trim()) ? parseInt(publicId, 10) : -1]
+    [tournament.id]
   );
 
   const teamsWithMembers = await Promise.all(rows.map(async (t) => {
@@ -470,34 +499,36 @@ const getTournamentTeams = async (publicId) => {
  * Returns detailed squad roster for a specific team in a tournament.
  */
 const getTournamentTeamRoster = async (tournamentPublicId, teamPublicId, user = null) => {
-  const isTournNum = /^\d+$/.test(String(tournamentPublicId).trim());
-  const tournamentRows = await db.query(
-    `SELECT t.*, s.name as sport_name, s.slug as sport_slug,
-            v.owner_id as venue_owner_id
-     FROM tournaments t
-     LEFT JOIN sports s ON t.sport_id = s.id
-     LEFT JOIN venues v ON t.venue_id = v.id
-     WHERE t.uuid = ? OR t.id = ?`,
-    [tournamentPublicId, isTournNum ? parseInt(tournamentPublicId, 10) : -1]
-  );
-
-  if (!tournamentRows || tournamentRows.length === 0) {
+  const tournament = await resolveTournamentStrict(tournamentPublicId);
+  if (!tournament) {
     throw { statusCode: 404, message: 'Tournament not found.' };
   }
-  const tournament = tournamentRows[0];
 
-  const isTeamNum = /^\d+$/.test(String(teamPublicId).trim());
-  const teamRows = await db.query(
-    `SELECT tm.*, s.name as sport_name, s.slug as sport_slug,
-            tt.group_name, tt.seed_number, tt.registration_status,
-            u.full_name as captain_user_name
-     FROM teams tm
-     LEFT JOIN tournament_teams tt ON (tt.team_id = tm.id AND tt.tournament_id = ?)
-     LEFT JOIN sports s ON tm.sport_id = s.id
-     LEFT JOIN users u ON tm.captain_id = u.id
-     WHERE tm.uuid = ? OR tm.id = ?`,
-    [tournament.id, teamPublicId, isTeamNum ? parseInt(teamPublicId, 10) : -1]
-  );
+  const strTeam = String(teamPublicId).trim();
+  const isTeamNum = /^\d+$/.test(strTeam);
+  const teamRows = isTeamNum
+    ? await db.query(
+        `SELECT tm.*, s.name as sport_name, s.slug as sport_slug,
+                tt.group_name, tt.seed_number, tt.registration_status,
+                u.full_name as captain_user_name
+         FROM teams tm
+         LEFT JOIN tournament_teams tt ON (tt.team_id = tm.id AND tt.tournament_id = ?)
+         LEFT JOIN sports s ON tm.sport_id = s.id
+         LEFT JOIN users u ON tm.captain_id = u.id
+         WHERE tm.id = ? LIMIT 1`,
+        [tournament.id, parseInt(strTeam, 10)]
+      )
+    : await db.query(
+        `SELECT tm.*, s.name as sport_name, s.slug as sport_slug,
+                tt.group_name, tt.seed_number, tt.registration_status,
+                u.full_name as captain_user_name
+         FROM teams tm
+         LEFT JOIN tournament_teams tt ON (tt.team_id = tm.id AND tt.tournament_id = ?)
+         LEFT JOIN sports s ON tm.sport_id = s.id
+         LEFT JOIN users u ON tm.captain_id = u.id
+         WHERE tm.uuid = ? LIMIT 1`,
+        [tournament.id, strTeam]
+      );
 
   if (!teamRows || teamRows.length === 0) {
     throw { statusCode: 404, message: 'Team not found.' };
@@ -912,18 +943,10 @@ const removePlayerFromTournamentTeamRoster = async (tournamentPublicId, teamPubl
  * Updates whether a match is displayed on Signage TV and Smart TV broadcast.
  */
 const updateTournamentMatchDisplay = async (tournamentPublicId, matchPublicId, showOnDisplay, user) => {
-  const isTournNum = /^\d+$/.test(String(tournamentPublicId).trim());
-  const tournamentRows = await db.query(
-    `SELECT t.*, v.owner_id as venue_owner_id
-     FROM tournaments t
-     LEFT JOIN venues v ON t.venue_id = v.id
-     WHERE t.uuid = ? OR t.id = ?`,
-    [tournamentPublicId, isTournNum ? parseInt(tournamentPublicId, 10) : -1]
-  );
-  if (!tournamentRows || tournamentRows.length === 0) {
+  const tournament = await resolveTournamentStrict(tournamentPublicId);
+  if (!tournament) {
     throw { statusCode: 404, message: 'Tournament not found.' };
   }
-  const tournament = tournamentRows[0];
 
   const canManage = user?.role === 'ADMIN' ||
     (Array.isArray(user?.roles) && user.roles.includes('ADMIN')) ||
@@ -934,11 +957,12 @@ const updateTournamentMatchDisplay = async (tournamentPublicId, matchPublicId, s
     throw { statusCode: 403, message: 'Forbidden. Only tournament organizers and admins can configure display matches.' };
   }
 
-  const isMatchNum = /^\d+$/.test(String(matchPublicId).trim());
-  const matchRows = await db.query(
-    `SELECT * FROM tournament_matches WHERE (uuid = ? OR id = ?) AND tournament_id = ?`,
-    [matchPublicId, isMatchNum ? parseInt(matchPublicId, 10) : -1, tournament.id]
-  );
+  const strMatch = String(matchPublicId).trim();
+  const isMatchNum = /^\d+$/.test(strMatch);
+  const matchRows = isMatchNum
+    ? await db.query(`SELECT * FROM tournament_matches WHERE id = ? AND tournament_id = ? LIMIT 1`, [parseInt(strMatch, 10), tournament.id])
+    : await db.query(`SELECT * FROM tournament_matches WHERE uuid = ? AND tournament_id = ? LIMIT 1`, [strMatch, tournament.id]);
+
   if (!matchRows || matchRows.length === 0) {
     throw { statusCode: 404, message: 'Match not found.' };
   }
@@ -976,18 +1000,10 @@ const updateTournamentMatchDisplay = async (tournamentPublicId, matchPublicId, s
  * Bulk updates display visibility for all or specified matches.
  */
 const bulkUpdateTournamentMatchesDisplay = async (tournamentPublicId, { matchIds, showOnDisplay, selectAll, clearAll }, user) => {
-  const isTournNum = /^\d+$/.test(String(tournamentPublicId).trim());
-  const tournamentRows = await db.query(
-    `SELECT t.*, v.owner_id as venue_owner_id
-     FROM tournaments t
-     LEFT JOIN venues v ON t.venue_id = v.id
-     WHERE t.uuid = ? OR t.id = ?`,
-    [tournamentPublicId, isTournNum ? parseInt(tournamentPublicId, 10) : -1]
-  );
-  if (!tournamentRows || tournamentRows.length === 0) {
+  const tournament = await resolveTournamentStrict(tournamentPublicId);
+  if (!tournament) {
     throw { statusCode: 404, message: 'Tournament not found.' };
   }
-  const tournament = tournamentRows[0];
 
   const canManage = user?.role === 'ADMIN' ||
     (Array.isArray(user?.roles) && user.roles.includes('ADMIN')) ||
@@ -1812,6 +1828,7 @@ const deleteTournament = async ({ tournamentId, user, force = false }) => {
 };
 
 module.exports = {
+  resolveTournamentStrict,
   getTournamentsPaginated,
   getTournamentByPublicId,
   getTournamentLiveMatches,

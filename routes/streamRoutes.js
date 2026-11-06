@@ -124,7 +124,8 @@ router.get(['/:matchId/stream/overlay-data', '/:matchId/overlay-data'], async (r
 // 7. GET /api/streams/live & /api/streams/active - List all active broadcasts across the platform
 router.get(['/live', '/active'], async (req, res, next) => {
   try {
-    const data = await streamService.getActiveLiveStreams();
+    const tournamentId = req.query.tournamentId || req.query.tournament_id || null;
+    const data = await streamService.getActiveLiveStreams(tournamentId);
     res.json({ success: true, data });
   } catch (error) {
     next(error);
