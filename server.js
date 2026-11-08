@@ -164,6 +164,8 @@ server.listen(PORT, '0.0.0.0', () => {
   // Verify SMTP Email Server Connection asynchronously
   verifyEmailConnection();
 
-  // Auto-sync existing active teams and tournaments into chat system
-  chatService.backfillExistingGroups().catch(() => {});
+  // Auto-verify chat schema and sync active teams/tournaments into chat system
+  chatService.ensureChatSchema()
+    .then(() => chatService.backfillExistingGroups())
+    .catch((err) => console.warn('Chat schema initialization note:', err.message));
 });

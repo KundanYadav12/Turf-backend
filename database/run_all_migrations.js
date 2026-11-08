@@ -23,6 +23,8 @@ const migrations = [
   'migrate_mobile_app_updates.js',
   'migrate_corner_logos.js',
   'migrate_app_branding.js',
+  'migrate_chat_system.js',
+  'migrate_user_profiles_mentions.js',
   'seed_superadmin.js'
 ];
 

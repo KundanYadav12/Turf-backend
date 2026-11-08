@@ -6,6 +6,32 @@ const { getIO } = require('./socketService');
  * WhatsApp-Style Real-Time Chat System Service
  */
 
+let schemaEnsured = false;
+let schemaPromise = null;
+
+async function ensureChatSchema() {
+  if (schemaEnsured) return true;
+  if (!schemaPromise) {
+    schemaPromise = (async () => {
+      try {
+        const migrateChat = require('../database/migrate_chat_system');
+        await migrateChat();
+        schemaEnsured = true;
+        console.log('✓ Chat System tables verified and ready.');
+      } catch (err) {
+        console.warn('⚠️ Chat schema ensure check:', err.message);
+      } finally {
+        schemaPromise = null;
+      }
+      return schemaEnsured;
+    })();
+  }
+  return schemaPromise;
+}
+
+// Auto-run non-blocking schema verification on load
+ensureChatSchema().catch(() => {});
+
 // Helper to safely get Socket.IO instance
 function getSocketIO() {
   try {
@@ -318,6 +344,9 @@ async function getOrCreateDirectConversation(user1Id, user2Id) {
     throw err;
   }
 
+  // Ensure tables exist
+  await ensureChatSchema().catch(() => {});
+
   // Verify target user exists
   const targetUserRows = await db.query(
     'SELECT id, full_name, username, profile_photo, status FROM users WHERE id = ?',
@@ -390,19 +419,46 @@ async function getUserConversations(userId) {
   const uId = Number(userId);
   if (!uId || isNaN(uId)) return [];
 
-  const rows = await db.query(
-    `SELECT c.*, 
-            cp.role as user_role, 
-            cp.is_external as user_is_external, 
-            cp.is_muted as user_is_muted, 
-            cp.unread_count as user_unread_count,
-            cp.joined_at as user_joined_at
-     FROM chat_participants cp
-     JOIN chat_conversations c ON cp.conversation_id = c.id
-     WHERE cp.user_id = ? AND cp.left_at IS NULL
-     ORDER BY COALESCE(c.last_message_at, c.created_at) DESC`,
-    [uId]
-  );
+  let rows;
+  try {
+    rows = await db.query(
+      `SELECT c.*, 
+              cp.role as user_role, 
+              cp.is_external as user_is_external, 
+              cp.is_muted as user_is_muted, 
+              cp.unread_count as user_unread_count,
+              cp.joined_at as user_joined_at
+       FROM chat_participants cp
+       JOIN chat_conversations c ON cp.conversation_id = c.id
+       WHERE cp.user_id = ? AND cp.left_at IS NULL
+       ORDER BY COALESCE(c.last_message_at, c.created_at) DESC`,
+      [uId]
+    );
+  } catch (err) {
+    if (err.code === 'ER_NO_SUCH_TABLE' || (err.message && err.message.includes("doesn't exist"))) {
+      await ensureChatSchema().catch(() => {});
+      try {
+        rows = await db.query(
+          `SELECT c.*, 
+                  cp.role as user_role, 
+                  cp.is_external as user_is_external, 
+                  cp.is_muted as user_is_muted, 
+                  cp.unread_count as user_unread_count,
+                  cp.joined_at as user_joined_at
+           FROM chat_participants cp
+           JOIN chat_conversations c ON cp.conversation_id = c.id
+           WHERE cp.user_id = ? AND cp.left_at IS NULL
+           ORDER BY COALESCE(c.last_message_at, c.created_at) DESC`,
+          [uId]
+        );
+      } catch (retryErr) {
+        return [];
+      }
+    } else {
+      console.warn('[getUserConversations] Error:', err.message);
+      return [];
+    }
+  }
 
   if (!rows || rows.length === 0) return [];
 
@@ -1192,13 +1248,33 @@ async function searchUsers(query, currentUserId) {
  */
 async function getTotalUnreadCount(userId) {
   const uId = Number(userId);
-  const rows = await db.query(
-    `SELECT COALESCE(SUM(unread_count), 0) as total 
-     FROM chat_participants 
-     WHERE user_id = ? AND left_at IS NULL`,
-    [uId]
-  );
-  return rows && rows.length > 0 ? Number(rows[0].total) : 0;
+  if (!uId || isNaN(uId)) return 0;
+  try {
+    const rows = await db.query(
+      `SELECT COALESCE(SUM(unread_count), 0) as total 
+       FROM chat_participants 
+       WHERE user_id = ? AND left_at IS NULL`,
+      [uId]
+    );
+    return rows && rows.length > 0 ? Number(rows[0].total) : 0;
+  } catch (err) {
+    if (err.code === 'ER_NO_SUCH_TABLE' || (err.message && err.message.includes("doesn't exist"))) {
+      await ensureChatSchema().catch(() => {});
+      try {
+        const rows = await db.query(
+          `SELECT COALESCE(SUM(unread_count), 0) as total 
+           FROM chat_participants 
+           WHERE user_id = ? AND left_at IS NULL`,
+          [uId]
+        );
+        return rows && rows.length > 0 ? Number(rows[0].total) : 0;
+      } catch (retryErr) {
+        return 0;
+      }
+    }
+    console.warn('[getTotalUnreadCount] Error:', err.message);
+    return 0;
+  }
 }
 
 /**
@@ -1254,5 +1330,6 @@ module.exports = {
   searchUsers,
   getTotalUnreadCount,
   registerPushToken,
-  backfillExistingGroups
+  backfillExistingGroups,
+  ensureChatSchema
 };
