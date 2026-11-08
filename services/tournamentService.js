@@ -1313,7 +1313,12 @@ const createTournament = async ({
     ]
   );
 
-  return await getTournamentByPublicId(publicId);
+  const createdTourn = await getTournamentByPublicId(publicId);
+  try {
+    const chatService = require('./chatService');
+    chatService.syncTournamentGroup(createdTourn.id).catch(() => {});
+  } catch (e) {}
+  return createdTourn;
 };
 
 /**
@@ -1483,6 +1488,11 @@ const removeTeamFromTournament = async (tournamentPublicId, teamPublicId, { mode
     console.warn('WebSocket broadcast error:', wsErr);
   }
 
+  try {
+    const chatService = require('./chatService');
+    chatService.syncTournamentGroup(tournament.id).catch(() => {});
+  } catch (chatErr) {}
+
   return {
     success: true,
     message: `Team "${team.name}" was removed from ${tournament.name} successfully.`
@@ -1616,6 +1626,11 @@ const bulkAddTeamsToTournament = async (tournamentPublicId, { teamIds = [], grou
   } catch (wsErr) {
     console.warn('WebSocket broadcast error:', wsErr);
   }
+
+  try {
+    const chatService = require('./chatService');
+    chatService.syncTournamentGroup(tournament.id).catch(() => {});
+  } catch (chatErr) {}
 
   return {
     success: true,

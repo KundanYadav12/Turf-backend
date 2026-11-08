@@ -334,71 +334,69 @@ async function overrideAward(awardId, { recipientId, recipientName, reason }, us
  * 4. Calculate actual dynamic career statistics from match events.
  */
 async function calculateCricketCareerStats(userId) {
-  // Batting totals
-  const [batting] = await db.query(
-    `SELECT 
-       COUNT(DISTINCT match_id) as matches_batted,
-       COALESCE(SUM(runs_scored), 0) as total_runs,
-       COALESCE(SUM(CASE WHEN is_wide = 0 THEN 1 ELSE 0 END), 0) as balls_faced,
-       COALESCE(SUM(CASE WHEN runs_scored = 4 THEN 1 ELSE 0 END), 0) as fours,
-       COALESCE(SUM(CASE WHEN runs_scored = 6 THEN 1 ELSE 0 END), 0) as sixes
-     FROM cricket_balls
-     WHERE striker_id = ?`,
-    [userId]
-  );
-
-  // Batting dismissals
-  const [dismissals] = await db.query(
-    `SELECT COUNT(*) as outs FROM cricket_balls WHERE dismissed_player_id = ?`,
-    [userId]
-  );
-
-  // Highest score in a match
-  const [highScore] = await db.query(
-    `SELECT SUM(runs_scored) as innings_runs
-     FROM cricket_balls
-     WHERE striker_id = ?
-     GROUP BY match_id
-     ORDER BY innings_runs DESC LIMIT 1`,
-    [userId]
-  );
-
-  // Bowling figures
-  const [bowling] = await db.query(
-    `SELECT 
-       COUNT(DISTINCT match_id) as matches_bowled,
-       COALESCE(SUM(CASE WHEN is_wide = 0 AND is_no_ball = 0 THEN 1 ELSE 0 END), 0) as legal_balls,
-       COALESCE(SUM(runs_scored + extra_runs), 0) as runs_conceded,
-       COALESCE(SUM(CASE WHEN is_wicket = 1 AND wicket_type NOT IN ('RUN_OUT', 'RETIRED_HURT') THEN 1 ELSE 0 END), 0) as wickets
-     FROM cricket_balls
-     WHERE bowler_id = ?`,
-    [userId]
-  );
-
-  // Best bowling in a single match
-  const [bestBowling] = await db.query(
-    `SELECT 
-       COUNT(CASE WHEN is_wicket = 1 AND wicket_type NOT IN ('RUN_OUT', 'RETIRED_HURT') THEN 1 ELSE NULL END) as wkts,
-       SUM(runs_scored + extra_runs) as runs
-     FROM cricket_balls
-     WHERE bowler_id = ?
-     GROUP BY match_id
-     ORDER BY wkts DESC, runs ASC LIMIT 1`,
-    [userId]
-  );
-
-  // Distinct appearances across all matches
-  const [appearances] = await db.query(
-    `SELECT COUNT(DISTINCT match_id) as total_matches
-     FROM (
-       SELECT match_id FROM cricket_balls WHERE striker_id = ? OR bowler_id = ?
-       UNION
-       SELECT tm.id as match_id FROM tournament_matches tm
-       JOIN team_members mem ON (tm.team_a_id = mem.team_id OR tm.team_b_id = mem.team_id)
-       WHERE mem.user_id = ? AND tm.status = 'COMPLETED'
-     ) as m`,
-    [userId, userId, userId]
-  );
+  const [
+    [batting],
+    [dismissals],
+    [highScore],
+    [bowling],
+    [bestBowling],
+    [appearances]
+  ] = await Promise.all([
+    db.query(
+      `SELECT 
+         COUNT(DISTINCT match_id) as matches_batted,
+         COALESCE(SUM(runs_scored), 0) as total_runs,
+         COALESCE(SUM(CASE WHEN is_wide = 0 THEN 1 ELSE 0 END), 0) as balls_faced,
+         COALESCE(SUM(CASE WHEN runs_scored = 4 THEN 1 ELSE 0 END), 0) as fours,
+         COALESCE(SUM(CASE WHEN runs_scored = 6 THEN 1 ELSE 0 END), 0) as sixes
+       FROM cricket_balls
+       WHERE striker_id = ?`,
+      [userId]
+    ),
+    db.query(
+      `SELECT COUNT(*) as outs FROM cricket_balls WHERE dismissed_player_id = ?`,
+      [userId]
+    ),
+    db.query(
+      `SELECT SUM(runs_scored) as innings_runs
+       FROM cricket_balls
+       WHERE striker_id = ?
+       GROUP BY match_id
+       ORDER BY innings_runs DESC LIMIT 1`,
+      [userId]
+    ),
+    db.query(
+      `SELECT 
+         COUNT(DISTINCT match_id) as matches_bowled,
+         COALESCE(SUM(CASE WHEN is_wide = 0 AND is_no_ball = 0 THEN 1 ELSE 0 END), 0) as legal_balls,
+         COALESCE(SUM(runs_scored + extra_runs), 0) as runs_conceded,
+         COALESCE(SUM(CASE WHEN is_wicket = 1 AND wicket_type NOT IN ('RUN_OUT', 'RETIRED_HURT') THEN 1 ELSE 0 END), 0) as wickets
+       FROM cricket_balls
+       WHERE bowler_id = ?`,
+      [userId]
+    ),
+    db.query(
+      `SELECT 
+         COUNT(CASE WHEN is_wicket = 1 AND wicket_type NOT IN ('RUN_OUT', 'RETIRED_HURT') THEN 1 ELSE NULL END) as wkts,
+         SUM(runs_scored + extra_runs) as runs
+       FROM cricket_balls
+       WHERE bowler_id = ?
+       GROUP BY match_id
+       ORDER BY wkts DESC, runs ASC LIMIT 1`,
+      [userId]
+    ),
+    db.query(
+      `SELECT COUNT(DISTINCT match_id) as total_matches
+       FROM (
+         SELECT match_id FROM cricket_balls WHERE striker_id = ? OR bowler_id = ?
+         UNION
+         SELECT tm.id as match_id FROM tournament_matches tm
+         JOIN team_members mem ON (tm.team_a_id = mem.team_id OR tm.team_b_id = mem.team_id)
+         WHERE mem.user_id = ? AND tm.status = 'COMPLETED'
+       ) as m`,
+      [userId, userId, userId]
+    )
+  ]);
 
   const runs = parseInt(batting?.total_runs, 10) || 0;
   const balls = parseInt(batting?.balls_faced, 10) || 0;
@@ -442,29 +440,36 @@ async function calculateCricketCareerStats(userId) {
 }
 
 async function calculateFootballCareerStats(userId) {
-  const [goals] = await db.query(
-    `SELECT COUNT(*) as count FROM sport_match_events WHERE player_id = ? AND event_type = 'GOAL'`,
-    [userId]
-  );
-  const [assists] = await db.query(
-    `SELECT COUNT(*) as count FROM sport_match_events WHERE assist_player_id = ?`,
-    [userId]
-  );
-  const [yellowCards] = await db.query(
-    `SELECT COUNT(*) as count FROM sport_match_events WHERE player_id = ? AND event_type = 'CARD' AND commentary LIKE '%YELLOW%'`,
-    [userId]
-  );
-  const [redCards] = await db.query(
-    `SELECT COUNT(*) as count FROM sport_match_events WHERE player_id = ? AND event_type = 'CARD' AND commentary LIKE '%RED%'`,
-    [userId]
-  );
-
-  const [appearances] = await db.query(
-    `SELECT COUNT(DISTINCT match_id) as total_matches
-     FROM sport_match_events
-     WHERE (player_id = ? OR assist_player_id = ?) AND sport_slug = 'football'`,
-    [userId, userId]
-  );
+  const [
+    [goals],
+    [assists],
+    [yellowCards],
+    [redCards],
+    [appearances]
+  ] = await Promise.all([
+    db.query(
+      `SELECT COUNT(*) as count FROM sport_match_events WHERE player_id = ? AND event_type = 'GOAL'`,
+      [userId]
+    ),
+    db.query(
+      `SELECT COUNT(*) as count FROM sport_match_events WHERE assist_player_id = ?`,
+      [userId]
+    ),
+    db.query(
+      `SELECT COUNT(*) as count FROM sport_match_events WHERE player_id = ? AND event_type = 'CARD' AND commentary LIKE '%YELLOW%'`,
+      [userId]
+    ),
+    db.query(
+      `SELECT COUNT(*) as count FROM sport_match_events WHERE player_id = ? AND event_type = 'CARD' AND commentary LIKE '%RED%'`,
+      [userId]
+    ),
+    db.query(
+      `SELECT COUNT(DISTINCT match_id) as total_matches
+       FROM sport_match_events
+       WHERE (player_id = ? OR assist_player_id = ?) AND sport_slug = 'football'`,
+      [userId, userId]
+    )
+  ]);
 
   return {
     matchesPlayed: parseInt(appearances?.total_matches, 10) || 0,
@@ -550,29 +555,30 @@ async function getPlayerMatchHistory(userId, sportFilter = null) {
 
   const rows = await db.query(sql, params);
 
-  // For each match, attach player-specific recorded statistics
-  const history = [];
-  for (const m of rows) {
+  // For each match, attach player-specific recorded statistics concurrently
+  const history = await Promise.all(rows.map(async (m) => {
     let performance = {};
 
     if (m.sport_slug === 'cricket') {
-      const [bat] = await db.query(
-        `SELECT SUM(runs_scored) as runs,
-                COUNT(CASE WHEN is_wide = 0 THEN 1 ELSE NULL END) as balls,
-                SUM(CASE WHEN runs_scored = 4 THEN 1 ELSE 0 END) as fours,
-                SUM(CASE WHEN runs_scored = 6 THEN 1 ELSE 0 END) as sixes
-         FROM cricket_balls
-         WHERE match_id = ? AND striker_id = ?`,
-        [m.internal_id, userId]
-      );
-      const [bowl] = await db.query(
-        `SELECT COUNT(CASE WHEN is_wide = 0 AND is_no_ball = 0 THEN 1 ELSE NULL END) as balls,
-                SUM(runs_scored + extra_runs) as runs,
-                COUNT(CASE WHEN is_wicket = 1 THEN 1 ELSE NULL END) as wkts
-         FROM cricket_balls
-         WHERE match_id = ? AND bowler_id = ?`,
-        [m.internal_id, userId]
-      );
+      const [[bat], [bowl]] = await Promise.all([
+        db.query(
+          `SELECT SUM(runs_scored) as runs,
+                  COUNT(CASE WHEN is_wide = 0 THEN 1 ELSE NULL END) as balls,
+                  SUM(CASE WHEN runs_scored = 4 THEN 1 ELSE 0 END) as fours,
+                  SUM(CASE WHEN runs_scored = 6 THEN 1 ELSE 0 END) as sixes
+           FROM cricket_balls
+           WHERE match_id = ? AND striker_id = ?`,
+          [m.internal_id, userId]
+        ),
+        db.query(
+          `SELECT COUNT(CASE WHEN is_wide = 0 AND is_no_ball = 0 THEN 1 ELSE NULL END) as balls,
+                  SUM(runs_scored + extra_runs) as runs,
+                  COUNT(CASE WHEN is_wicket = 1 THEN 1 ELSE NULL END) as wkts
+           FROM cricket_balls
+           WHERE match_id = ? AND bowler_id = ?`,
+          [m.internal_id, userId]
+        )
+      ]);
 
       const bRuns = parseInt(bat?.runs, 10) || 0;
       const bBalls = parseInt(bat?.balls, 10) || 0;
@@ -603,7 +609,7 @@ async function getPlayerMatchHistory(userId, sportFilter = null) {
       };
     }
 
-    history.push({
+    return {
       matchId: m.match_id,
       matchNumber: m.match_number,
       matchDate: m.match_date,
@@ -618,8 +624,8 @@ async function getPlayerMatchHistory(userId, sportFilter = null) {
       resultSummary: m.result_summary || 'Match Concluded',
       scoreSummary: m.live_score_summary,
       performance
-    });
-  }
+    };
+  }));
 
   return history;
 }
@@ -646,45 +652,48 @@ async function getPlayerProfile(userId, requestingUser = null) {
   const isAdmin = requestingUser && requestingUser.role === 'ADMIN';
   const showPrivate = isSelf || isAdmin;
 
-  // Actual Dynamic Career Statistics
-  const cricketCareer = await calculateCricketCareerStats(user.id);
-  const footballCareer = await calculateFootballCareerStats(user.id);
-  const badmintonCareer = await calculateRacketCareerStats(user.id, 'badminton');
-  const pickleballCareer = await calculateRacketCareerStats(user.id, 'pickleball');
-
-  // Multi-Sport Profiles from table
-  const sportsProfiles = await db.query(
-    `SELECT p.*, s.name as sport_name, s.icon as sport_icon
-     FROM player_sport_profiles p
-     JOIN sports s ON p.sport_slug = s.slug
-     WHERE p.user_id = ?`,
-    [userId]
-  );
-
-  // Teams player belongs to
-  const teams = await db.query(
-    `SELECT tm.id, tm.uuid as public_id, tm.name, tm.logo_url, s.name as sport_name,
-            mem.role, mem.jersey_number, mem.position, mem.is_captain
-     FROM team_members mem
-     JOIN teams tm ON mem.team_id = tm.id
-     JOIN sports s ON tm.sport_id = s.id
-     WHERE mem.user_id = ?
-     ORDER BY mem.is_captain DESC, tm.name ASC`,
-    [userId]
-  );
-
-  // Awards won by player
-  const awardsWon = await db.query(
-    `SELECT a.*, t.name as tournament_name, t.uuid as tournament_uuid
-     FROM tournament_awards a
-     JOIN tournaments t ON a.tournament_id = t.id
-     WHERE a.recipient_id = ? AND a.recipient_type = 'PLAYER'
-     ORDER BY a.created_at DESC`,
-    [userId]
-  );
-
-  // Match History
-  const matchHistory = await getPlayerMatchHistory(user.id);
+  // Actual Dynamic Career Statistics, Multi-Sport Profiles, Teams, Awards, and Match History (run concurrently)
+  const [
+    cricketCareer,
+    footballCareer,
+    badmintonCareer,
+    pickleballCareer,
+    sportsProfiles,
+    teams,
+    awardsWon,
+    matchHistory
+  ] = await Promise.all([
+    calculateCricketCareerStats(user.id),
+    calculateFootballCareerStats(user.id),
+    calculateRacketCareerStats(user.id, 'badminton'),
+    calculateRacketCareerStats(user.id, 'pickleball'),
+    db.query(
+      `SELECT p.*, s.name as sport_name, s.icon as sport_icon
+       FROM player_sport_profiles p
+       JOIN sports s ON p.sport_slug = s.slug
+       WHERE p.user_id = ?`,
+      [userId]
+    ),
+    db.query(
+      `SELECT tm.id, tm.uuid as public_id, tm.name, tm.logo_url, s.name as sport_name,
+              mem.role, mem.jersey_number, mem.position, mem.is_captain
+       FROM team_members mem
+       JOIN teams tm ON mem.team_id = tm.id
+       JOIN sports s ON tm.sport_id = s.id
+       WHERE mem.user_id = ?
+       ORDER BY mem.is_captain DESC, tm.name ASC`,
+      [userId]
+    ),
+    db.query(
+      `SELECT a.*, t.name as tournament_name, t.uuid as tournament_uuid
+       FROM tournament_awards a
+       JOIN tournaments t ON a.tournament_id = t.id
+       WHERE a.recipient_id = ? AND a.recipient_type = 'PLAYER'
+       ORDER BY a.created_at DESC`,
+      [userId]
+    ),
+    getPlayerMatchHistory(user.id)
+  ]);
 
   return {
     id: user.id,

@@ -22,6 +22,7 @@ const migrations = [
   'migrate_golden_point.js',
   'migrate_mobile_app_updates.js',
   'migrate_corner_logos.js',
+  'migrate_app_branding.js',
   'seed_superadmin.js'
 ];
 

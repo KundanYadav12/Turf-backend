@@ -621,6 +621,65 @@ async function getUserStreamingAssignments(userId) {
 }
 
 /**
+ * Fetch flat list of matches assigned to current user for live streaming (with match metadata)
+ */
+async function getUserStreamingMatches(userId) {
+  if (!userId) return [];
+  const uid = Number(userId);
+
+  // Check if admin
+  const adminCheck = await db.query(
+    `SELECT ur.user_id FROM user_roles ur 
+     JOIN roles r ON ur.role_id = r.id 
+     WHERE ur.user_id = ? AND UPPER(r.name) IN ('ADMIN', 'SUPER_ADMIN') 
+     LIMIT 1`,
+    [uid]
+  );
+  const isAdmin = adminCheck && adminCheck.length > 0;
+
+  let query = `
+    SELECT DISTINCT
+       tm.id, tm.uuid, tm.match_number, tm.status, tm.match_date, tm.start_time,
+       tm.live_score_summary, tm.live_subtext, tm.category,
+       t.id as tournament_id, t.uuid as tournament_uuid, t.name as tournament_name,
+       s.slug as sport_slug, s.name as sport_name,
+       ta.name as team_a_name, ta.logo_url as team_a_logo,
+       tb.name as team_b_name, tb.logo_url as team_b_logo,
+       v.name as venue_name,
+       c.name as court_name
+     FROM tournament_matches tm
+     JOIN tournaments t ON tm.tournament_id = t.id
+     JOIN sports s ON t.sport_id = s.id
+     LEFT JOIN venues v ON tm.venue_id = v.id
+     LEFT JOIN courts c ON tm.court_id = c.id
+     JOIN teams ta ON tm.team_a_id = ta.id
+     JOIN teams tb ON tm.team_b_id = tb.id
+     JOIN tournament_stream_permissions tsp ON tsp.tournament_id = t.id 
+       AND (tsp.match_id IS NULL OR tsp.match_id = tm.id)
+       AND tsp.status = 'ACTIVE'
+       AND (tsp.expires_at IS NULL OR tsp.expires_at > NOW())
+  `;
+
+  let params = [];
+  if (!isAdmin) {
+    query += ` WHERE tsp.user_id = ?`;
+    params = [uid];
+  }
+
+  query += `
+     ORDER BY 
+       CASE tm.status 
+         WHEN 'LIVE' THEN 1 
+         WHEN 'SCHEDULED' THEN 2 
+         ELSE 3 
+       END, 
+       tm.match_date ASC, tm.start_time ASC`;
+
+  const rows = await db.query(query, params);
+  return rows;
+}
+
+/**
  * Fetch streaming overview across all matches of a tournament
  */
 async function getTournamentStreamingOverview(tournamentId, user = null) {
@@ -760,5 +819,6 @@ module.exports = {
   grantStreamPermission,
   revokeStreamPermission,
   getUserStreamingAssignments,
+  getUserStreamingMatches,
   getTournamentStreamingOverview
 };

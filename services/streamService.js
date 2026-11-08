@@ -326,6 +326,15 @@ async function getMatchStream(matchId, user = null) {
     } catch {}
   }
 
+  // Ensure fresh stream sessions default to 'none' and panelTimer: 0 (Off)
+  if (s.status !== 'LIVE') {
+    parsedOverlay = {
+      ...parsedOverlay,
+      activePanel: 'none',
+      panelTimer: 0
+    };
+  }
+
   // Sanitized viewer payload (never exposes broadcaster keys or ingest tokens)
   const publicStream = {
     id: s.uuid,
@@ -434,7 +443,12 @@ async function initializeStream(matchId, user, payload = {}) {
 
   const streamTitle = title || `${match.team_a_name} vs ${match.team_b_name} - Match #${match.match_number} Live`;
   const streamDescription = description || `Official Live Match Stream for ${match.tournament_name}`;
-  const mergedOverlay = { ...DEFAULT_OVERLAY_CONFIG, ...overlayConfig };
+  const mergedOverlay = {
+    ...DEFAULT_OVERLAY_CONFIG,
+    ...overlayConfig,
+    activePanel: overlayConfig?.activePanel || 'none',
+    panelTimer: Number(overlayConfig?.panelTimer) || 0
+  };
 
   if (existingRows.length > 0) {
     const existing = existingRows[0];
@@ -546,12 +560,32 @@ async function updateStreamStatus(matchId, user, { status }) {
 
   if (status === 'LIVE' && !actualStart) {
     actualStart = new Date();
+    try {
+      let currentCfg = DEFAULT_OVERLAY_CONFIG;
+      if (stream.overlay_config) {
+        currentCfg = typeof stream.overlay_config === 'string' ? JSON.parse(stream.overlay_config) : stream.overlay_config;
+      }
+      currentCfg.activePanel = 'none';
+      currentCfg.panelTimer = 0;
+      currentCfg.panelUpdatedAt = null;
+      await db.query('UPDATE match_streams SET overlay_config = ? WHERE id = ?', [JSON.stringify(currentCfg), stream.id]);
+    } catch (e) {}
   }
   if (status === 'ENDED') {
     actualEnd = new Date();
     try {
       const matchBreakService = require('./matchBreakService');
       matchBreakService.endBreak(match.public_id || matchId).catch(() => {});
+    } catch (e) {}
+    try {
+      let currentCfg = DEFAULT_OVERLAY_CONFIG;
+      if (stream.overlay_config) {
+        currentCfg = typeof stream.overlay_config === 'string' ? JSON.parse(stream.overlay_config) : stream.overlay_config;
+      }
+      currentCfg.activePanel = 'none';
+      currentCfg.panelTimer = 0;
+      currentCfg.panelUpdatedAt = null;
+      await db.query('UPDATE match_streams SET overlay_config = ? WHERE id = ?', [JSON.stringify(currentCfg), stream.id]);
     } catch (e) {}
   }
 
@@ -694,10 +728,13 @@ async function updateOverlayConfig(matchId, user, config) {
 
   const io = getIO();
   if (io) {
-    io.to(`match:${match.public_id}`).emit('stream:overlay_updated', {
+    const overlayPayload = {
       matchId: match.public_id,
       overlayConfig: updated
-    });
+    };
+    io.to(`match:${match.public_id}`).emit('stream:overlay_updated', overlayPayload);
+    io.to(`stream:${match.public_id}`).emit('stream:overlay_updated', overlayPayload);
+    io.emit('stream:overlay_updated', overlayPayload);
   }
 
   return { success: true, overlayConfig: updated };

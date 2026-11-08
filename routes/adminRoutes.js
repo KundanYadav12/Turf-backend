@@ -50,4 +50,20 @@ router.post('/mobile-updates/releases/:id/publish', appUpdateController.publishR
 router.post('/mobile-updates/releases/:id/rollback', appUpdateController.rollbackRelease);
 router.delete('/mobile-updates/releases/:id', appUpdateController.deleteRelease);
 
+// Software Branding Super Admin Management
+const brandingController = require('../controllers/brandingController');
+const brandingUpload = require('../middleware/brandingUploadMiddleware');
+
+router.get('/branding', brandingController.getAdminBranding);
+router.put(
+  '/branding',
+  brandingUpload.fields([
+    { name: 'logo', maxCount: 1 },
+    { name: 'favicon', maxCount: 1 }
+  ]),
+  brandingController.updateBranding
+);
+router.post('/branding/reset', brandingController.resetBranding);
+router.get('/branding/audit-logs', brandingController.getAuditLogs);
+
 module.exports = router;

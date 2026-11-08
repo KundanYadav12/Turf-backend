@@ -281,10 +281,10 @@ async function getUpdateAnalytics() {
     devicesOnLatest,
     devicesPendingUpdate,
     adoptionPercentage,
-    totalDownloads: logsSummary[0]?.totalDownloads || 0,
-    totalInstalls: logsSummary[0]?.totalInstalls || 0,
-    totalFailures: logsSummary[0]?.totalFailures || 0,
-    totalApkClicks: logsSummary[0]?.totalApkClicks || 0,
+    totalDownloads: parseInt(logsSummary[0]?.totalDownloads, 10) || 0,
+    totalInstalls: parseInt(logsSummary[0]?.totalInstalls, 10) || 0,
+    totalFailures: parseInt(logsSummary[0]?.totalFailures, 10) || 0,
+    totalApkClicks: parseInt(logsSummary[0]?.totalApkClicks, 10) || 0,
     versionDistribution: formattedDist
   };
 }

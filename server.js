@@ -29,6 +29,8 @@ const privacyPolicyRoutes = require('./routes/privacyPolicyRoutes');
 const accountDeletionRoutes = require('./routes/accountDeletionRoutes');
 const appUpdateRoutes = require('./routes/appUpdateRoutes');
 const imageRoutes = require('./routes/imageRoutes');
+const chatRoutes = require('./routes/chatRoutes');
+const chatService = require('./services/chatService');
 const errorHandler = require('./middleware/errorHandler');
 const { verifyConnection: verifyEmailConnection } = require('./services/emailService');
 
@@ -134,6 +136,11 @@ app.use('/api/tv', tvDisplayRoutes);
 const streamRoutes = require('./routes/streamRoutes');
 app.use('/api/matches', streamRoutes);
 app.use('/api/streams', streamRoutes);
+app.use('/api/chat', chatRoutes);
+
+// Public Dynamic Software Branding
+const brandingController = require('./controllers/brandingController');
+app.get('/api/branding', brandingController.getPublicBranding);
 
 
 // 404 Route Handler
@@ -159,4 +166,7 @@ server.listen(PORT, () => {
 
   // Verify SMTP Email Server Connection asynchronously
   verifyEmailConnection();
+
+  // Auto-sync existing active teams and tournaments into chat system
+  chatService.backfillExistingGroups().catch(() => {});
 });

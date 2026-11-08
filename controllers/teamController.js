@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const db = require('../config/database');
 const { getIO } = require('../services/socketService');
+const chatService = require('../services/chatService');
 
 /**
  * Generate a cryptographically secure random alphanumeric invite code
@@ -615,6 +616,9 @@ const createTeam = async (req, res, next) => {
       });
     }
 
+    // Auto-create/sync Team Group Chat
+    chatService.syncTeamGroup(teamId).catch(() => {});
+
     res.status(201).json({
       success: true,
       message: 'Team created successfully!',
@@ -920,6 +924,9 @@ const addPlayerToTeam = async (req, res, next) => {
       [team.id]
     );
 
+    // Auto-sync Team Group Chat participants
+    chatService.syncTeamGroup(team.id).catch(() => {});
+
     res.status(201).json({
       success: true,
       message: `Player "${userRecord?.full_name || fullName}" added to roster!`,
@@ -1019,6 +1026,9 @@ const removePlayerFromTeam = async (req, res, next) => {
       `SELECT COUNT(*) as count FROM team_members WHERE team_id = ? AND deleted_at IS NULL`,
       [team.id]
     );
+
+    // Auto-sync Team Group Chat participants
+    chatService.syncTeamGroup(team.id).catch(() => {});
 
     const totalRosterSize = memberCountRes[0]?.count || 0;
 
@@ -1283,6 +1293,9 @@ const joinTeamByInviteCode = async (req, res, next) => {
       });
     }
 
+    // Auto-sync Team Group Chat participants
+    chatService.syncTeamGroup(team.id).catch(() => {});
+
     res.status(200).json({
       success: true,
       message: `Congratulations! You have joined ${team.name}!`,
@@ -1359,6 +1372,9 @@ const leaveTeam = async (req, res, next) => {
         totalRosterSize
       });
     }
+
+    // Auto-sync Team Group Chat participants
+    chatService.syncTeamGroup(team.id).catch(() => {});
 
     res.json({
       success: true,

@@ -173,6 +173,15 @@ async function assignScorer({ tournamentId, userId, matchId = null, assignedBy, 
       tournamentId: tournament.uuid,
       scorerUserId: targetUser.id
     });
+    io.to(`user:${targetUser.id}`).emit('user:scorer_assignment_updated', {
+      tournamentId: tournament.uuid,
+      action: 'ASSIGNED'
+    });
+    io.emit('scorer:assignmentChanged', {
+      tournamentId: tournament.uuid,
+      userId: targetUser.id,
+      action: 'ASSIGNED'
+    });
   }
 
   return {
@@ -226,6 +235,15 @@ async function removeScorer({ tournamentId, assignmentId, removedBy, removedByRo
       tournamentId: tournament.uuid,
       removedAssignmentId: assignmentId
     });
+    io.to(`user:${assignment.user_id}`).emit('user:scorer_assignment_updated', {
+      tournamentId: tournament.uuid,
+      action: 'REMOVED'
+    });
+    io.emit('scorer:assignmentChanged', {
+      tournamentId: tournament.uuid,
+      userId: assignment.user_id,
+      action: 'REMOVED'
+    });
   }
 
   return { success: true, message: 'Scorer access removed successfully.' };
@@ -233,54 +251,170 @@ async function removeScorer({ tournamentId, assignmentId, removedBy, removedByRo
 
 /**
  * Verify if authenticated user is authorized to score a match
+ * Permitted:
+ * a) Superadmin (ADMIN, SUPER_ADMIN)
+ * b) Organizer: Creator/owner of THAT tournament
+ * c) Assigned Scorer: Explicitly assigned in tournament_scorers (tournament-wide or match-specific) or tournament_matches.scorer_id
+ * Denied: All other users (guests, players, turf owners, team owners, unrelated organizers)
  */
 async function checkUserCanScoreMatch({ userId, userRole, matchPublicOrInternalId }) {
   if (!userId) return false;
+  const uid = Number(userId);
 
+  // 1. Superadmin check (role or DB check)
   const roleUpper = String(userRole || '').toUpperCase();
-  if (roleUpper === 'ADMIN' || roleUpper === 'SUPER_ADMIN') return true;
+  if (roleUpper === 'SUPER_ADMIN' || roleUpper === 'ADMIN') return true;
 
-  // Also check database user_roles in case user token role was omitted or stale
   const adminCheck = await db.query(
     `SELECT ur.user_id FROM user_roles ur 
      JOIN roles r ON ur.role_id = r.id 
      WHERE ur.user_id = ? AND UPPER(r.name) IN ('ADMIN', 'SUPER_ADMIN') 
      LIMIT 1`,
-    [userId]
+    [uid]
   );
   if (adminCheck && adminCheck.length > 0) return true;
 
+  // 2. Fetch match and its parent tournament
   const [match] = await db.query(
-    `SELECT tm.id, tm.scorer_id, tm.venue_id, tm.tournament_id, 
-            t.created_by as tournament_creator_id, 
-            v.owner_id as venue_owner_id
+    `SELECT tm.id, tm.scorer_id, tm.tournament_id, 
+            t.created_by as tournament_creator_id
      FROM tournament_matches tm
      JOIN tournaments t ON tm.tournament_id = t.id
-     LEFT JOIN venues v ON tm.venue_id = v.id
      WHERE tm.uuid = ? OR tm.id = ?`,
     [matchPublicOrInternalId, isNaN(matchPublicOrInternalId) ? -1 : parseInt(matchPublicOrInternalId, 10)]
   );
 
   if (!match) return false;
 
-  // Tournament creator or Venue owner
-  if (match.tournament_creator_id === userId || match.venue_owner_id === userId) {
+  // 3. Organizer of THAT tournament only
+  if (match.tournament_creator_id && Number(match.tournament_creator_id) === uid) {
     return true;
   }
 
-  // Direct match scorer_id
-  if (match.scorer_id === userId) {
+  // 4. Direct match scorer_id
+  if (match.scorer_id && Number(match.scorer_id) === uid) {
     return true;
   }
 
-  // Check tournament_scorers table (tournament-wide match_id IS NULL OR match-specific match_id = match.id)
+  // 5. Check tournament_scorers table (tournament-wide match_id IS NULL OR match-specific match_id = match.id)
   const rows = await db.query(
     `SELECT id FROM tournament_scorers 
      WHERE tournament_id = ? AND user_id = ? AND (match_id IS NULL OR match_id = ?)`,
-    [match.tournament_id, userId, match.id]
+    [match.tournament_id, uid, match.id]
   );
 
-  return rows.length > 0;
+  return Boolean(rows && rows.length > 0);
+}
+
+/**
+ * Check a user's scoring access scope for a tournament
+ * Returns: { canScoreAny: boolean, isSuperAdmin: boolean, isOrganizer: boolean, isAssignedScorer: boolean, assignedMatchIds: number[] | 'ALL' }
+ */
+async function getTournamentScorerAccess({ userId, userRole, tournamentId }) {
+  if (!userId) {
+    return {
+      canScoreAny: false,
+      isSuperAdmin: false,
+      isOrganizer: false,
+      isAssignedScorer: false,
+      assignedMatchIds: []
+    };
+  }
+  const uid = Number(userId);
+
+  // 1. Superadmin check
+  const roleUpper = String(userRole || '').toUpperCase();
+  if (roleUpper === 'SUPER_ADMIN' || roleUpper === 'ADMIN') {
+    return {
+      canScoreAny: true,
+      isSuperAdmin: true,
+      isOrganizer: true,
+      isAssignedScorer: true,
+      assignedMatchIds: 'ALL'
+    };
+  }
+
+  const adminCheck = await db.query(
+    `SELECT ur.user_id FROM user_roles ur 
+     JOIN roles r ON ur.role_id = r.id 
+     WHERE ur.user_id = ? AND UPPER(r.name) IN ('ADMIN', 'SUPER_ADMIN') 
+     LIMIT 1`,
+    [uid]
+  );
+  if (adminCheck && adminCheck.length > 0) {
+    return {
+      canScoreAny: true,
+      isSuperAdmin: true,
+      isOrganizer: true,
+      isAssignedScorer: true,
+      assignedMatchIds: 'ALL'
+    };
+  }
+
+  // 2. Fetch tournament
+  const isTournNum = /^\d+$/.test(String(tournamentId).trim());
+  const [tournament] = await db.query(
+    'SELECT id, uuid, created_by FROM tournaments WHERE uuid = ? OR id = ?',
+    [tournamentId, isTournNum ? parseInt(tournamentId, 10) : -1]
+  );
+  if (!tournament) {
+    return {
+      canScoreAny: false,
+      isSuperAdmin: false,
+      isOrganizer: false,
+      isAssignedScorer: false,
+      assignedMatchIds: []
+    };
+  }
+
+  // 3. Organizer of THAT tournament
+  if (tournament.created_by && Number(tournament.created_by) === uid) {
+    return {
+      canScoreAny: true,
+      isSuperAdmin: false,
+      isOrganizer: true,
+      isAssignedScorer: false,
+      assignedMatchIds: 'ALL'
+    };
+  }
+
+  // 4. Check tournament_scorers assignments
+  const assignments = await db.query(
+    'SELECT match_id FROM tournament_scorers WHERE tournament_id = ? AND user_id = ?',
+    [tournament.id, uid]
+  );
+
+  // Also check direct match scorer_id
+  const directMatches = await db.query(
+    'SELECT id FROM tournament_matches WHERE tournament_id = ? AND scorer_id = ?',
+    [tournament.id, uid]
+  );
+
+  const hasTournamentWide = assignments.some(a => a.match_id === null);
+  if (hasTournamentWide) {
+    return {
+      canScoreAny: true,
+      isSuperAdmin: false,
+      isOrganizer: false,
+      isAssignedScorer: true,
+      assignedMatchIds: 'ALL'
+    };
+  }
+
+  const matchIdsSet = new Set();
+  assignments.forEach(a => { if (a.match_id) matchIdsSet.add(a.match_id); });
+  directMatches.forEach(m => { if (m.id) matchIdsSet.add(m.id); });
+
+  const assignedMatchIds = Array.from(matchIdsSet);
+  const canScoreAny = assignedMatchIds.length > 0;
+
+  return {
+    canScoreAny,
+    isSuperAdmin: false,
+    isOrganizer: false,
+    isAssignedScorer: canScoreAny,
+    assignedMatchIds
+  };
 }
 
 /**
@@ -288,6 +422,7 @@ async function checkUserCanScoreMatch({ userId, userRole, matchPublicOrInternalI
  */
 async function getUserScoringMatches(userId) {
   if (!userId) return [];
+  const uid = Number(userId);
 
   // Check if user is an ADMIN or SUPER_ADMIN
   const adminCheck = await db.query(
@@ -295,7 +430,7 @@ async function getUserScoringMatches(userId) {
      JOIN roles r ON ur.role_id = r.id 
      WHERE ur.user_id = ? AND UPPER(r.name) IN ('ADMIN', 'SUPER_ADMIN') 
      LIMIT 1`,
-    [userId]
+    [uid]
   );
   const isAdmin = adminCheck && adminCheck.length > 0;
 
@@ -307,11 +442,13 @@ async function getUserScoringMatches(userId) {
        s.slug as sport_slug, s.name as sport_name,
        ta.name as team_a_name, ta.logo_url as team_a_logo,
        tb.name as team_b_name, tb.logo_url as team_b_logo,
-       v.name as venue_name
+       v.name as venue_name,
+       c.name as court_name
      FROM tournament_matches tm
      JOIN tournaments t ON tm.tournament_id = t.id
      JOIN sports s ON t.sport_id = s.id
      LEFT JOIN venues v ON tm.venue_id = v.id
+     LEFT JOIN courts c ON tm.court_id = c.id
      JOIN teams ta ON tm.team_a_id = ta.id
      JOIN teams tb ON tm.team_b_id = tb.id
      LEFT JOIN tournament_scorers ts ON ts.tournament_id = t.id AND (ts.match_id IS NULL OR ts.match_id = tm.id)
@@ -320,7 +457,7 @@ async function getUserScoringMatches(userId) {
   let params = [];
   if (!isAdmin) {
     query += ` WHERE (tm.scorer_id = ? OR ts.user_id = ?)`;
-    params = [userId, userId];
+    params = [uid, uid];
   }
 
   query += `
@@ -342,5 +479,6 @@ module.exports = {
   assignScorer,
   removeScorer,
   checkUserCanScoreMatch,
+  getTournamentScorerAccess,
   getUserScoringMatches
 };

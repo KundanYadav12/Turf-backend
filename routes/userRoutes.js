@@ -16,10 +16,15 @@ router.post('/profile-photo', authenticateUser, upload.single('photo'), userCont
 // 4. Remove Profile Photo (Protected: Self)
 router.delete('/profile-photo', authenticateUser, userController.removeProfilePhoto);
 
-// 5. Update Profile Details (Protected: Self)
+// 5. Get & Update Profile Details (Protected: Self)
+router.get('/profile', authenticateUser, userController.getMyProfile);
 router.put('/profile', authenticateUser, userController.updateProfile);
 
-// 6. Notifications Hub (Protected: Self)
+// 6. Change Password (Protected: Self)
+router.post('/change-password', authenticateUser, userController.changePassword);
+router.put('/change-password', authenticateUser, userController.changePassword);
+
+// 7. Notifications Hub (Protected: Self)
 router.get('/notifications', authenticateUser, userController.getNotifications);
 router.put('/notifications/:id/read', authenticateUser, userController.markNotificationRead);
 // 7. Account Self-Deletion & Status (Protected: Self)

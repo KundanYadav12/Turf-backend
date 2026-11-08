@@ -236,6 +236,24 @@ router.post('/:id/break/end', authenticateUser, checkBreakPermission, async (req
   }
 });
 
+// 3b. GET /api/matches/:id/can-score - Check if current user is authorized to score this match
+router.get('/:id/can-score', optionalAuthenticateUser, async (req, res, next) => {
+  try {
+    if (!req.user) {
+      return res.json({ success: true, canScore: false, reason: 'UNAUTHENTICATED', data: { canScore: false } });
+    }
+    const { checkUserCanScoreMatch } = require('../services/scorerAccessService');
+    const canScore = await checkUserCanScoreMatch({
+      userId: req.user.id,
+      userRole: req.user.role,
+      matchPublicOrInternalId: req.params.id
+    });
+    res.json({ success: true, canScore: Boolean(canScore), data: { canScore: Boolean(canScore) } });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // 4. GET /api/matches/:id/scorer - Full Scorer Console State (Protected: Scorer / Owner / Admin)
 router.get('/:id/scorer', authenticateUser, requireScorerForMatch, async (req, res, next) => {
   try {

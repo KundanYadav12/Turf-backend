@@ -5,6 +5,7 @@ const scorerAccessService = require('../services/scorerAccessService');
 const streamPermissionService = require('../services/streamPermissionService');
 const fixtureService = require('../services/fixtureService');
 const matchService = require('../services/matchService');
+const chatService = require('../services/chatService');
 const auctionController = require('../controllers/auctionController');
 const { authenticateUser, optionalAuthenticateUser } = require('../middleware/authMiddleware');
 const { authorizeRoles } = require('../middleware/rbacMiddleware');
@@ -407,6 +408,7 @@ router.put('/:id/groups', authenticateUser, authorizeTournamentOrganizer, async 
 router.post('/:id/teams', authenticateUser, authorizeTournamentOrganizer, async (req, res, next) => {
   try {
     const data = await pickleballService.addTeamToTournament(req.params.id, req.body, req.user);
+    chatService.syncTournamentGroup(req.params.id).catch(() => {});
     res.status(201).json({ success: true, message: 'Team added to tournament successfully!', data });
   } catch (error) {
     next(error);
@@ -667,6 +669,8 @@ router.post('/:id/register', authenticateUser, async (req, res, next) => {
       [tournament.id, resolvedTeamId, registrationType, player1Id || req.user.id, player2Id || null]
     );
 
+    chatService.syncTournamentGroup(tournament.id).catch(() => {});
+
     res.status(201).json({
       success: true,
       message: 'Registration submitted and approved successfully!',
@@ -819,6 +823,20 @@ router.post('/:id/player-registrations/:regId/reveal-sensitive', authenticateUse
       reason
     );
     res.json({ success: true, data: sensitiveData });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// MODULE I: Check current user's scorer access scope for this tournament
+router.get('/:id/my-scorer-access', optionalAuthenticateUser, async (req, res, next) => {
+  try {
+    const access = await scorerAccessService.getTournamentScorerAccess({
+      userId: req.user ? req.user.id : null,
+      userRole: req.user ? req.user.role : null,
+      tournamentId: req.params.id
+    });
+    res.json({ success: true, data: access });
   } catch (error) {
     next(error);
   }

@@ -322,6 +322,38 @@ function initSocket(server) {
       }
     });
 
+    // 10b. Real-time WhatsApp-Style Chat Handlers
+    socket.on('join:chat_conversation', ({ conversationId }) => {
+      if (conversationId) {
+        socket.join(`chat:conversation:${conversationId}`);
+      }
+    });
+
+    socket.on('leave:chat_conversation', ({ conversationId }) => {
+      if (conversationId) {
+        socket.leave(`chat:conversation:${conversationId}`);
+      }
+    });
+
+    socket.on('chat:typing', ({ conversationId, userId, userName }) => {
+      if (conversationId) {
+        socket.to(`chat:conversation:${conversationId}`).emit('chat:user_typing', {
+          conversationId,
+          userId,
+          userName
+        });
+      }
+    });
+
+    socket.on('chat:stop_typing', ({ conversationId, userId }) => {
+      if (conversationId) {
+        socket.to(`chat:conversation:${conversationId}`).emit('chat:user_stop_typing', {
+          conversationId,
+          userId
+        });
+      }
+    });
+
     // Helper to calculate exact viewer count (excluding broadcasters)
     const getRoomViewerCount = (mId) => {
       const room = io.sockets.adapter.rooms.get(`stream:${mId}`);

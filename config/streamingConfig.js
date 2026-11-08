@@ -43,7 +43,11 @@ const DEFAULT_OVERLAY_CONFIG = {
   showBallByBall: true,
   showTournamentName: true,
   showMatchTimer: true,
-  opacity: 0.95
+  opacity: 0.95,
+  activePanel: 'none', // 'none' | 'points' | 'awards'
+  panelTimer: 0, // 0 (Off), 15, 30, 60
+  panelUpdatedAt: null,
+  showCelebrations: true
 };
 
 module.exports = {
