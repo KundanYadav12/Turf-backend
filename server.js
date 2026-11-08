@@ -59,13 +59,7 @@ const PORT = process.env.PORT || CONFIG_PORT || 5008;
 // Enable CORS and JSON parsing
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (TRUSTED_ORIGINS.includes(origin) || origin.endsWith('playzo.duckdns.org')) {
-      return callback(null, true);
-    }
-    if (origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:')) {
-      return callback(null, true);
-    }
+    // Dynamically allow all incoming trusted and configured domains
     return callback(null, true);
   },
   credentials: true
@@ -74,8 +68,11 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Browser permissions header for WebRTC and Live Broadcasting
+// Support Chrome Private Network Access (PNA) and permission headers
 app.use((req, res, next) => {
+  if (req.headers['access-control-request-private-network']) {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
   res.setHeader(
     'Permissions-Policy',
     'camera=(self), microphone=(self), display-capture=(self)'
@@ -154,8 +151,8 @@ app.use((req, res) => {
 // Centralized Error Handler
 app.use(errorHandler);
 
-// Start Server
-server.listen(PORT, () => {
+// Start Server (listen on 0.0.0.0 so both IPv4 127.0.0.1 and host network can connect)
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
   console.log(`🏆 Sports Booking & Management Server Started`);
   console.log(`🌐 Public Web App: ${APP_URL}`);

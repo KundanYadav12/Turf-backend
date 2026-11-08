@@ -3,7 +3,10 @@ const chatService = require('../services/chatService');
 // GET /api/chat/conversations
 async function getConversations(req, res, next) {
   try {
-    const userId = req.user.id;
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
     const conversations = await chatService.getUserConversations(userId);
     res.json({ success: true, data: { items: conversations } });
   } catch (error) {
@@ -14,7 +17,10 @@ async function getConversations(req, res, next) {
 // GET /api/chat/unread-count
 async function getTotalUnread(req, res, next) {
   try {
-    const userId = req.user.id;
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
     const totalUnread = await chatService.getTotalUnreadCount(userId);
     res.json({ success: true, data: { totalUnread } });
   } catch (error) {
@@ -105,7 +111,10 @@ async function markAsRead(req, res, next) {
 // POST /api/chat/direct
 async function getOrCreateDirectChat(req, res, next) {
   try {
-    const userId = req.user.id;
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
     const { targetUserId } = req.body;
     if (!targetUserId) {
       return res.status(400).json({ success: false, message: 'targetUserId is required' });
@@ -113,6 +122,9 @@ async function getOrCreateDirectChat(req, res, next) {
     const conversation = await chatService.getOrCreateDirectConversation(userId, targetUserId);
     res.json({ success: true, data: conversation });
   } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
     next(error);
   }
 }

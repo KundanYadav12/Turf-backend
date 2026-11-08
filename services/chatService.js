@@ -31,7 +31,7 @@ async function isUserSuperAdmin(userId) {
 /**
  * Format conversation record for user view
  */
-async function formatConversationForUser(conv, userId) {
+async function formatConversationForUser(conv, userId, userMap = null) {
   // If DIRECT, resolve the other user's info as title & image
   let title = conv.title;
   let imageUrl = conv.image_url;
@@ -41,14 +41,27 @@ async function formatConversationForUser(conv, userId) {
     const ids = conv.direct_user_pair.split(':').map(Number);
     const otherId = ids[0] === Number(userId) ? ids[1] : ids[0];
 
-    const users = await db.query(
-      `SELECT id, full_name, username, profile_photo, status FROM users WHERE id = ?`,
-      [otherId]
-    );
-    if (users && users.length > 0) {
-      otherUser = users[0];
-      title = otherUser.full_name || otherUser.username || `User #${otherId}`;
-      imageUrl = otherUser.profile_photo || null;
+    if (otherId && !isNaN(otherId)) {
+      if (userMap && userMap.has(otherId)) {
+        otherUser = userMap.get(otherId);
+      } else {
+        try {
+          const users = await db.query(
+            `SELECT id, full_name, username, profile_photo, status FROM users WHERE id = ?`,
+            [otherId]
+          );
+          if (users && users.length > 0) {
+            otherUser = users[0];
+          }
+        } catch (e) {
+          console.warn('[formatConversationForUser] Failed to fetch other user:', otherId, e.message);
+        }
+      }
+
+      if (otherUser) {
+        title = otherUser.full_name || otherUser.username || `User #${otherId}`;
+        imageUrl = otherUser.profile_photo || null;
+      }
     }
   }
 
@@ -56,14 +69,14 @@ async function formatConversationForUser(conv, userId) {
     id: conv.id,
     uuid: conv.uuid,
     type: conv.type,
-    title,
-    imageUrl,
-    teamId: conv.team_id,
-    tournamentId: conv.tournament_id,
-    messagingPermission: conv.messaging_permission,
-    lastMessageId: conv.last_message_id,
-    lastMessagePreview: conv.last_message_preview,
-    lastMessageAt: conv.last_message_at,
+    title: title || (conv.type === 'DIRECT' ? 'Direct Message' : 'Group Chat'),
+    imageUrl: imageUrl || null,
+    teamId: conv.team_id || null,
+    tournamentId: conv.tournament_id || null,
+    messagingPermission: conv.messaging_permission || 'EVERYONE',
+    lastMessageId: conv.last_message_id || null,
+    lastMessagePreview: conv.last_message_preview || null,
+    lastMessageAt: conv.last_message_at || null,
     unreadCount: conv.user_unread_count || 0,
     role: conv.user_role || 'MEMBER',
     isExternal: Boolean(conv.user_is_external),
@@ -299,8 +312,21 @@ async function syncTournamentGroup(tournamentId) {
 async function getOrCreateDirectConversation(user1Id, user2Id) {
   const u1 = Number(user1Id);
   const u2 = Number(user2Id);
-  if (!u1 || !u2 || u1 === u2) {
-    throw new Error('Invalid user IDs for direct conversation');
+  if (!u1 || !u2 || isNaN(u1) || isNaN(u2) || u1 === u2) {
+    const err = new Error(u1 === u2 ? 'You cannot start a direct conversation with yourself.' : 'Invalid target user for direct conversation.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Verify target user exists
+  const targetUserRows = await db.query(
+    'SELECT id, full_name, username, profile_photo, status FROM users WHERE id = ?',
+    [u2]
+  );
+  if (!targetUserRows || targetUserRows.length === 0) {
+    const err = new Error('The selected user could not be found.');
+    err.statusCode = 404;
+    throw err;
   }
 
   const [minId, maxId] = [Math.min(u1, u2), Math.max(u1, u2)];
@@ -322,22 +348,28 @@ async function getOrCreateDirectConversation(user1Id, user2Id) {
     );
     conversationId = result.insertId;
 
-    // Add both participants
+    // Add both participants idempotently
     await db.query(
-      `INSERT INTO chat_participants (conversation_id, user_id, role, is_external) VALUES (?, ?, 'MEMBER', 0), (?, ?, 'MEMBER', 0)`,
+      `INSERT INTO chat_participants (conversation_id, user_id, role, is_external) 
+       VALUES (?, ?, 'MEMBER', 0), (?, ?, 'MEMBER', 0)
+       ON DUPLICATE KEY UPDATE left_at = NULL`,
       [conversationId, u1, conversationId, u2]
     );
   } else {
     conversationId = convs[0].id;
-    // Ensure both are marked active
+    // Ensure both participants are present and active
     await db.query(
-      `UPDATE chat_participants SET left_at = NULL WHERE conversation_id = ? AND user_id IN (?, ?)`,
-      [conversationId, u1, u2]
+      `INSERT INTO chat_participants (conversation_id, user_id, role, is_external) 
+       VALUES (?, ?, 'MEMBER', 0), (?, ?, 'MEMBER', 0)
+       ON DUPLICATE KEY UPDATE left_at = NULL`,
+      [conversationId, u1, conversationId, u2]
     );
   }
 
   const conv = await getConversationById(conversationId);
-  return formatConversationForUser(conv, u1);
+  const otherUser = targetUserRows[0];
+  const userMap = new Map([[u2, otherUser]]);
+  return formatConversationForUser(conv, u1, userMap);
 }
 
 /**
@@ -356,6 +388,8 @@ async function getConversationById(idOrUuid) {
  */
 async function getUserConversations(userId) {
   const uId = Number(userId);
+  if (!uId || isNaN(uId)) return [];
+
   const rows = await db.query(
     `SELECT c.*, 
             cp.role as user_role, 
@@ -370,9 +404,44 @@ async function getUserConversations(userId) {
     [uId]
   );
 
+  if (!rows || rows.length === 0) return [];
+
+  // Batch resolve otherUser for all DIRECT conversations in a single fast query
+  const directOtherIds = new Set();
+  for (const conv of rows) {
+    if (conv.type === 'DIRECT' && conv.direct_user_pair) {
+      const ids = conv.direct_user_pair.split(':').map(Number);
+      const otherId = ids[0] === uId ? ids[1] : ids[0];
+      if (otherId && !isNaN(otherId)) {
+        directOtherIds.add(otherId);
+      }
+    }
+  }
+
+  const userMap = new Map();
+  if (directOtherIds.size > 0) {
+    const idList = Array.from(directOtherIds);
+    const placeholders = idList.map(() => '?').join(',');
+    try {
+      const users = await db.query(
+        `SELECT id, full_name, username, profile_photo, status FROM users WHERE id IN (${placeholders})`,
+        idList
+      );
+      if (users && users.length > 0) {
+        users.forEach(u => userMap.set(Number(u.id), u));
+      }
+    } catch (e) {
+      console.warn('[getUserConversations] Failed to batch load other users:', e.message);
+    }
+  }
+
   const formatted = [];
   for (const conv of rows) {
-    formatted.push(await formatConversationForUser(conv, uId));
+    try {
+      formatted.push(await formatConversationForUser(conv, uId, userMap));
+    } catch (convErr) {
+      console.warn('[getUserConversations] Error formatting item:', conv.id, convErr.message);
+    }
   }
   return formatted;
 }
