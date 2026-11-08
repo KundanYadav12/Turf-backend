@@ -56,7 +56,7 @@ server.prependListener('upgrade', (req, socket, head) => {
 const io = initSocket(server);
 const PORT = process.env.PORT || CONFIG_PORT || 5008;
 
-// Enable CORS and JSON parsing
+// Enable CORS and JSON parsing with increased body limits for stadium ads and media uploads
 const corsOptions = {
   origin: (origin, callback) => {
     // Dynamically allow all incoming trusted and configured domains
@@ -65,8 +65,8 @@ const corsOptions = {
   credentials: true
 };
 app.use(cors(corsOptions));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Support Chrome Private Network Access (PNA) and permission headers
 app.use((req, res, next) => {

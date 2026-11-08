@@ -4,8 +4,11 @@ const errorHandler = (err, req, res, next) => {
   let statusCode = err.statusCode || 500;
   let message = err.message || 'Internal Server Error';
 
-  // Handle MySQL foreign key constraint failures (code 1452: ER_NO_REFERENCED_ROW_2)
-  if (err.code === 'ER_NO_REFERENCED_ROW_2' || err.errno === 1452) {
+  // Handle Multer file size exceeded
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    statusCode = 413;
+    message = 'File size is too large. Maximum allowed size is 25MB. Please choose a smaller image or compress it before uploading.';
+  } else if (err.code === 'ER_NO_REFERENCED_ROW_2' || err.errno === 1452) {
     statusCode = 400;
     if (err.message && err.message.includes('tournament_matches_ibfk_3')) {
       message = 'Selected Team A does not exist or has been removed from the database.';
