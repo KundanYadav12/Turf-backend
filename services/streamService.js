@@ -7,7 +7,7 @@ const {
   getIceServers,
   DEFAULT_OVERLAY_CONFIG
 } = require('../config/streamingConfig');
-const { extractYouTubeVideoId, getYouTubeEmbedUrl } = require('./youtubeStreamService');
+const { extractYouTubeVideoId, isYouTubeStreamKeyOrRtmp, getYouTubeEmbedUrl } = require('./youtubeStreamService');
 const { getIO } = require('./socketService');
 
 /**
@@ -421,8 +421,16 @@ async function initializeStream(matchId, user, payload = {}) {
       ytVideoId = extractYouTubeVideoId(effectiveYoutubeUrl);
       ytLiveUrl = effectiveYoutubeUrl.trim();
       if (!ytVideoId) {
-        throw { statusCode: 400, message: 'Invalid YouTube Live URL or Video ID. Supported formats: youtube.com/live/ID, youtube.com/watch?v=ID, youtu.be/ID' };
+        if (isYouTubeStreamKeyOrRtmp(effectiveYoutubeUrl)) {
+          throw {
+            statusCode: 400,
+            message: 'You entered a YouTube Stream Key or RTMP Ingest URL. Stream keys are entered in OBS Studio/encoders to send video to YouTube. To connect the stream to TurfSpot for viewers, please paste your YouTube Live Video URL (e.g. from YouTube Studio address bar: studio.youtube.com/video/... or youtube.com/watch?v=...) or your 11-character Video ID.'
+          };
+        }
+        throw { statusCode: 400, message: 'Invalid YouTube Live URL or Video ID. Supported formats: studio.youtube.com/video/ID, youtube.com/watch?v=ID, youtube.com/live/ID, youtu.be/ID, or direct 11-character Video ID.' };
       }
+      // Normalize ytLiveUrl to standard watch URL so players and viewers always have a clean link
+      ytLiveUrl = `https://www.youtube.com/watch?v=${ytVideoId}`;
     }
   }
 

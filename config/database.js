@@ -306,7 +306,8 @@ async function query(sql, params = []) {
     // Only fall back to SQLite for connection-level errors (ECONNREFUSED, ER_ACCESS_DENIED etc)
     const isConnError = error.code === 'ECONNREFUSED' || error.code === 'ER_ACCESS_DENIED_ERROR' || 
                         error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT' ||
-                        error.message.includes('connect');
+                        error.code === 'EACCES' || error.name === 'AggregateError' ||
+                        (error.message && error.message.includes('connect'));
     if (isConnError) {
       console.warn('⚠️ MySQL Unavailable:', error.message, '--> Switching to local SQLite engine.');
       useSqlite = true;
@@ -372,7 +373,8 @@ async function transaction(callback) {
   } catch (error) {
     // Only fall back if it's a genuine connection error
     const isConnError = error.code === 'ECONNREFUSED' || error.code === 'ER_ACCESS_DENIED_ERROR' || 
-                        error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT';
+                        error.code === 'ENOTFOUND' || error.code === 'ETIMEDOUT' ||
+                        error.code === 'EACCES' || error.name === 'AggregateError';
     if (isConnError) {
       console.warn('⚠️ MySQL Connection Error during transaction --> Fallback to SQLite engine.');
       useSqlite = true;
