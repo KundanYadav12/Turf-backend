@@ -3,38 +3,73 @@ const { YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REDIRECT_URI } = requi
 /**
  * Extracts a YouTube Video ID from any standard YouTube URL or ID string.
  * Supports:
+ * - https://studio.youtube.com/video/VIDEO_ID/livestreaming (YouTube Studio livestream)
  * - https://www.youtube.com/watch?v=VIDEO_ID
  * - https://youtu.be/VIDEO_ID
  * - https://youtube.com/live/VIDEO_ID
  * - https://www.youtube.com/embed/VIDEO_ID
+ * - https://www.youtube.com/shorts/VIDEO_ID
  * - Direct 11-character video ID
+ * - HTML iframe tags (extracts src attribute)
  */
 function extractYouTubeVideoId(input) {
   if (!input || typeof input !== 'string') return null;
-  const trimmed = input.trim();
+  let trimmed = input.trim();
 
-  // Direct 11-char ID
+  // Strip wrapping quotes if any
+  trimmed = trimmed.replace(/^["']|["']$/g, '');
+
+  // If someone pasted an iframe tag: extract the src URL
+  const iframeMatch = trimmed.match(/src=["']([^"']+)["']/i);
+  if (iframeMatch) {
+    trimmed = iframeMatch[1];
+  }
+
+  // 1. Direct 11-character video ID (e.g. RG7ws07JlY4)
   if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) {
     return trimmed;
   }
 
-  // youtube.com/live/VIDEO_ID
-  const liveMatch = trimmed.match(/youtube\.com\/live\/([a-zA-Z0-9_-]{11})/i);
+  // 2. YouTube Studio livestreaming URL: studio.youtube.com/video/VIDEO_ID(/livestreaming)?
+  const studioMatch = trimmed.match(/studio\.youtube\.com\/video\/([a-zA-Z0-9_-]{11})/i);
+  if (studioMatch) return studioMatch[1];
+
+  // 3. youtube.com/live/VIDEO_ID
+  const liveMatch = trimmed.match(/(?:youtube\.com|youtube-nocookie\.com)\/live\/([a-zA-Z0-9_-]{11})/i);
   if (liveMatch) return liveMatch[1];
 
-  // youtu.be/VIDEO_ID
+  // 4. youtu.be/VIDEO_ID
   const shortMatch = trimmed.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/i);
   if (shortMatch) return shortMatch[1];
 
-  // youtube.com/watch?v=VIDEO_ID
+  // 5. youtube.com/watch?v=VIDEO_ID
   const watchMatch = trimmed.match(/[?&]v=([a-zA-Z0-9_-]{11})/i);
   if (watchMatch) return watchMatch[1];
 
-  // youtube.com/embed/VIDEO_ID
-  const embedMatch = trimmed.match(/youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/i);
+  // 6. youtube.com/embed/VIDEO_ID
+  const embedMatch = trimmed.match(/(?:youtube\.com|youtube-nocookie\.com)\/embed\/([a-zA-Z0-9_-]{11})/i);
   if (embedMatch) return embedMatch[1];
 
+  // 7. youtube.com/shorts/VIDEO_ID
+  const shortsMatch = trimmed.match(/(?:youtube\.com|youtube-nocookie\.com)\/shorts\/([a-zA-Z0-9_-]{11})/i);
+  if (shortsMatch) return shortsMatch[1];
+
+  // 8. General fallback for any URL containing /video/VIDEO_ID or /v/VIDEO_ID
+  const genericMatch = trimmed.match(/(?:\/video\/|\/v\/)([a-zA-Z0-9_-]{11})/i);
+  if (genericMatch) return genericMatch[1];
+
   return null;
+}
+
+/**
+ * Checks if input is an RTMP ingest URL or stream key (e.g. ybv0-8u28-zqys-uc64-1xuf)
+ */
+function isYouTubeStreamKeyOrRtmp(input) {
+  if (!input || typeof input !== 'string') return false;
+  const trimmed = input.trim();
+  const isKey = /^[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/i.test(trimmed);
+  const isRtmp = /^rtmps?:\/\//i.test(trimmed);
+  return isKey || isRtmp;
 }
 
 /**
@@ -137,15 +172,18 @@ function getYouTubeSetupInstructions() {
       }
     ],
     supportedUrlFormats: [
-      'https://www.youtube.com/live/VIDEO_ID',
+      'https://studio.youtube.com/video/VIDEO_ID/livestreaming',
       'https://www.youtube.com/watch?v=VIDEO_ID',
-      'https://youtu.be/VIDEO_ID'
+      'https://www.youtube.com/live/VIDEO_ID',
+      'https://youtu.be/VIDEO_ID',
+      'VIDEO_ID (11 characters)'
     ]
   };
 }
 
 module.exports = {
   extractYouTubeVideoId,
+  isYouTubeStreamKeyOrRtmp,
   getYouTubeEmbedUrl,
   getYouTubeAuthUrl,
   exchangeCodeForTokens,
