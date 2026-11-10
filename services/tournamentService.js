@@ -61,7 +61,15 @@ const getTournamentsPaginated = async ({
       t.start_date,
       t.end_date,
       t.status,
+      t.created_by,
+      t.entry_fee,
+      t.updated_at,
+      t.has_auction,
+      t.venue_id,
+      t.description,
+      t.rules,
       COALESCE(v.city, 'Mumbai') as city,
+      s.id as sport_id,
       s.name as sport_name,
       s.slug as sport_slug,
       s.icon as sport_icon,
@@ -109,6 +117,16 @@ const getTournamentsPaginated = async ({
       startDate: item.start_date,
       endDate: item.end_date,
       status: item.status,
+      createdBy: item.created_by,
+      created_by: item.created_by,
+      entryFee: item.entry_fee != null ? parseFloat(item.entry_fee) : 0,
+      hasAuction: Boolean(item.has_auction),
+      updatedAt: item.updated_at,
+      updated_at: item.updated_at,
+      venueId: item.venue_id,
+      sportId: item.sport_id,
+      description: item.description,
+      rules: item.rules,
       totalViews: parseInt(item.total_views, 10) || 0,
       uniqueViewers: parseInt(item.unique_viewers, 10) || 0,
       lastViewedAt: item.last_viewed_at || null,
@@ -213,7 +231,15 @@ const getTournamentByPublicId = async (publicId) => {
     status: t.status,
     rules: t.rules,
     createdBy: t.created_by,
+    created_by: t.created_by,
     venueOwnerId: t.venue_owner_id,
+    venue_owner_id: t.venue_owner_id,
+    updatedAt: t.updated_at,
+    updated_at: t.updated_at,
+    entryFee: t.entry_fee != null ? parseFloat(t.entry_fee) : 0,
+    registrationDeadline: t.registration_deadline,
+    venueId: t.venue_id,
+    sportId: t.sport_id,
     hasAuction: Boolean(t.has_auction || auctionId),
     auctionId: auctionId,
     auctionStatus: auctionStatus,
@@ -1322,6 +1348,333 @@ const createTournament = async ({
 };
 
 /**
+ * Updates an existing tournament with authorization and validation.
+ */
+const updateTournament = async (idOrUuid, updates = {}, user) => {
+  const tournament = await resolveTournamentStrict(idOrUuid);
+  if (!tournament) {
+    throw { statusCode: 404, message: 'Tournament not found.' };
+  }
+
+  // 1. Authorization: Only SUPER_ADMIN, ADMIN, or the organizer who CREATED the tournament
+  const roleUpper = String(user?.role || '').toUpperCase();
+  const isSuperAdmin = roleUpper === 'SUPER_ADMIN' || roleUpper === 'ADMIN';
+  const isCreator = tournament.created_by && Number(tournament.created_by) === Number(user?.id);
+
+  if (!isSuperAdmin && !isCreator) {
+    throw { statusCode: 403, message: 'Forbidden. Only the tournament organizer or superadmin can edit this tournament.' };
+  }
+
+  // 2. Concurrency Guard: Validate updated_at if provided
+  const incomingUpdatedAt = updates.updatedAt || updates.updated_at;
+  if (incomingUpdatedAt && tournament.updated_at) {
+    const clientTime = new Date(incomingUpdatedAt).getTime();
+    const serverTime = new Date(tournament.updated_at).getTime();
+    if (!isNaN(clientTime) && !isNaN(serverTime) && Math.abs(clientTime - serverTime) > 2000) {
+      throw { statusCode: 409, message: 'Tournament was changed by someone else, reload and try again.' };
+    }
+  }
+
+  const {
+    name,
+    sportId,
+    description,
+    bannerUrl,
+    removeBanner,
+    format,
+    venueId,
+    startDate,
+    endDate,
+    registrationDeadline,
+    entryFee,
+    maxTeams,
+    rules,
+    status,
+    hasAuction,
+    matchFormat,
+    scoringMode,
+    targetScore,
+    winByTwo,
+    maxScore,
+    rosterSize,
+    groupsCount,
+    sportConfig
+  } = updates;
+
+  const setClauses = [];
+  const params = [];
+  const previousState = { ...tournament };
+
+  // 3. Name validation
+  if (name !== undefined) {
+    if (typeof name !== 'string' || name.trim().length < 3) {
+      throw { statusCode: 400, message: 'Tournament name must be at least 3 characters long.' };
+    }
+    if (name.trim().length > 150) {
+      throw { statusCode: 400, message: 'Tournament name must not exceed 150 characters.' };
+    }
+    setClauses.push('name = ?');
+    params.push(name.trim());
+  }
+
+  // 4. Safe-Edit: Sport Type
+  if (sportId !== undefined) {
+    const sId = parseInt(sportId, 10);
+    if (!isNaN(sId) && sId > 0 && sId !== tournament.sport_id) {
+      const [teamRows] = await db.query('SELECT COUNT(*) as teamCount FROM tournament_teams WHERE tournament_id = ?', [tournament.id]);
+      const [fixtureRows] = await db.query('SELECT COUNT(*) as matchCount FROM tournament_matches WHERE tournament_id = ?', [tournament.id]);
+      const teamCount = parseInt(teamRows?.teamCount || 0, 10);
+      const matchCount = parseInt(fixtureRows?.matchCount || 0, 10);
+      if (teamCount > 0 || matchCount > 0) {
+        throw { statusCode: 400, message: 'Locked because teams or fixtures already exist.' };
+      }
+      setClauses.push('sport_id = ?');
+      params.push(sId);
+    }
+  }
+
+  // 5. Safe-Edit: Tournament Format
+  if (format !== undefined && format !== tournament.format) {
+    const [fixtureRows] = await db.query('SELECT COUNT(*) as matchCount FROM tournament_matches WHERE tournament_id = ?', [tournament.id]);
+    const matchCount = parseInt(fixtureRows?.matchCount || 0, 10);
+    if (matchCount > 0) {
+      throw { statusCode: 400, message: 'Locked because fixtures already exist.' };
+    }
+    const allowedFormats = ['LEAGUE', 'KNOCKOUT', 'LEAGUE_KNOCKOUT'];
+    if (allowedFormats.includes(format)) {
+      setClauses.push('format = ?');
+      params.push(format);
+    }
+  }
+
+  // 6. Safe-Edit: Max Teams vs Registered Teams
+  if (maxTeams !== undefined) {
+    const parsedMax = parseInt(maxTeams, 10);
+    if (isNaN(parsedMax) || parsedMax < 1 || parsedMax > 64) {
+      throw { statusCode: 400, message: 'Maximum teams must be between 1 and 64.' };
+    }
+    const [regRows] = await db.query(
+      "SELECT COUNT(*) as regCount FROM tournament_teams WHERE tournament_id = ? AND registration_status = 'APPROVED'",
+      [tournament.id]
+    );
+    const regCount = parseInt(regRows?.regCount || 0, 10);
+    if (parsedMax < regCount) {
+      throw { statusCode: 400, message: `Cannot be lower than ${regCount} registered teams.` };
+    }
+    setClauses.push('max_teams = ?');
+    params.push(parsedMax);
+  }
+
+  // 7. Safe-Edit: Start Date & End Date vs Scheduled Matches
+  let newStart = tournament.start_date;
+  let newEnd = tournament.end_date;
+  if (startDate !== undefined && startDate) {
+    const sObj = new Date(startDate);
+    if (isNaN(sObj.getTime())) throw { statusCode: 400, message: 'Invalid start date format.' };
+    newStart = sObj.toISOString().slice(0, 10);
+  }
+  if (endDate !== undefined && endDate) {
+    const eObj = new Date(endDate);
+    if (isNaN(eObj.getTime())) throw { statusCode: 400, message: 'Invalid end date format.' };
+    newEnd = eObj.toISOString().slice(0, 10);
+  }
+  if (newEnd < newStart) {
+    throw { statusCode: 400, message: 'Tournament end date cannot be earlier than start date.' };
+  }
+  if (startDate !== undefined || endDate !== undefined) {
+    const [outsideRows] = await db.query(
+      'SELECT COUNT(*) as matchesOutside FROM tournament_matches WHERE tournament_id = ? AND (match_date < ? OR match_date > ?)',
+      [tournament.id, newStart, newEnd]
+    );
+    const matchesOutside = parseInt(outsideRows?.matchesOutside || 0, 10);
+    if (matchesOutside > 0) {
+      throw { statusCode: 400, message: `Cannot change tournament dates: ${matchesOutside} match(es) are scheduled outside the new date range.` };
+    }
+    if (startDate !== undefined) {
+      setClauses.push('start_date = ?');
+      params.push(newStart);
+    }
+    if (endDate !== undefined) {
+      setClauses.push('end_date = ?');
+      params.push(newEnd);
+    }
+  }
+
+  // 8. Registration Deadline
+  if (registrationDeadline !== undefined) {
+    if (registrationDeadline) {
+      const regObj = new Date(registrationDeadline);
+      if (isNaN(regObj.getTime())) throw { statusCode: 400, message: 'Invalid registration deadline format.' };
+      const regStr = regObj.toISOString().slice(0, 10);
+      if (regStr > newStart) {
+        throw { statusCode: 400, message: 'Registration deadline cannot be after tournament start date.' };
+      }
+      setClauses.push('registration_deadline = ?');
+      params.push(regStr);
+    } else {
+      setClauses.push('registration_deadline = ?');
+      params.push(newStart);
+    }
+  }
+
+  // 9. Entry Fee (Applies to new registrations only)
+  if (entryFee !== undefined) {
+    const fee = parseFloat(entryFee);
+    if (isNaN(fee) || fee < 0) {
+      throw { statusCode: 400, message: 'Entry fee must be a valid non-negative amount.' };
+    }
+    setClauses.push('entry_fee = ?');
+    params.push(fee);
+  }
+
+  // 10. Venue
+  if (venueId !== undefined) {
+    const vId = venueId ? parseInt(venueId, 10) : null;
+    setClauses.push('venue_id = ?');
+    params.push(vId && vId > 0 ? vId : null);
+  }
+
+  // 11. Description & Rules
+  if (description !== undefined) {
+    setClauses.push('description = ?');
+    params.push(description ? description.trim() : null);
+  }
+  if (rules !== undefined) {
+    setClauses.push('rules = ?');
+    params.push(rules ? rules.trim() : null);
+  }
+
+  // 12. Banner handling: replace, URL, or remove
+  if (removeBanner === true || removeBanner === 'true') {
+    setClauses.push('banner_url = NULL');
+  } else if (bannerUrl !== undefined) {
+    setClauses.push('banner_url = ?');
+    params.push(bannerUrl ? bannerUrl.trim() : null);
+  }
+
+  // 13. Status transitions
+  if (status !== undefined && status !== tournament.status) {
+    const allowedStatuses = ['DRAFT', 'PUBLISHED', 'ONGOING', 'COMPLETED', 'CANCELLED'];
+    if (!allowedStatuses.includes(status)) {
+      throw { statusCode: 400, message: `Invalid tournament status: ${status}` };
+    }
+    if (['COMPLETED', 'CANCELLED'].includes(tournament.status) && ['DRAFT'].includes(status)) {
+      throw { statusCode: 400, message: `Cannot transition tournament from ${tournament.status} back to ${status}.` };
+    }
+    setClauses.push('status = ?');
+    params.push(status);
+  }
+
+  // 14. Safe-Edit: Cricket Player Auction Toggle
+  if (hasAuction !== undefined) {
+    const incomingAuction = Boolean(hasAuction === true || hasAuction === 'true' || hasAuction === 1);
+    const currentAuction = Boolean(tournament.has_auction);
+    if (incomingAuction !== currentAuction) {
+      const auctions = await db.query('SELECT id, status FROM tournament_auctions WHERE tournament_id = ?', [tournament.id]);
+      if (auctions && auctions.length > 0) {
+        const a = auctions[0];
+        if (['LIVE', 'PAUSED', 'COMPLETED'].includes(a.status)) {
+          throw { statusCode: 400, message: 'Auction settings are locked because player auction is in progress or completed.' };
+        }
+        const [bids] = await db.query('SELECT COUNT(*) as bidCount FROM auction_bids WHERE auction_id = ?', [a.id]);
+        if (parseInt(bids?.bidCount || 0, 10) > 0) {
+          throw { statusCode: 400, message: 'Auction settings are locked because bidding has already started.' };
+        }
+      }
+      setClauses.push('has_auction = ?');
+      params.push(incomingAuction ? 1 : 0);
+    }
+  }
+
+  // 15. Pickleball / sport-specific parameters
+  if (matchFormat !== undefined) {
+    setClauses.push('match_format = ?');
+    params.push(matchFormat === 'SINGLES' ? 'SINGLES' : 'DOUBLES');
+  }
+  if (scoringMode !== undefined) {
+    const sMode = String(scoringMode).toUpperCase() === 'SIDE_OUT' ? 'SIDE_OUT' : 'RALLY';
+    let currentConfig = {};
+    try {
+      currentConfig = typeof tournament.sport_config === 'string'
+        ? JSON.parse(tournament.sport_config)
+        : (tournament.sport_config || {});
+    } catch (_) {}
+    currentConfig.scoringMode = sMode;
+    setClauses.push('sport_config = ?');
+    params.push(JSON.stringify(currentConfig));
+  }
+  if (targetScore !== undefined) {
+    const score = Math.max(1, parseInt(targetScore, 10) || 15);
+    setClauses.push('target_score = ?');
+    params.push(score);
+  }
+  if (winByTwo !== undefined) {
+    setClauses.push('win_by_two = ?');
+    params.push(winByTwo === false || winByTwo === 'false' || winByTwo === 0 ? 0 : 1);
+  }
+  if (maxScore !== undefined) {
+    const mScore = maxScore ? parseInt(maxScore, 10) : null;
+    setClauses.push('max_score = ?');
+    params.push(mScore);
+  }
+  if (rosterSize !== undefined) {
+    const rSize = Math.max(1, parseInt(rosterSize, 10) || 12);
+    setClauses.push('roster_size = ?');
+    params.push(rSize);
+  }
+  if (groupsCount !== undefined) {
+    const gCount = Math.max(1, parseInt(groupsCount, 10) || 2);
+    setClauses.push('groups_count = ?');
+    params.push(gCount);
+  }
+
+  // 16. Execute Database Update
+  if (setClauses.length > 0) {
+    params.push(tournament.id);
+    await db.query(`UPDATE tournaments SET ${setClauses.join(', ')} WHERE id = ?`, params);
+  }
+
+  const updatedTournament = await getTournamentByPublicId(tournament.uuid || tournament.id);
+
+  // 17. Record Audit Log if changes occurred
+  if (setClauses.length > 0) {
+    try {
+      await db.query(
+        `INSERT INTO tournament_audit_logs (tournament_id, action_type, user_id, user_role, previous_state, new_state, notes)
+         VALUES (?, 'TOURNAMENT_EDIT', ?, ?, ?, ?, ?)`,
+        [
+          tournament.id,
+          user.id,
+          user.role || 'USER',
+          JSON.stringify(previousState),
+          JSON.stringify(updatedTournament),
+          `Tournament updated by ${user.name || user.email || `User #${user.id}`}`
+        ]
+      );
+    } catch (auditErr) {
+      console.warn('Failed to record tournament edit audit log:', auditErr.message);
+    }
+  }
+
+  // 18. Broadcast Real-Time WebSocket Update
+  try {
+    const { getIO } = require('./socketService');
+    const io = getIO();
+    if (io) {
+      io.emit('tournament:updated', {
+        tournamentId: tournament.uuid,
+        id: tournament.id,
+        tournament: updatedTournament
+      });
+    }
+  } catch (wsErr) {
+    console.warn('WebSocket broadcast error on tournament update:', wsErr);
+  }
+
+  return updatedTournament;
+};
+
+/**
  * Returns impact of removing a team from a tournament (completed matches, fixtures, standings).
  */
 const getTeamRemovalImpact = async (tournamentPublicId, teamPublicId) => {
@@ -1852,6 +2205,7 @@ module.exports = {
   getTournamentTeamRoster,
   addPlayerToTournamentTeamRoster,
   createTournament,
+  updateTournament,
   getTeamRemovalImpact,
   removeTeamFromTournament,
   bulkAddTeamsToTournament,

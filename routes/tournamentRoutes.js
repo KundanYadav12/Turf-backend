@@ -128,6 +128,43 @@ router.delete('/:id', authenticateUser, async (req, res, next) => {
   }
 });
 
+// 2c. PUT /api/tournaments/:id - Update Tournament Details (Organizer or Superadmin)
+router.put(
+  '/:id',
+  authenticateUser,
+  (req, res, next) => {
+    upload.single('banner')(req, res, (err) => {
+      if (err) return res.status(400).json({ success: false, message: err.message });
+      next();
+    });
+  },
+  async (req, res, next) => {
+    try {
+      let bannerUrl = req.body.bannerUrl;
+      if (req.file) {
+        try {
+          const processed = await optimizeUpload(req.file.path, { type: 'banner' });
+          bannerUrl = processed.url;
+        } catch (imgErr) {
+          bannerUrl = `/uploads/${req.file.filename}`;
+        }
+      }
+      const updated = await tournamentService.updateTournament(
+        req.params.id,
+        { ...req.body, ...(bannerUrl ? { bannerUrl } : {}) },
+        req.user
+      );
+      res.json({
+        success: true,
+        message: 'Tournament updated successfully!',
+        data: updated
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 // 2b. GET /api/tournaments/live & /api/tournaments/live-all - Active Live matches across all tournaments
 router.get(['/live', '/live-all'], async (req, res, next) => {
   try {
