@@ -65,5 +65,7 @@ router.put(
 );
 router.post('/branding/reset', brandingController.resetBranding);
 router.get('/branding/audit-logs', brandingController.getAuditLogs);
+router.put('/features', brandingController.updateFeatureToggles);
+router.put('/branding/toggles', brandingController.updateFeatureToggles);
 
 module.exports = router;

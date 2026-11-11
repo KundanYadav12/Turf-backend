@@ -92,11 +92,39 @@ async function getAuditLogs(req, res, next) {
   }
 }
 
+/**
+ * PUT /api/admin/features or PUT /api/admin/branding/toggles (Superadmin / Admin)
+ * Update platform feature toggles: Explore Venues, My Bookings, Chat Image Upload, Disable Right Click
+ */
+async function updateFeatureToggles(req, res, next) {
+  try {
+    const { showExploreVenues, showMyBookings, showChatImageUpload, disableRightClick } = req.body;
+
+    const updated = await brandingService.updateFeatureToggles({
+      showExploreVenues,
+      showMyBookings,
+      showChatImageUpload,
+      disableRightClick,
+      user: req.user,
+      ipAddress: req.ip || req.headers['x-forwarded-for'] || null
+    });
+
+    res.json({
+      success: true,
+      message: 'Platform feature toggles updated successfully.',
+      data: updated
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
 module.exports = {
   getPublicBranding,
   getAdminBranding,
   updateBranding,
   resetBranding,
-  getAuditLogs
+  getAuditLogs,
+  updateFeatureToggles
 };
 

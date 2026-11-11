@@ -12,6 +12,7 @@ if (!fs.existsSync(BRANDING_UPLOAD_DIR)) {
 
 // In-memory cached branding object
 let cachedBranding = null;
+let columnsVerified = false;
 
 const DEFAULT_BRANDING = {
   appName: 'TurfSpot',
@@ -20,8 +21,47 @@ const DEFAULT_BRANDING = {
   faviconUrl: '/favicon.ico',
   logoDarkUrl: null,
   contactEmail: null,
+  showExploreVenues: true,
+  showMyBookings: true,
+  showChatImageUpload: true,
+  disableRightClick: false,
   updatedAt: new Date().toISOString()
 };
+
+/**
+ * Self-healing schema validation: ensures feature toggle columns exist in app_branding
+ */
+async function ensureBrandingColumns() {
+  if (columnsVerified) return;
+  try {
+    const cols = await db.query('DESCRIBE app_branding');
+    const colNames = (cols || []).map(c => c.Field);
+    if (!colNames.includes('show_explore_venues')) {
+      await db.query('ALTER TABLE app_branding ADD COLUMN show_explore_venues TINYINT(1) NOT NULL DEFAULT 1');
+      console.log('✅ Added show_explore_venues column to app_branding');
+    }
+    if (!colNames.includes('show_my_bookings')) {
+      await db.query('ALTER TABLE app_branding ADD COLUMN show_my_bookings TINYINT(1) NOT NULL DEFAULT 1');
+      console.log('✅ Added show_my_bookings column to app_branding');
+    }
+    if (!colNames.includes('show_chat_image_upload')) {
+      await db.query('ALTER TABLE app_branding ADD COLUMN show_chat_image_upload TINYINT(1) NOT NULL DEFAULT 1');
+      console.log('✅ Added show_chat_image_upload column to app_branding');
+    }
+    if (!colNames.includes('disable_right_click')) {
+      await db.query('ALTER TABLE app_branding ADD COLUMN disable_right_click TINYINT(1) NOT NULL DEFAULT 0');
+      console.log('✅ Added disable_right_click column to app_branding');
+    }
+    columnsVerified = true;
+  } catch (err) {
+    console.warn('[Branding] Column verification warning:', err.message);
+  }
+}
+
+// Auto-run schema check asynchronously on startup
+setImmediate(() => {
+  ensureBrandingColumns().catch(e => console.warn('[Branding] Startup column check error:', e.message));
+});
 
 /**
  * Format branding entity for API responses and client consumption
@@ -46,6 +86,10 @@ function formatBranding(row) {
     rawFaviconUrl: rawFavicon,
     logoDarkUrl: row.logo_dark_url || null,
     contactEmail: row.contact_email || null,
+    showExploreVenues: row.show_explore_venues !== undefined && row.show_explore_venues !== null ? (Number(row.show_explore_venues) === 1) : true,
+    showMyBookings: row.show_my_bookings !== undefined && row.show_my_bookings !== null ? (Number(row.show_my_bookings) === 1) : true,
+    showChatImageUpload: row.show_chat_image_upload !== undefined && row.show_chat_image_upload !== null ? (Number(row.show_chat_image_upload) === 1) : true,
+    disableRightClick: row.disable_right_click !== undefined && row.disable_right_click !== null ? (Number(row.disable_right_click) === 1) : false,
     updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : DEFAULT_BRANDING.updatedAt
   };
 }
@@ -333,10 +377,90 @@ async function getAuditLogs(limit = 25) {
   }));
 }
 
+/**
+ * Update platform feature toggles (Explore Venues, My Bookings, Chat Image Upload, Disable Right Click)
+ */
+async function updateFeatureToggles({ showExploreVenues, showMyBookings, showChatImageUpload, disableRightClick, user, ipAddress }) {
+  await ensureBrandingColumns();
+
+  const [current] = await db.query('SELECT * FROM app_branding WHERE id = 1');
+  const currentFormatted = formatBranding(current);
+
+  const updates = [];
+  const params = [];
+
+  if (showExploreVenues !== undefined) {
+    updates.push('show_explore_venues = ?');
+    params.push(showExploreVenues ? 1 : 0);
+  }
+  if (showMyBookings !== undefined) {
+    updates.push('show_my_bookings = ?');
+    params.push(showMyBookings ? 1 : 0);
+  }
+  if (showChatImageUpload !== undefined) {
+    updates.push('show_chat_image_upload = ?');
+    params.push(showChatImageUpload ? 1 : 0);
+  }
+  if (disableRightClick !== undefined) {
+    updates.push('disable_right_click = ?');
+    params.push(disableRightClick ? 1 : 0);
+  }
+
+  if (updates.length > 0) {
+    updates.push('updated_at = NOW()');
+    if (user?.id) {
+      updates.push('updated_by = ?');
+      params.push(user.id);
+    }
+    params.push(1);
+    await db.query(`UPDATE app_branding SET ${updates.join(', ')} WHERE id = ?`, params);
+  }
+
+  cachedBranding = await getBranding(true);
+
+  // Write audit log
+  try {
+    await db.query(`
+      INSERT INTO app_branding_audit_logs (user_id, user_email, user_role, action, details, ip_address)
+      VALUES (?, ?, ?, 'UPDATE_FEATURE_TOGGLES', ?, ?)
+    `, [
+      user?.id || null,
+      user?.email || 'admin',
+      user?.role || 'ADMIN',
+      JSON.stringify({
+        previous: {
+          showExploreVenues: currentFormatted.showExploreVenues,
+          showMyBookings: currentFormatted.showMyBookings,
+          showChatImageUpload: currentFormatted.showChatImageUpload,
+          disableRightClick: currentFormatted.disableRightClick
+        },
+        updated: {
+          showExploreVenues: cachedBranding.showExploreVenues,
+          showMyBookings: cachedBranding.showMyBookings,
+          showChatImageUpload: cachedBranding.showChatImageUpload,
+          disableRightClick: cachedBranding.disableRightClick
+        }
+      }),
+      ipAddress || null
+    ]);
+  } catch (auditErr) {
+    console.warn('[Branding] Audit log warning:', auditErr.message);
+  }
+
+  // Broadcast real-time WebSocket update to all connected clients!
+  const io = getIO();
+  if (io) {
+    io.emit('system:branding_updated', cachedBranding);
+  }
+
+  return cachedBranding;
+}
+
 module.exports = {
   getBranding,
   updateBranding,
   resetBranding,
+  updateFeatureToggles,
   getAuditLogs,
   DEFAULT_BRANDING
 };
