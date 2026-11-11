@@ -1,4 +1,5 @@
 const chatService = require('../services/chatService');
+const brandingService = require('../services/brandingService');
 
 // GET /api/chat/conversations
 async function getConversations(req, res, next) {
@@ -65,6 +66,14 @@ async function sendMessage(req, res, next) {
     // Attachments uploaded via multer
     const attachments = [];
     if (req.files && Array.isArray(req.files) && req.files.length > 0) {
+      const branding = await brandingService.getBranding();
+      if (branding.showChatImageUpload === false) {
+        return res.status(403).json({
+          success: false,
+          message: 'Image uploads in chat are currently disabled by the Super Administrator.',
+          code: 'CHAT_ATTACHMENTS_DISABLED'
+        });
+      }
       for (const f of req.files) {
         attachments.push({
           fileUrl: `/uploads/${f.filename}`,
