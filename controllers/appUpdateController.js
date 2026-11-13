@@ -161,6 +161,58 @@ async function createRelease(req, res, next) {
 }
 
 /**
+ * Superadmin Endpoint: Update an existing release
+ * PUT /api/admin/mobile-updates/releases/:id
+ */
+async function updateRelease(req, res, next) {
+  try {
+    let bundleUrl = req.body.bundleUrl;
+    let apkUrl = req.body.apkUrl;
+    let bundleHash = req.body.bundleHash;
+    let bundleSizeBytes = null;
+
+    if (req.files) {
+      if (req.files.bundle && req.files.bundle[0]) {
+        const file = req.files.bundle[0];
+        bundleUrl = `/uploads/mobile-updates/${file.filename}`;
+        bundleSizeBytes = file.size;
+        bundleHash = appUpdateService.calculateFileHash(file.path);
+      }
+      if (req.files.apk && req.files.apk[0]) {
+        const file = req.files.apk[0];
+        apkUrl = `/uploads/mobile-updates/${file.filename}`;
+      }
+    } else if (req.file) {
+      const file = req.file;
+      if (req.body.updateType === 'OTA') {
+        bundleUrl = `/uploads/mobile-updates/${file.filename}`;
+        bundleSizeBytes = file.size;
+        bundleHash = appUpdateService.calculateFileHash(file.path);
+      } else {
+        apkUrl = `/uploads/mobile-updates/${file.filename}`;
+      }
+    }
+
+    const release = await appUpdateService.updateRelease(req.params.id, {
+      ...req.body,
+      isMandatory: req.body.isMandatory === 'true' || req.body.isMandatory === true || req.body.isMandatory === 1,
+      bundleUrl,
+      apkUrl,
+      bundleHash,
+      bundleSizeBytes
+    }, req.user);
+
+    res.json({
+      success: true,
+      message: `Release v${release.version} updated successfully!`,
+      data: release
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
  * Superadmin Endpoint: Publish release
  * POST /api/admin/mobile-updates/releases/:id/publish
  */
@@ -210,6 +262,7 @@ module.exports = {
   getAnalytics,
   getReleases,
   createRelease,
+  updateRelease,
   publishRelease,
   rollbackRelease,
   deleteRelease
