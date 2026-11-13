@@ -391,6 +391,16 @@ async function createRelease({
 
   const publishedAt = safeStatus === 'PUBLISHED' ? new Date() : null;
 
+  // Smart fallbacks to existing static files if none uploaded
+  let finalBundleUrl = bundleUrl || null;
+  let finalApkUrl = apkUrl || null;
+  if (safeType === 'OTA' && !finalBundleUrl && fs.existsSync(path.join(__dirname, '../uploads/mobile-updates/turf-ota-bundle.hbc'))) {
+    finalBundleUrl = '/uploads/mobile-updates/turf-ota-bundle.hbc';
+  }
+  if (safeType === 'NATIVE' && !finalApkUrl && fs.existsSync(path.join(__dirname, '../uploads/mobile-updates/app-release.apk'))) {
+    finalApkUrl = '/uploads/mobile-updates/app-release.apk';
+  }
+
   const result = await db.query(`
     INSERT INTO app_releases (
       version, build_number, title, release_notes, update_type,
@@ -408,8 +418,8 @@ async function createRelease({
     safeMandatory,
     safeStatus,
     platform || 'android',
-    bundleUrl || null,
-    apkUrl || null,
+    finalBundleUrl,
+    finalApkUrl,
     bundleHash || null,
     bundleSizeBytes || null,
     runtimeVersion || '1.0.0',
@@ -427,6 +437,63 @@ async function createRelease({
   }
 
   return newRelease;
+}
+
+/**
+ * 6b. Update an Existing Release (Version, Build Number, Notes, Type, Mandatory, etc.)
+ */
+async function updateRelease(id, updateData = {}, user = null) {
+  const relRows = await db.query('SELECT * FROM app_releases WHERE id = ?', [id]);
+  if (!relRows || relRows.length === 0) {
+    throw { statusCode: 404, message: 'Release not found.' };
+  }
+
+  const current = relRows[0];
+  const version = updateData.version ? String(updateData.version).trim() : current.version;
+  const buildNumber = updateData.buildNumber ? parseInt(updateData.buildNumber, 10) : current.build_number;
+  const title = updateData.title !== undefined ? String(updateData.title).trim() : current.title;
+  const releaseNotes = updateData.releaseNotes !== undefined ? String(updateData.releaseNotes).trim() : current.release_notes;
+  const updateType = updateData.updateType || current.update_type;
+  const minAppVersion = updateData.minAppVersion || current.min_app_version;
+  const isMandatory = updateData.isMandatory !== undefined ? (Boolean(updateData.isMandatory) ? 1 : 0) : current.is_mandatory;
+  const platform = updateData.platform || current.platform;
+  const status = updateData.status || current.status;
+
+  let bundleUrl = updateData.bundleUrl !== undefined ? updateData.bundleUrl : current.bundle_url;
+  let apkUrl = updateData.apkUrl !== undefined ? updateData.apkUrl : current.apk_url;
+  let bundleHash = updateData.bundleHash || current.bundle_hash;
+  let bundleSizeBytes = updateData.bundleSizeBytes || current.bundle_size_bytes;
+
+  if (updateType === 'OTA' && !bundleUrl && fs.existsSync(path.join(__dirname, '../uploads/mobile-updates/turf-ota-bundle.hbc'))) {
+    bundleUrl = '/uploads/mobile-updates/turf-ota-bundle.hbc';
+  }
+  if (updateType === 'NATIVE' && !apkUrl && fs.existsSync(path.join(__dirname, '../uploads/mobile-updates/app-release.apk'))) {
+    apkUrl = '/uploads/mobile-updates/app-release.apk';
+  }
+
+  await db.query(`
+    UPDATE app_releases
+    SET version = ?, build_number = ?, title = ?, release_notes = ?, update_type = ?,
+        min_app_version = ?, is_mandatory = ?, platform = ?, status = ?,
+        bundle_url = ?, apk_url = ?, bundle_hash = ?, bundle_size_bytes = ?,
+        published_at = CASE WHEN ? = 'PUBLISHED' AND (published_at IS NULL OR status != 'PUBLISHED') THEN NOW() ELSE published_at END
+    WHERE id = ?
+  `, [
+    version, buildNumber, title, releaseNotes, updateType,
+    minAppVersion, isMandatory, platform, status,
+    bundleUrl, apkUrl, bundleHash, bundleSizeBytes,
+    status, id
+  ]);
+
+  const updatedRows = await db.query('SELECT * FROM app_releases WHERE id = ?', [id]);
+  const updatedRel = updatedRows[0];
+
+  // If status is PUBLISHED, broadcast update alert to all active mobile devices
+  if (updatedRel.status === 'PUBLISHED') {
+    broadcastUpdateNotification(updatedRel);
+  }
+
+  return updatedRel;
 }
 
 /**
@@ -590,6 +657,7 @@ module.exports = {
   getUpdateAnalytics,
   getAllReleases,
   createRelease,
+  updateRelease,
   publishRelease,
   rollbackRelease,
   deleteRelease

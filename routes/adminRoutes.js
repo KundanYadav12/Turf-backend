@@ -46,6 +46,14 @@ router.post(
   ]),
   appUpdateController.createRelease
 );
+router.put(
+  '/mobile-updates/releases/:id',
+  updateUpload.fields([
+    { name: 'bundle', maxCount: 1 },
+    { name: 'apk', maxCount: 1 }
+  ]),
+  appUpdateController.updateRelease
+);
 router.post('/mobile-updates/releases/:id/publish', appUpdateController.publishRelease);
 router.post('/mobile-updates/releases/:id/rollback', appUpdateController.rollbackRelease);
 router.delete('/mobile-updates/releases/:id', appUpdateController.deleteRelease);
