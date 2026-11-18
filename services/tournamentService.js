@@ -743,11 +743,13 @@ const addPlayerToTournamentTeamRoster = async (tournamentPublicId, teamPublicId,
 
   const leadershipRole = isCap ? 'CAPTAIN' : isViceCap ? 'VICE_CAPTAIN' : 'PLAYER';
 
+  const targetUserId = playerData.userId ? parseInt(playerData.userId, 10) : null;
+
   const insertResult = await db.query(
     `INSERT INTO team_members (
       team_id, user_id, player_name, role, jersey_number, position, is_captain, is_vice_captain
-    ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?)`,
-    [team.id, cleanName, leadershipRole, parsedJersey, role || 'Player', isCap ? 1 : 0, isViceCap ? 1 : 0]
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [team.id, targetUserId, cleanName, leadershipRole, parsedJersey, role || 'Player', isCap ? 1 : 0, isViceCap ? 1 : 0]
   );
 
   return {
@@ -962,6 +964,70 @@ const removePlayerFromTournamentTeamRoster = async (tournamentPublicId, teamPubl
     success: true,
     message: `Player "${existingMember.player_name || 'Player'}" removed from squad successfully.`,
     playerId: existingMember.id
+  };
+};
+
+/**
+ * Clears auto-generated or dummy players from a team's squad.
+ */
+const clearDummyPlayersFromTournamentTeamRoster = async (tournamentPublicId, teamPublicId, user) => {
+  const isTournNum = /^\d+$/.test(String(tournamentPublicId).trim());
+  const tournamentRows = await db.query(
+    `SELECT t.*, s.slug as sport_slug, v.owner_id as venue_owner_id
+     FROM tournaments t
+     LEFT JOIN sports s ON t.sport_id = s.id
+     LEFT JOIN venues v ON t.venue_id = v.id
+     WHERE t.uuid = ? OR t.id = ?`,
+    [tournamentPublicId, isTournNum ? parseInt(tournamentPublicId, 10) : -1]
+  );
+  if (!tournamentRows || tournamentRows.length === 0) {
+    throw { statusCode: 404, message: 'Tournament not found.' };
+  }
+  const tournament = tournamentRows[0];
+
+  const isTeamNum = /^\d+$/.test(String(teamPublicId).trim());
+  const teamRows = await db.query(
+    'SELECT * FROM teams WHERE uuid = ? OR id = ?',
+    [teamPublicId, isTeamNum ? parseInt(teamPublicId, 10) : -1]
+  );
+  if (!teamRows || teamRows.length === 0) {
+    throw { statusCode: 404, message: 'Team not found.' };
+  }
+  const team = teamRows[0];
+
+  const canManage = user?.role === 'ADMIN' ||
+    (Array.isArray(user?.roles) && user.roles.includes('ADMIN')) ||
+    user?.id === team.owner_id ||
+    user?.id === team.captain_id ||
+    tournament.created_by === user?.id ||
+    tournament.venue_owner_id === user?.id;
+
+  if (!canManage) {
+    throw { statusCode: 403, message: 'Forbidden. You do not have permission to manage this team squad.' };
+  }
+
+  // Delete all unassigned dummy members (e.g. X1..X12, Player 1..12, or members with user_id IS NULL)
+  const result = await db.query(
+    `DELETE FROM team_members 
+     WHERE team_id = ? 
+       AND user_id IS NULL`,
+    [team.id]
+  );
+
+  const { getIO } = require('./socketService');
+  const io = getIO();
+  if (io) {
+    io.to(`tournament:${tournament.uuid}`).emit('tournament:rosterUpdated', {
+      tournamentId: tournament.uuid,
+      teamId: team.uuid,
+      action: 'CLEARED_DUMMIES'
+    });
+  }
+
+  return {
+    success: true,
+    message: `Removed ${result.affectedRows || 0} unassigned / dummy players from squad.`,
+    removedCount: result.affectedRows || 0
   };
 };
 
@@ -1914,23 +1980,6 @@ const bulkAddTeamsToTournament = async (tournamentPublicId, { teamIds = [], grou
         [tournament.id, team.id, groupName || 'Group 1']
       );
 
-      // Check if team has members, auto-populate default roster if empty
-      const members = await db.query(`SELECT id FROM team_members WHERE team_id = ?`, [team.id]);
-      if (!members || members.length === 0) {
-        const rosterSize = tournament.roster_size || 12;
-        for (let idx = 0; idx < rosterSize; idx++) {
-          const pName = `${team.name} Player ${idx + 1}`;
-          const role = idx === 0 ? 'CAPTAIN' : (idx === 1 ? 'VICE_CAPTAIN' : 'PLAYER');
-          const isCap = idx === 0 ? 1 : 0;
-          const isViceCap = idx === 1 ? 1 : 0;
-          await db.query(
-            `INSERT INTO team_members (team_id, user_id, player_name, role, jersey_number, is_captain, is_vice_captain)
-             VALUES (?, NULL, ?, ?, ?, ?, ?)`,
-            [team.id, pName, role, idx + 1, isCap, isViceCap]
-          );
-        }
-      }
-
       results.push({ teamId: tid, teamName: team.name, status: 'SUCCESS' });
       registeredCount++;
     } catch (err) {
@@ -2211,6 +2260,7 @@ module.exports = {
   bulkAddTeamsToTournament,
   updatePlayerInTournamentTeamRoster,
   removePlayerFromTournamentTeamRoster,
+  clearDummyPlayersFromTournamentTeamRoster,
   updateTournamentMatchDisplay,
   bulkUpdateTournamentMatchesDisplay,
   updateTournamentCourtColor,

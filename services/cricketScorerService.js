@@ -1046,6 +1046,20 @@ const recordDelivery = async ({
       ]
     );
 
+    // Update Tournament points_table & recalculate authoritative standings (NRR, points, etc.) if match completed
+    if (matchStatus === 'COMPLETED' && m.tournament_id) {
+      try {
+        const { recalculateStandings, advanceKnockoutWinner } = require('./tournamentEngineService');
+        await recalculateStandings(m.tournament_id, { force: true });
+        if (winnerTeamId) {
+          const loserTeamId = m.team_a_id === winnerTeamId ? m.team_b_id : m.team_a_id;
+          await advanceKnockoutWinner(matchInfo.id, winnerTeamId, loserTeamId);
+        }
+      } catch (err) {
+        console.error('Error recalculating standings on cricket match complete in recordBall:', err);
+      }
+    }
+
     // 17. Broadcast live events
     broadcastTournamentMatchUpdate(m.tournament_public_id, {
       public_id: matchInfo.uuid,
@@ -1206,14 +1220,29 @@ const undoLastDelivery = async ({ matchPublicId, userId, userRole }) => {
       if (restoredState.currentOverBalls.length > 0) restoredState.currentOverBalls.pop();
     }
 
+    const [statusRows] = await conn.query('SELECT status, tournament_id FROM tournament_matches WHERE id = ?', [matchInfo.id]);
+    const wasCompleted = statusRows && statusRows[0] && statusRows[0].status === 'COMPLETED';
+
     const newSummary = `${restoredState.totalRuns}/${restoredState.wickets} (${restoredState.overs} ov)`;
     await conn.query(
       `UPDATE tournament_matches 
        SET live_score_summary = ?,
-           sport_state = ?
+           sport_state = ?,
+           status = 'LIVE',
+           winner_team_id = NULL,
+           result_summary = NULL
        WHERE id = ?`,
       [newSummary, JSON.stringify(restoredState), matchInfo.id]
     );
+
+    if (wasCompleted && statusRows[0]?.tournament_id) {
+      try {
+        const { recalculateStandings } = require('./tournamentEngineService');
+        await recalculateStandings(statusRows[0].tournament_id, { force: true });
+      } catch (e) {
+        console.warn('Failed to recalculate standings on cricket undo:', e);
+      }
+    }
 
     // Log in score_corrections
     await conn.query(

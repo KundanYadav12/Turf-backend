@@ -396,6 +396,10 @@ async function recordPoint(matchPublicId, { scoringSide = 'A', pointType = 'RALL
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
+  if (match.status === 'COMPLETED') {
+    throw { statusCode: 400, message: 'Match is already completed. Score cannot be altered without correction or undo.' };
+  }
+
   const candidatePlayerId = scoredByPlayerId || playerId;
 
   let state = {
@@ -922,6 +926,8 @@ async function undoPoint(matchPublicId, user) {
   const scoreSummary = completedGamesStr ? `${completedGamesStr} (${currentScoreStr})` : currentScoreStr;
   const liveSubtext = `Serving: ${state.currentServer === 'A' ? match.team_a_name : match.team_b_name} (${state.serverCourt})`;
 
+  const wasCompleted = match.status === 'COMPLETED';
+
   state.eventSeq = (state.eventSeq || 0) + 1;
 
   await db.query(
@@ -937,6 +943,14 @@ async function undoPoint(matchPublicId, user) {
      WHERE id = ?`,
     [state.gamesWonA, state.gamesWonB, scoreSummary, liveSubtext, JSON.stringify(state), match.id]
   );
+
+  if (wasCompleted && match.tournament_id) {
+    try {
+      await recalculateStandings(match.tournament_id, { force: true });
+    } catch (e) {
+      console.warn('Failed to recalculate standings on badminton undo:', e);
+    }
+  }
 
   broadcastBadmintonEvent(match, {
     type: 'UNDO',

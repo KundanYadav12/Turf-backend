@@ -149,6 +149,10 @@ async function setLineups(matchPublicId, { teamALineup, teamBLineup }, user) {
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
+  if (match.status === 'COMPLETED') {
+    throw { statusCode: 400, message: 'Match is already completed. Score cannot be altered without correction or undo.' };
+  }
+
   let state = {};
   try {
     state = typeof match.sport_state === 'string' ? JSON.parse(match.sport_state) : (match.sport_state || {});
@@ -179,6 +183,10 @@ async function updatePeriod(matchPublicId, { period, minute, stoppageMinutes = 0
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
+  if (match.status === 'COMPLETED') {
+    throw { statusCode: 400, message: 'Match is already completed. Score cannot be altered without correction or undo.' };
+  }
+
   let state = {};
   try {
     state = typeof match.sport_state === 'string' ? JSON.parse(match.sport_state) : (match.sport_state || {});
@@ -189,12 +197,27 @@ async function updatePeriod(matchPublicId, { period, minute, stoppageMinutes = 0
   state.stoppageMinutes = stoppageMinutes;
 
   let newStatus = match.status;
+  let determinedWinnerId = match.winner_team_id;
+  let finalSummary = match.result_summary;
+
   if (['1ST_HALF', '2ND_HALF', 'EXTRA_TIME_1', 'EXTRA_TIME_2', 'PENALTIES'].includes(period)) {
     newStatus = 'LIVE';
   } else if (period === 'HALF_TIME') {
     newStatus = 'PAUSED';
   } else if (period === 'FULL_TIME') {
     newStatus = 'COMPLETED';
+    const sA = Number(state.teamAScore) || 0;
+    const sB = Number(state.teamBScore) || 0;
+    if (sA > sB) {
+      determinedWinnerId = match.team_a_id;
+      finalSummary = `${match.team_a_name} won ${sA} - ${sB}`;
+    } else if (sB > sA) {
+      determinedWinnerId = match.team_b_id;
+      finalSummary = `${match.team_b_name} won ${sB} - ${sA}`;
+    } else {
+      determinedWinnerId = null;
+      finalSummary = `Match Drawn ${sA} - ${sB}`;
+    }
   }
 
   const scoreSummary = `${state.teamAScore || 0} - ${state.teamBScore || 0}`;
@@ -203,10 +226,23 @@ async function updatePeriod(matchPublicId, { period, minute, stoppageMinutes = 0
   await db.query(
     `UPDATE tournament_matches 
      SET status = ?, period_state = ?, sport_state = ?,
-         live_score_summary = ?, live_subtext = ?
+         live_score_summary = ?, live_subtext = ?,
+         winner_team_id = ?, result_summary = ?
      WHERE id = ?`,
-    [newStatus, period, JSON.stringify(state), scoreSummary, liveSubtext, match.id]
+    [newStatus, period, JSON.stringify(state), scoreSummary, liveSubtext, determinedWinnerId, finalSummary, match.id]
   );
+
+  if (newStatus === 'COMPLETED' && match.tournament_id) {
+    try {
+      await recalculateStandings(match.tournament_id, { force: true });
+      if (match.stage && match.stage !== 'GROUP' && determinedWinnerId) {
+        const loserId = determinedWinnerId === match.team_a_id ? match.team_b_id : match.team_a_id;
+        await advanceKnockoutWinner(match.id, determinedWinnerId, loserId);
+      }
+    } catch (e) {
+      console.warn('Failed to recalculate standings on football full-time:', e);
+    }
+  }
 
   // Broadcast to Socket.IO
   broadcastFootballEvent(match, {
@@ -236,6 +272,10 @@ async function recordGoal(matchPublicId, {
 }, user) {
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
+
+  if (match.status === 'COMPLETED') {
+    throw { statusCode: 400, message: 'Match is already completed. Score cannot be altered without correction or undo.' };
+  }
 
   let state = {};
   try {
@@ -315,6 +355,10 @@ async function recordCard(matchPublicId, {
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
+  if (match.status === 'COMPLETED') {
+    throw { statusCode: 400, message: 'Match is already completed. Score cannot be altered without correction or undo.' };
+  }
+
   const isTeamA = Number(teamId) === Number(match.team_a_id);
   const teamName = isTeamA ? match.team_a_name : match.team_b_name;
   const desc = cardType === 'RED'
@@ -363,6 +407,10 @@ async function recordSubstitution(matchPublicId, {
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
+  if (match.status === 'COMPLETED') {
+    throw { statusCode: 400, message: 'Match is already completed. Score cannot be altered without correction or undo.' };
+  }
+
   const isTeamA = Number(teamId) === Number(match.team_a_id);
   const teamName = isTeamA ? match.team_a_name : match.team_b_name;
   const desc = `🔄 Substitution for ${teamName}: ${playerOnName} ON 🔼, ${playerOffName} OFF 🔽 (${minute}')`;
@@ -402,6 +450,10 @@ async function undoLastEvent(matchPublicId, user) {
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
 
+  if (match.status === 'COMPLETED') {
+    throw { statusCode: 400, message: 'Match is already completed. Score cannot be altered without correction or undo.' };
+  }
+
   const lastEvents = await db.query(
     `SELECT * FROM sport_match_events WHERE match_id = ? ORDER BY id DESC LIMIT 1`,
     [match.id]
@@ -437,6 +489,23 @@ async function undoLastEvent(matchPublicId, user) {
     );
   }
 
+  const wasCompleted = match.status === 'COMPLETED';
+  if (wasCompleted) {
+    await db.query(
+      `UPDATE tournament_matches 
+       SET status = 'LIVE', winner_team_id = NULL, result_summary = NULL, period_state = '2ND_HALF'
+       WHERE id = ?`,
+      [match.id]
+    );
+    if (match.tournament_id) {
+      try {
+        await recalculateStandings(match.tournament_id, { force: true });
+      } catch (e) {
+        console.warn('Failed to recalculate standings on football undo:', e);
+      }
+    }
+  }
+
   broadcastFootballEvent(match, {
     type: 'UNDO',
     undoneEventId: lastEvent.id,
@@ -453,6 +522,10 @@ async function undoLastEvent(matchPublicId, user) {
 async function completeMatch(matchPublicId, { winnerTeamId, resultSummary }, user) {
   const match = await resolveMatch(matchPublicId);
   if (!match) throw { statusCode: 404, message: 'Match not found.' };
+
+  if (match.status === 'COMPLETED') {
+    throw { statusCode: 400, message: 'Match is already completed. Score cannot be altered without correction or undo.' };
+  }
 
   let state = {};
   try {

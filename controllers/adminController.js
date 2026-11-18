@@ -3,6 +3,7 @@ const db = require('../config/database');
 const getAdminDashboardStats = async (req, res, next) => {
   try {
     const userCount = await db.query(`SELECT COUNT(id) as total FROM users`);
+    const activeLoginCount = await db.query(`SELECT COUNT(id) as total FROM users WHERE last_login_at >= NOW() - INTERVAL 1 DAY`);
     const venueCount = await db.query(`SELECT COUNT(id) as total FROM venues`);
     const bookingCount = await db.query(`SELECT COUNT(id) as total FROM bookings`);
     const revenueStats = await db.query(
@@ -26,6 +27,7 @@ const getAdminDashboardStats = async (req, res, next) => {
       success: true,
       data: {
         totalUsers: userCount[0]?.total || 0,
+        activeUsers: Math.max(1, activeLoginCount[0]?.total || 1),
         totalVenues: venueCount[0]?.total || 0,
         totalBookings: bookingCount[0]?.total || 0,
         totalVolume: parseFloat(revenueStats[0]?.total_volume || 0),
@@ -51,7 +53,7 @@ const getAdminDashboardStats = async (req, res, next) => {
 const getUsers = async (req, res, next) => {
   try {
     const users = await db.query(
-      `SELECT u.id, u.full_name, u.email, u.phone, u.status, u.created_at, r.name as role 
+      `SELECT u.id, u.full_name, u.email, u.phone, u.status, u.created_at, u.last_login_at, r.name as role 
        FROM users u
        LEFT JOIN user_roles ur ON u.id = ur.user_id
        LEFT JOIN roles r ON ur.role_id = r.id
@@ -64,10 +66,11 @@ const getUsers = async (req, res, next) => {
         id: u.id,
         fullName: u.full_name,
         email: u.email,
-        phone: u.phone,
+        phone: u.phone || 'N/A',
         role: u.role || 'PLAYER',
         status: u.status,
-        createdAt: u.created_at
+        createdAt: u.created_at,
+        lastLoginAt: u.last_login_at
       }))
     });
   } catch (error) {

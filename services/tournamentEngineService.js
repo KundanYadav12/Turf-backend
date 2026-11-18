@@ -642,28 +642,58 @@ function oversToDecimal(overs) {
   return wholeOvers + (balls / 6);
 }
 
+// In-memory sequential queue per tournament to prevent race conditions during concurrent recalculations
+const recalculationQueues = new Map();
+
 /**
  * Authoritative Standings Recalculation Engine
  * Calculates sport-specific points, GD, NRR, game/point differentials, rankings,
  * and permanently preserves/freezes standings after tournament conclusion.
+ * Thread-safe with per-tournament queuing.
  */
 async function recalculateStandings(tournamentId, options = {}) {
+  const normTournId = String(tournamentId);
+  if (!normTournId) return;
+
+  if (!recalculationQueues.has(normTournId)) {
+    recalculationQueues.set(normTournId, Promise.resolve());
+  }
+
+  const currentChain = recalculationQueues.get(normTournId);
+  const nextChain = currentChain.then(async () => {
+    try {
+      await _executeRecalculateStandings(tournamentId, options);
+    } catch (err) {
+      console.error(`❌ [recalculateStandings] Error for tournament #${normTournId}:`, err);
+    }
+  }).finally(() => {
+    if (recalculationQueues.get(normTournId) === nextChain) {
+      recalculationQueues.delete(normTournId);
+    }
+  });
+
+  recalculationQueues.set(normTournId, nextChain);
+  return nextChain;
+}
+
+async function _executeRecalculateStandings(tournamentId, options = {}) {
   await ensureFrozenColumns();
   const tournament = await getTournamentEntity(tournamentId);
   if (!tournament) return;
 
   const { force = false } = options;
 
-  // 0. Standings Freeze check: If standings are already frozen or tournament is COMPLETED,
+  // 0. Standings Freeze check: If tournament is officially COMPLETED and frozen,
   // do not overwrite unless force is explicitly requested.
-  if (!force && (tournament.is_standings_frozen || tournament.status === 'COMPLETED')) {
-    console.log(`ℹ️ [recalculateStandings] Tournament #${tournament.id} standings are frozen. Skipping destructive recalculation.`);
+  // Ongoing tournaments should always keep recalculating standings freely!
+  if (!force && tournament.status === 'COMPLETED' && tournament.is_standings_frozen) {
+    console.log(`ℹ️ [recalculateStandings] Tournament #${tournament.id} is COMPLETED and standings are frozen. Skipping destructive recalculation.`);
     return;
   }
 
   const sportSlug = tournament.sport_slug || 'cricket';
   const sportConfig = getSportConfig(sportSlug);
-  const winPts = sportConfig.standingsFormula?.winPoints ?? (sportSlug === 'pickleball' ? 2 : 2);
+  const winPts = sportConfig.standingsFormula?.winPoints ?? (sportSlug === 'football' ? 3 : 2);
   const drawPts = sportConfig.standingsFormula?.drawPoints ?? (sportConfig.standingsFormula?.tiePoints ?? 1);
   const lossPts = sportConfig.standingsFormula?.lossPoints ?? 0;
 
@@ -801,9 +831,13 @@ async function recalculateStandings(tournamentId, options = {}) {
        AND UPPER(TRIM(tm.status)) NOT IN ('LIVE', 'SCHEDULED', 'READY', 'PAUSED', 'INNINGS_BREAK', 'CANCELLED', 'ABANDONED')
        AND (tm.counts_in_standings = 1 OR tm.counts_in_standings IS NULL)
        AND (
-         UPPER(TRIM(COALESCE(tm.category, 'LEAGUE'))) IN ('LEAGUE', 'GROUP', 'ROUND_ROBIN')
-         OR UPPER(TRIM(COALESCE(tm.stage, 'GROUP'))) IN ('GROUP', 'LEAGUE', 'ROUND_ROBIN')
-       )`,
+         tm.group_name IS NOT NULL
+         OR UPPER(TRIM(COALESCE(tm.stage, 'GROUP'))) LIKE 'GROUP%'
+         OR UPPER(TRIM(COALESCE(tm.stage, 'GROUP'))) IN ('GROUP', 'LEAGUE', 'ROUND_ROBIN', 'REGULAR')
+         OR UPPER(TRIM(COALESCE(tm.category, 'LEAGUE'))) IN ('LEAGUE', 'GROUP', 'ROUND_ROBIN', 'DOUBLES', 'SINGLES', 'MATCH', 'PICKLEBALL')
+         OR tm.stage IS NULL
+       )
+       AND UPPER(TRIM(COALESCE(tm.stage, ''))) NOT IN ('KNOCKOUT', 'PLAYOFF', 'QUARTER_FINAL', 'SEMI_FINAL', 'FINAL')`,
     [tournament.id]
   );
 
@@ -846,6 +880,11 @@ async function recalculateStandings(tournamentId, options = {}) {
     const canonicalAId = teamIdToCanonicalId[m.team_a_id] || m.team_a_id;
     const canonicalBId = teamIdToCanonicalId[m.team_b_id] || m.team_b_id;
 
+    if (canonicalAId === canonicalBId) {
+      console.warn(`⚠️ [recalculateStandings] Match #${m.id} has identical canonical team IDs (${canonicalAId}), skipping duplicate self-play.`);
+      continue;
+    }
+
     const tA = statsMap[canonicalAId];
     const tB = statsMap[canonicalBId];
     if (!tA || !tB) {
@@ -869,6 +908,53 @@ async function recalculateStandings(tournamentId, options = {}) {
     tA.pa += scoreB;
     tB.pf += scoreB;
     tB.pa += scoreA;
+
+    // For racket sports (Badminton, Tennis, Table Tennis, Pickleball), parse individual game scores if available
+    if (['badminton', 'tennis', 'table_tennis', 'pickleball'].includes(sportSlug) && m.sport_state) {
+      try {
+        const state = typeof m.sport_state === 'string' ? JSON.parse(m.sport_state) : m.sport_state;
+        if (state && Array.isArray(state.gameScores)) {
+          let rallyA = 0;
+          let rallyB = 0;
+          let setsA = 0;
+          let setsB = 0;
+          for (const g of state.gameScores) {
+            if (g && (g.teamA > 0 || g.teamB > 0 || g.winner)) {
+              rallyA += (Number(g.teamA) || 0);
+              rallyB += (Number(g.teamB) || 0);
+              if (g.winner === 'A') setsA++;
+              else if (g.winner === 'B') setsB++;
+            }
+          }
+          if (rallyA > 0 || rallyB > 0) {
+            // Adjust points scored/conceded with actual rally points
+            tA.pf = (tA.pf - scoreA) + rallyA;
+            tA.pa = (tA.pa - scoreB) + rallyB;
+            tB.pf = (tB.pf - scoreB) + rallyB;
+            tB.pa = (tB.pa - scoreA) + rallyA;
+            tA.setsWon += (setsA || scoreA);
+            tA.setsLost += (setsB || scoreB);
+            tB.setsWon += (setsB || scoreB);
+            tB.setsLost += (setsA || scoreA);
+          } else {
+            tA.setsWon += scoreA;
+            tA.setsLost += scoreB;
+            tB.setsWon += scoreB;
+            tB.setsLost += scoreA;
+          }
+        } else {
+          tA.setsWon += scoreA;
+          tA.setsLost += scoreB;
+          tB.setsWon += scoreB;
+          tB.setsLost += scoreA;
+        }
+      } catch (e) {
+        tA.setsWon += scoreA;
+        tA.setsLost += scoreB;
+        tB.setsWon += scoreB;
+        tB.setsLost += scoreA;
+      }
+    }
 
     // Cricket Innings data for Net Run Rate
     if (sportSlug === 'cricket') {
@@ -972,15 +1058,22 @@ async function recalculateStandings(tournamentId, options = {}) {
   );
   const totalFixtures = Number(matchCounts?.total_fixtures || 0);
   const pendingFixtures = Number(matchCounts?.pending_fixtures || 0);
-  const isFinished = totalFixtures > 0 && pendingFixtures === 0;
-  const shouldFreeze = Boolean(tournament.is_standings_frozen || tournament.status === 'COMPLETED' || isFinished);
+  const isFinished = totalFixtures > 0 && pendingFixtures === 0 && tournament.status === 'COMPLETED';
+  const shouldFreeze = Boolean((tournament.is_standings_frozen && tournament.status === 'COMPLETED') || isFinished);
 
-  if (shouldFreeze && !tournament.is_standings_frozen) {
+  if (tournament.status === 'COMPLETED' && shouldFreeze && !tournament.is_standings_frozen) {
     try {
       await db.query(`UPDATE tournaments SET is_standings_frozen = 1 WHERE id = ?`, [tournament.id]);
+      tournament.is_standings_frozen = 1;
     } catch (e) {
       // column may not exist on unmigrated database
     }
+  } else if (tournament.status !== 'COMPLETED' && tournament.is_standings_frozen) {
+    // If tournament is actively ongoing, ensure it is NOT frozen so standings update with every match!
+    try {
+      await db.query(`UPDATE tournaments SET is_standings_frozen = 0 WHERE id = ?`, [tournament.id]);
+      tournament.is_standings_frozen = 0;
+    } catch (e) {}
   }
 
   // Update points_table in database with all metrics and freeze status
@@ -1058,6 +1151,15 @@ async function recalculateStandings(tournamentId, options = {}) {
   if (io) {
     io.to(`tournament:${tournament.uuid}`).emit('tournament:standingsUpdated', {
       tournamentId: tournament.uuid,
+      tournamentUuid: tournament.uuid,
+      tournamentNumericId: tournament.id,
+      isFrozen: shouldFreeze,
+      timestamp: new Date().toISOString()
+    });
+    io.to(`tournament:${tournament.id}`).emit('tournament:standingsUpdated', {
+      tournamentId: tournament.id,
+      tournamentUuid: tournament.uuid,
+      tournamentNumericId: tournament.id,
       isFrozen: shouldFreeze,
       timestamp: new Date().toISOString()
     });
@@ -1116,16 +1218,17 @@ async function getTournamentStandings(tournamentId) {
   const totalPlayed = Number(standingsMeta?.total_played || 0);
 
   // 1. Authoritative Recalculation on Read: Keep standings dynamic and strictly derived from completed matches
-  if (!tournament.is_standings_frozen && tournament.status !== 'COMPLETED') {
+  const isTournamentCompleted = tournament.status === 'COMPLETED';
+  if (!isTournamentCompleted) {
     try {
-      await recalculateStandings(tournament.id, { force: false });
+      await recalculateStandings(tournament.id, { force: true });
     } catch (recalcErr) {
       console.error(`❌ [getTournamentStandings] Error recalculating standings on read for tournament #${tournament.id}:`, recalcErr);
     }
   } else {
-    // If frozen/completed but points_table has 0 played while completed matches exist, auto-heal:
-    if (completedCount > 0 && totalPlayed === 0) {
-      console.log(`⚡ [getTournamentStandings] Self-healing standings for tournament #${tournament.id} (${completedCount} completed matches detected).`);
+    // If completed but completed matches count doesn't match total played in points_table, auto-heal:
+    if (completedCount > 0 && totalPlayed !== completedCount) {
+      console.log(`⚡ [getTournamentStandings] Self-healing standings for tournament #${tournament.id} (${completedCount} completed matches vs ${totalPlayed} in table).`);
       await recalculateStandings(tournament.id, { force: true });
     }
   }
@@ -1147,8 +1250,8 @@ async function getTournamentStandings(tournamentId) {
   // 3. Order criteria by sport
   let orderByClause = 'pt.points DESC, pt.point_difference DESC, pt.won DESC';
   if (sportSlug === 'pickleball') {
-    // Pickleball standard: Most wins -> Higher points scored (PF) -> Better point diff (PD) -> Points -> Team name
-    orderByClause = 'pt.won DESC, pt.points_scored DESC, pt.point_difference DESC, pt.points DESC, tm.name ASC';
+    // Pickleball standard: Points -> Most wins -> Point Differential (PD) -> Points Scored (PF) -> Least Points Conceded (PA) -> Team name
+    orderByClause = 'pt.points DESC, pt.won DESC, pt.point_difference DESC, pt.points_scored DESC, pt.points_conceded ASC, tm.name ASC';
   } else if (sportSlug === 'football') {
     orderByClause = 'pt.points DESC, pt.goal_difference DESC, pt.won DESC, pt.goals_for DESC';
   } else if (sportSlug === 'cricket') {
@@ -1225,41 +1328,135 @@ async function getTournamentStandings(tournamentId) {
     });
   }
 
-  // Calculate ranks with head-to-head tiebreak logic
+  // Helper for head-to-head lookup between two teams
+  const getHeadToHeadWinner = (x, y) => {
+    const xNorm = (x.name || '').toLowerCase().trim();
+    const yNorm = (y.name || '').toLowerCase().trim();
+    const h2h = completedMatches.find(m => {
+      const aNorm = (m.team_a_name || '').toLowerCase().trim();
+      const bNorm = (m.team_b_name || '').toLowerCase().trim();
+      const isA_X = m.team_a_id === x.internalTeamId || (aNorm && aNorm === xNorm);
+      const isB_Y = m.team_b_id === y.internalTeamId || (bNorm && bNorm === yNorm);
+      const isA_Y = m.team_a_id === y.internalTeamId || (aNorm && aNorm === yNorm);
+      const isB_X = m.team_b_id === x.internalTeamId || (bNorm && bNorm === xNorm);
+      return (isA_X && isB_Y) || (isA_Y && isB_X);
+    });
+    if (!h2h) return 0;
+    const wNorm = (h2h.winner_name || '').toLowerCase().trim();
+    if (h2h.winner_team_id === x.internalTeamId || (wNorm && wNorm === xNorm)) return -1;
+    if (h2h.winner_team_id === y.internalTeamId || (wNorm && wNorm === yNorm)) return 1;
+    return 0;
+  };
+
+  // Calculate ranks with head-to-head tiebreak logic per sport
   for (const gName of Object.keys(groups)) {
     const list = groups[gName];
 
-    // Optional sports-specific tiebreaking
-    if (sportSlug === 'pickleball') {
-      list.sort((x, y) => {
-        if (y.won !== x.won) return y.won - x.won;
-        if (y.pointsFor !== x.pointsFor) return y.pointsFor - x.pointsFor;
-        // Head-to-head between x and y (tolerant of alternate team IDs by comparing IDs and names)
-        const xNorm = (x.name || '').toLowerCase().trim();
-        const yNorm = (y.name || '').toLowerCase().trim();
-        const h2h = completedMatches.find(m => {
-          const aNorm = (m.team_a_name || '').toLowerCase().trim();
-          const bNorm = (m.team_b_name || '').toLowerCase().trim();
-          const isA_X = m.team_a_id === x.internalTeamId || (aNorm && aNorm === xNorm);
-          const isB_Y = m.team_b_id === y.internalTeamId || (bNorm && bNorm === yNorm);
-          const isA_Y = m.team_a_id === y.internalTeamId || (aNorm && aNorm === yNorm);
-          const isB_X = m.team_b_id === x.internalTeamId || (bNorm && bNorm === xNorm);
-          return (isA_X && isB_Y) || (isA_Y && isB_X);
-        });
-        if (h2h) {
-          const wNorm = (h2h.winner_name || '').toLowerCase().trim();
-          if (h2h.winner_team_id === x.internalTeamId || (wNorm && wNorm === xNorm)) return -1;
-          if (h2h.winner_team_id === y.internalTeamId || (wNorm && wNorm === yNorm)) return 1;
-        }
-        if (y.pointDifference !== x.pointDifference) return y.pointDifference - x.pointDifference;
+    list.sort((x, y) => {
+      // 1. Total Tournament Points
+      if ((y.points || 0) !== (x.points || 0)) {
+        return (y.points || 0) - (x.points || 0);
+      }
+
+      // 2. Cricket: Points -> NRR -> Wins -> Head-to-Head -> Runs Scored -> Team Name
+      if (sportSlug === 'cricket') {
+        const nrrY = parseFloat(y.netRunRate || 0);
+        const nrrX = parseFloat(x.netRunRate || 0);
+        if (Math.abs(nrrY - nrrX) > 0.0001) return nrrY - nrrX;
+        if ((y.won || 0) !== (x.won || 0)) return (y.won || 0) - (x.won || 0);
+        const h2h = getHeadToHeadWinner(x, y);
+        if (h2h !== 0) return h2h;
+        const rfY = (y.pointsScored || y.runsScored || 0);
+        const rfX = (x.pointsScored || x.runsScored || 0);
+        if (rfY !== rfX) return rfY - rfX;
         return (x.name || '').localeCompare(y.name || '');
-      });
-    }
+      }
+
+      // 3. Football / Futsal: Points -> Goal Difference -> Goals For -> Head-to-Head -> Wins -> Team Name
+      if (sportSlug === 'football' || sportSlug === 'futsal') {
+        const gdY = y.goalDifference != null ? y.goalDifference : ((y.goalsFor || 0) - (y.goalsAgainst || 0));
+        const gdX = x.goalDifference != null ? x.goalDifference : ((x.goalsFor || 0) - (x.goalsAgainst || 0));
+        if (gdY !== gdX) return gdY - gdX;
+        const gfY = y.goalsFor || 0;
+        const gfX = x.goalsFor || 0;
+        if (gfY !== gfX) return gfY - gfX;
+        const h2h = getHeadToHeadWinner(x, y);
+        if (h2h !== 0) return h2h;
+        if ((y.won || 0) !== (x.won || 0)) return (y.won || 0) - (x.won || 0);
+        return (x.name || '').localeCompare(y.name || '');
+      }
+
+      // 4. Pickleball: Points -> Wins -> Head-to-Head -> Point Diff (PD) -> Points For (PF) -> Least Points Against (PA) -> Team Name
+      if (sportSlug === 'pickleball') {
+        if ((y.won || 0) !== (x.won || 0)) return (y.won || 0) - (x.won || 0);
+        const h2h = getHeadToHeadWinner(x, y);
+        if (h2h !== 0) return h2h;
+        const diffY = y.pointDifference != null ? y.pointDifference : ((y.pointsScored || 0) - (y.pointsConceded || 0));
+        const diffX = x.pointDifference != null ? x.pointDifference : ((x.pointsScored || 0) - (x.pointsConceded || 0));
+        if (diffY !== diffX) return diffY - diffX;
+        const pfY = y.pointsScored || y.pointsFor || 0;
+        const pfX = x.pointsScored || x.pointsFor || 0;
+        if (pfY !== pfX) return pfY - pfX;
+        const paY = y.pointsConceded || y.pointsAgainst || 0;
+        const paX = x.pointsConceded || x.pointsAgainst || 0;
+        if (paX !== paY) return paX - paY;
+        return (x.name || '').localeCompare(y.name || '');
+      }
+
+      // 5. Badminton / Tennis / Table Tennis / General multi-sport:
+      // Points -> Wins -> Head-to-Head -> Sets Won -> Diff -> For -> Team Name
+      if ((y.won || 0) !== (x.won || 0)) return (y.won || 0) - (x.won || 0);
+      const h2h = getHeadToHeadWinner(x, y);
+      if (h2h !== 0) return h2h;
+      if ((y.setsWon || 0) !== (x.setsWon || 0)) return (y.setsWon || 0) - (x.setsWon || 0);
+      const diffY = y.pointDifference != null ? y.pointDifference : (y.goalDifference != null ? y.goalDifference : 0);
+      const diffX = x.pointDifference != null ? x.pointDifference : (x.goalDifference != null ? x.goalDifference : 0);
+      if (diffY !== diffX) return diffY - diffX;
+      const forY = y.pointsScored || y.goalsFor || y.pointsFor || 0;
+      const forX = x.pointsScored || x.goalsFor || x.pointsFor || 0;
+      if (forY !== forX) return forY - forX;
+      return (x.name || '').localeCompare(y.name || '');
+    });
 
     list.forEach((team, idx) => {
       team.rank = idx + 1;
       team.isQualified = idx < (tournament.playoff_teams_per_group || 2);
     });
+  }
+
+  let rankingRules = null;
+  if (sportSlug === 'pickleball') {
+    rankingRules = [
+      '1. Total Points (2 per Win)',
+      '2. Total Matches Won',
+      '3. Head-to-Head Result',
+      '4. Point Differential (PD)',
+      '5. Points Scored (PF)',
+      '6. Least Points Conceded (PA)'
+    ];
+  } else if (sportSlug === 'cricket') {
+    rankingRules = [
+      '1. Total Points (2 per Win, 1 per Tie/NR)',
+      '2. Net Run Rate (NRR)',
+      '3. Total Matches Won',
+      '4. Head-to-Head Result'
+    ];
+  } else if (sportSlug === 'football' || sportSlug === 'futsal') {
+    rankingRules = [
+      '1. Total Points (3 per Win, 1 per Draw)',
+      '2. Goal Difference (GD)',
+      '3. Goals Scored (GF)',
+      '4. Head-to-Head Result',
+      '5. Total Matches Won'
+    ];
+  } else if (['badminton', 'tennis', 'table_tennis'].includes(sportSlug)) {
+    rankingRules = [
+      '1. Total Points',
+      '2. Matches Won',
+      '3. Head-to-Head Result',
+      '4. Sets Won',
+      '5. Point Differential (PD)'
+    ];
   }
 
   return {
@@ -1269,12 +1466,7 @@ async function getTournamentStandings(tournamentId) {
     format: tournament.tournament_format || tournament.format,
     isFrozen,
     status: tournament.status,
-    rankingRules: sportSlug === 'pickleball' ? [
-      '1. Most Wins',
-      '2. Higher Points Scored (PF)',
-      '3. Head-to-Head Result',
-      '4. Point Difference (PD)'
-    ] : null,
+    rankingRules,
     groups,
     standings: groups // Both groups and standings for universal frontend compatibility
   };

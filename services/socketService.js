@@ -1,5 +1,6 @@
 let ioInstance = null;
 const broadcasterDisconnectTimers = new Map();
+const activeUserSockets = new Map(); // userId -> Set of socket.ids
 
 // High-speed In-Memory Identifier Mapping Cache (numeric ID <-> UUID)
 const matchIdentifierCache = new Map();
@@ -309,16 +310,31 @@ function initSocket(server) {
       }
     });
 
-    // 10. Join User Room (for private notifications)
+    // 10. Join User Room (for private notifications & active user tracking)
     socket.on('join:user', ({ userId }) => {
       if (userId) {
-        socket.join(`user:${userId}`);
+        const uId = String(userId);
+        socket.userId = uId;
+        socket.join(`user:${uId}`);
+        if (!activeUserSockets.has(uId)) {
+          activeUserSockets.set(uId, new Set());
+        }
+        activeUserSockets.get(uId).add(socket.id);
+        io.emit('admin:active_users_count', { activeUsers: activeUserSockets.size });
       }
     });
 
     socket.on('leave:user', ({ userId }) => {
       if (userId) {
-        socket.leave(`user:${userId}`);
+        const uId = String(userId);
+        socket.leave(`user:${uId}`);
+        if (activeUserSockets.has(uId)) {
+          activeUserSockets.get(uId).delete(socket.id);
+          if (activeUserSockets.get(uId).size === 0) {
+            activeUserSockets.delete(uId);
+          }
+        }
+        io.emit('admin:active_users_count', { activeUsers: activeUserSockets.size });
       }
     });
 
@@ -532,6 +548,17 @@ function initSocket(server) {
     });
 
     socket.on('disconnect', () => {
+      // Clean up active user tracking on disconnect
+      if (socket.userId) {
+        const uId = socket.userId;
+        if (activeUserSockets.has(uId)) {
+          activeUserSockets.get(uId).delete(socket.id);
+          if (activeUserSockets.get(uId).size === 0) {
+            activeUserSockets.delete(uId);
+          }
+        }
+        io.emit('admin:active_users_count', { activeUsers: activeUserSockets.size });
+      }
       if (socket.streamMatchId) {
         const matchId = socket.streamMatchId;
         const streamRoom = `stream:${matchId}`;
@@ -791,9 +818,17 @@ function broadcastPickleballScore(matchPublicId, tournamentPublicId, payload) {
   }).catch(() => {});
 }
 
+/**
+ * Return current connected authenticated active users count.
+ */
+function getActiveUsersCount() {
+  return activeUserSockets.size;
+}
+
 module.exports = {
   initSocket,
   getIO,
+  getActiveUsersCount,
   resolveMatchIdentifiers,
   resolveTournamentIdentifiers,
   broadcastScoreSync,

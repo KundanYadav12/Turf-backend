@@ -446,7 +446,7 @@ async function updateFixture({ tournamentId, matchId, user, updates }) {
     let existingSportState = {};
     try {
       existingSportState = typeof match.sport_state === 'string' ? JSON.parse(match.sport_state) : (match.sport_state || {});
-    } catch {}
+    } catch { }
     if (startingServingTeam) {
       existingSportState.servingTeam = startingServingTeam === 'teamB' ? 'teamB' : 'teamA';
       existingSportState.startingServingTeam = existingSportState.servingTeam;
@@ -472,7 +472,7 @@ async function updateFixture({ tournamentId, matchId, user, updates }) {
 
   // Recalculate standings if counts_in_standings or status was modified
   if (match.status === 'COMPLETED' || status === 'COMPLETED' || newCountsInStandings !== match.counts_in_standings) {
-    await recalculateStandings(tournament.id);
+    await recalculateStandings(tournament.id, { force: true });
   }
 
   const io = getIO();
