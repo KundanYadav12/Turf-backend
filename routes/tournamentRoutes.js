@@ -332,6 +332,20 @@ router.delete('/:id/teams/:teamId/players/:playerId', authenticateUser, async (r
   }
 });
 
+// 5e. POST /api/tournaments/:id/teams/:teamId/clear-dummies - Clear dummy players from squad
+router.post('/:id/teams/:teamId/clear-dummies', authenticateUser, async (req, res, next) => {
+  try {
+    const result = await tournamentService.clearDummyPlayersFromTournamentTeamRoster(
+      req.params.id,
+      req.params.teamId,
+      req.user
+    );
+    res.json({ success: true, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // 6. POST /api/tournaments - Create tournament (Protected: ADMIN, VENUE_OWNER, PLAYER, USER)
 router.post(
   '/',

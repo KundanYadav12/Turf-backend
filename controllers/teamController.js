@@ -1139,8 +1139,8 @@ const getTeamInviteInfo = async (req, res, next) => {
        LEFT JOIN sports s ON t.sport_id = s.id
        LEFT JOIN venues v ON t.venue_id = v.id
        LEFT JOIN users u ON t.captain_id = u.id
-       WHERE t.invite_code = ? AND t.status = 'ACTIVE'`,
-      [code.trim()]
+       WHERE (t.invite_code = ? OR t.uuid = ?) AND t.status = 'ACTIVE'`,
+      [code.trim(), code.trim()]
     );
 
     if (!team) {
@@ -1148,6 +1148,13 @@ const getTeamInviteInfo = async (req, res, next) => {
         success: false,
         message: 'This team invitation link is invalid, expired, or has been revoked.'
       });
+    }
+
+    // Ensure team has an invite_code, generate if missing
+    if (!team.invite_code) {
+      const generated = generateInviteCode();
+      await db.query('UPDATE teams SET invite_code = ? WHERE id = ?', [generated, team.id]);
+      team.invite_code = generated;
     }
 
     const callerId = req.user?.id;
@@ -1206,8 +1213,8 @@ const joinTeamByInviteCode = async (req, res, next) => {
     }
 
     const [team] = await db.query(
-      'SELECT id, uuid, name, owner_id, status FROM teams WHERE invite_code = ? AND status = "ACTIVE"',
-      [code.trim()]
+      'SELECT id, uuid, name, owner_id, status, invite_code FROM teams WHERE (invite_code = ? OR uuid = ?) AND status = "ACTIVE"',
+      [code.trim(), code.trim()]
     );
 
     if (!team) {
@@ -1216,6 +1223,12 @@ const joinTeamByInviteCode = async (req, res, next) => {
         message: 'This team invitation link is invalid, expired, or has been revoked.'
       });
     }
+
+    // Auto-sync Team Group Chat participants if not already
+    let conv = null;
+    try {
+      conv = await chatService.syncTeamGroup(team.id);
+    } catch (e) {}
 
     // Check if user is already an active member
     const [existingMember] = await db.query(
@@ -1230,7 +1243,8 @@ const joinTeamByInviteCode = async (req, res, next) => {
         message: `You are already a member of ${team.name}.`,
         data: {
           teamId: team.uuid,
-          teamName: team.name
+          teamName: team.name,
+          conversationId: conv?.uuid || conv?.id || null
         }
       });
     }
@@ -1291,10 +1305,15 @@ const joinTeamByInviteCode = async (req, res, next) => {
         playerName: userRecord?.full_name || 'Player',
         totalRosterSize
       });
+      if (conv) {
+        io.to(`user:${userId}`).emit('chat:conversation_updated', conv);
+        io.to(`chat:conversation:${conv.id || conv.uuid}`).emit('chat:participant_added', {
+          conversationId: conv.uuid || conv.id,
+          userId,
+          role: 'MEMBER'
+        });
+      }
     }
-
-    // Auto-sync Team Group Chat participants
-    chatService.syncTeamGroup(team.id).catch(() => {});
 
     res.status(200).json({
       success: true,
@@ -1302,7 +1321,8 @@ const joinTeamByInviteCode = async (req, res, next) => {
       data: {
         teamId: team.uuid,
         teamName: team.name,
-        totalRosterSize
+        totalRosterSize,
+        conversationId: conv?.uuid || conv?.id || null
       }
     });
   } catch (error) {

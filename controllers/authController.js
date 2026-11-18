@@ -10,8 +10,8 @@ const register = async (req, res, next) => {
   try {
     const { fullName, email, phone, password, role = 'PLAYER', username } = req.body;
 
-    if (!fullName || !email || !password) {
-      return res.status(400).json({ success: false, message: 'Full name, email, and password are required.' });
+    if (!fullName || !email || !password || !phone || !String(phone).trim()) {
+      return res.status(400).json({ success: false, message: 'Full name, email, phone number, and password are required.' });
     }
 
     // Check if user already exists
@@ -82,6 +82,25 @@ const register = async (req, res, next) => {
       });
     });
 
+    // Broadcast user registered event to Superadmin portal in real time
+    try {
+      const { getIO } = require('../services/socketService');
+      const io = getIO();
+      if (io) {
+        io.emit('user:registered', {
+          id: userId,
+          fullName,
+          username: targetUsername,
+          email,
+          phone: String(phone).trim(),
+          role: targetRole,
+          status: 'ACTIVE',
+          createdAt: new Date().toISOString(),
+          lastLoginAt: null
+        });
+      }
+    } catch (e) {}
+
     res.status(201).json({
       success: true,
       message: 'Account created successfully!',
@@ -147,6 +166,25 @@ const login = async (req, res, next) => {
       secret,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
+
+    // Update last_login_at in database
+    await db.query('UPDATE users SET last_login_at = NOW() WHERE id = ?', [user.id]).catch(() => {});
+
+    // Broadcast login event to Superadmin portal in real time
+    try {
+      const { getIO } = require('../services/socketService');
+      const io = getIO();
+      if (io) {
+        io.emit('user:login', {
+          id: user.id,
+          fullName: user.full_name,
+          email: user.email,
+          phone: user.phone,
+          role: user.role,
+          lastLoginAt: new Date().toISOString()
+        });
+      }
+    } catch (e) {}
 
     res.json({
       success: true,

@@ -223,7 +223,7 @@ const addTeamToTournament = async (tournamentId, { teamId, name, logoUrl, groupN
     [tournament.id, internalTeamId, groupName || 'Group 1']
   );
 
-  // 7. Add roster players if team doesn't have members or custom players passed
+  // 7. Add roster players if custom players passed
   const existingMembers = await db.query(
     'SELECT id FROM team_members WHERE team_id = ?',
     [internalTeamId]
@@ -231,10 +231,8 @@ const addTeamToTournament = async (tournamentId, { teamId, name, logoUrl, groupN
 
   let finalRosterCount = existingMembers ? existingMembers.length : 0;
 
-  if (finalRosterCount === 0 || (Array.isArray(playerNames) && playerNames.length > 0)) {
-    const roster = Array.isArray(playerNames) && playerNames.length > 0
-      ? playerNames
-      : (finalRosterCount === 0 ? Array.from({ length: tournament.roster_size || 12 }, (_, i) => `${cleanName} Player ${i + 1}`) : []);
+  if (Array.isArray(playerNames) && playerNames.length > 0) {
+    const roster = playerNames;
 
     for (let idx = 0; idx < roster.length; idx++) {
       const pName = typeof roster[idx] === 'string' ? roster[idx].trim() : (roster[idx].name || `Player ${idx + 1}`);
@@ -670,116 +668,61 @@ function computeGoldenPointStatus(opts, goldenPointTargetArg, targetScoreArg, go
   const target = goldenPointTarget ? parseInt(goldenPointTarget, 10) : null;
   const needsTargetPrompt = !target || isNaN(target);
 
-  // Derive consecutive scoring streak from logs after tie was first reached
-  let rA = 0;
-  let rB = 0;
-  let tieLogIndex = -1;
-  const sortedLogs = [...logs].sort((a, b) => (a.sequence_number || 0) - (b.sequence_number || 0));
-
-  for (let i = 0; i < sortedLogs.length; i++) {
-    const l = sortedLogs[i];
-    if (l.event_type === 'CORRECTION') {
-      if (l.team_a_score != null) rA = l.team_a_score;
-      if (l.team_b_score != null) rB = l.team_b_score;
-    } else {
-      if (l.team_a_score != null && l.team_b_score != null) {
-        rA = l.team_a_score;
-        rB = l.team_b_score;
-      } else {
-        const pTo = (l.point_to === 'team_b' || l.pointTo === 'teamB') ? 'teamB' : 'teamA';
-        if (pTo === 'teamA') rA += 1;
-        else rB += 1;
-      }
-    }
-    if (rA >= tieThreshold && rB >= tieThreshold && tieLogIndex === -1) {
-      tieLogIndex = i;
-    }
-  }
-
-  let streakTeam = null; // 'teamA' or 'teamB'
-  let streakCount = 0;
+  // Authoritative Golden Point Rule:
+  // After tie threshold is reached (e.g. 14-14 for target 15):
+  // 1. First team to achieve a 2-point lead wins (e.g. 16-14, 17-15, 18-16, 19-17)
+  // 2. OR first team to reach the Golden Point Target cap wins (e.g. 20-19)
   let goldenWinner = null;
   let winReason = null;
 
-  if (tieLogIndex !== -1) {
-    let prevScoreA = tieThreshold;
-    let prevScoreB = tieThreshold;
-
-    for (let i = tieLogIndex + 1; i < sortedLogs.length; i++) {
-      const l = sortedLogs[i];
-      let curScoreA = l.team_a_score != null ? l.team_a_score : prevScoreA;
-      let curScoreB = l.team_b_score != null ? l.team_b_score : prevScoreB;
-
-      const scoredA = curScoreA > prevScoreA;
-      const scoredB = curScoreB > prevScoreB;
-
-      prevScoreA = curScoreA;
-      prevScoreB = curScoreB;
-
-      // Side-outs do not change score, so side-outs do NOT break or add to streak!
-      if (!scoredA && !scoredB) continue;
-
-      const scoringTeam = scoredA ? 'teamA' : 'teamB';
-      if (streakTeam === scoringTeam) {
-        streakCount += 1;
-      } else {
-        streakTeam = scoringTeam;
-        streakCount = 1;
-      }
-
-      // Check winning conditions:
-      // Condition 1: Target reached
-      if (target) {
-        if ((scoringTeam === 'teamA' && curScoreA >= target) ||
-            (scoringTeam === 'teamB' && curScoreB >= target)) {
-          goldenWinner = scoringTeam;
-          winReason = 'TARGET_REACHED';
-          break;
-        }
-      }
-
-      // Condition 2: 2 points in a row
-      if (streakCount >= 2) {
-        goldenWinner = scoringTeam;
-        winReason = 'CONSECUTIVE_STREAK';
-        break;
-      }
-    }
+  if (target && effectiveScoreA >= target) {
+    goldenWinner = 'teamA';
+    winReason = 'TARGET_REACHED';
+  } else if (target && effectiveScoreB >= target) {
+    goldenWinner = 'teamB';
+    winReason = 'TARGET_REACHED';
+  } else if (effectiveScoreA >= effectiveScoreB + 2) {
+    goldenWinner = 'teamA';
+    winReason = 'WIN_BY_TWO';
+  } else if (effectiveScoreB >= effectiveScoreA + 2) {
+    goldenWinner = 'teamB';
+    winReason = 'WIN_BY_TWO';
   }
 
-  // Also check if current score already reaches target
-  if (!goldenWinner && target) {
-    if (scoreA >= target) {
-      goldenWinner = 'teamA';
-      winReason = 'TARGET_REACHED';
-    } else if (scoreB >= target) {
-      goldenWinner = 'teamB';
-      winReason = 'TARGET_REACHED';
-    }
+  // Lead computation for score margin display
+  let leadTeam = null;
+  let leadCount = 0;
+  if (effectiveScoreA > effectiveScoreB) {
+    leadTeam = 'teamA';
+    leadCount = effectiveScoreA - effectiveScoreB;
+  } else if (effectiveScoreB > effectiveScoreA) {
+    leadTeam = 'teamB';
+    leadCount = effectiveScoreB - effectiveScoreA;
   }
 
-  // Game Point detection in Golden Point:
-  // A team shows "GAME POINT" when one more point would win by either condition:
-  // - at streak 1 (next point gives streak 2 = win)
-  // - at target - 1 (next point reaches target = win)
+  // Game Point detection:
+  // A team has Game Point when 1 more point would result in a victory:
+  // - Leading by 1 point (next point establishes 2-point winning margin)
+  // - At target - 1 (next point reaches target cap)
   let isGamePoint = false;
   let gamePointTeam = null;
 
   if (!goldenWinner && target) {
-    if (streakCount === 1 && streakTeam) {
+    if (leadCount === 1) {
       isGamePoint = true;
-      gamePointTeam = streakTeam;
+      gamePointTeam = leadTeam;
     }
-    if (scoreA === target - 1) {
+    if (effectiveScoreA === target - 1) {
       isGamePoint = true;
-      gamePointTeam = 'teamA';
-    } else if (scoreB === target - 1) {
+      gamePointTeam = (gamePointTeam && gamePointTeam !== 'teamA') ? 'BOTH' : 'teamA';
+    }
+    if (effectiveScoreB === target - 1) {
       isGamePoint = true;
-      gamePointTeam = 'teamB';
+      gamePointTeam = (gamePointTeam && gamePointTeam !== 'teamB') ? 'BOTH' : 'teamB';
     }
   }
 
-  const streakTeamName = streakTeam === 'teamA' ? teamAName : (streakTeam === 'teamB' ? teamBName : null);
+  const streakTeamName = leadTeam === 'teamA' ? teamAName : (leadTeam === 'teamB' ? teamBName : null);
 
   return {
     enabled: true,
@@ -789,8 +732,10 @@ function computeGoldenPointStatus(opts, goldenPointTargetArg, targetScoreArg, go
     needsTargetPrompt,
     target,
     lastTarget: target || (lastGoldenPointTarget ? parseInt(lastGoldenPointTarget, 10) : 21),
-    streakTeam,
-    streakCount,
+    streakTeam: leadTeam,
+    streakCount: Math.min(leadCount, 2),
+    leadTeam,
+    leadCount,
     streakTeamName,
     isWinner: Boolean(goldenWinner),
     winnerTeamKey: goldenWinner,
@@ -1637,7 +1582,7 @@ const recordPoint = async (matchId, { pointTo, scoredByPlayerId = null, playerId
       isCompleted = true;
       winnerTeamId = goldenStatus.winnerTeamKey === 'teamA' ? m.team_a_id : m.team_b_id;
       const winnerName = winnerTeamId === m.team_a_id ? m.team_a_name : m.team_b_name;
-      const reasonText = goldenStatus.winReason === 'CONSECUTIVE_STREAK' ? 'Golden Point - 2 in a row' : 'Golden Point Target';
+      const reasonText = goldenStatus.winReason === 'TARGET_REACHED' ? 'Golden Point Target' : 'Golden Point - Win by 2';
       resultSummary = `${winnerName} won ${newScoreA} - ${newScoreB} (${reasonText})`;
     }
   } else {
@@ -1751,7 +1696,7 @@ const recordPoint = async (matchId, { pointTo, scoredByPlayerId = null, playerId
       const matchBreakService = require('./matchBreakService');
       matchBreakService.endBreak(m.id).catch(() => {});
     } catch (e) {}
-    await recalculateStandings(m.tournament_id);
+    await recalculateStandings(m.tournament_id, { force: true });
   }
 
   const state = await getScorerState(m.uuid);
@@ -1927,7 +1872,7 @@ const undoPoint = async (matchId, user) => {
   );
 
   if (wasCompleted) {
-    await recalculateStandings(m.tournament_id);
+    await recalculateStandings(m.tournament_id, { force: true });
   }
 
   const state = await getScorerState(m.uuid);
@@ -2012,7 +1957,7 @@ const correctScore = async (matchId, { teamAScore, teamBScore, notes = 'Score Co
       isCompleted = true;
       winnerTeamId = goldenStatus.winnerTeamKey === 'teamA' ? m.team_a_id : m.team_b_id;
       const winnerName = winnerTeamId === m.team_a_id ? m.team_a_name : m.team_b_name;
-      const reasonText = goldenStatus.winReason === 'CONSECUTIVE_STREAK' ? 'Golden Point - 2 in a row' : 'Golden Point Target';
+      const reasonText = goldenStatus.winReason === 'TARGET_REACHED' ? 'Golden Point Target' : 'Golden Point - Win by 2';
       resultSummary = `${winnerName} won ${newScoreA} - ${newScoreB} (${reasonText})`;
     }
   } else {
@@ -2131,7 +2076,7 @@ const correctScore = async (matchId, { teamAScore, teamBScore, notes = 'Score Co
     [m.id, nextSeq, newScoreA, newScoreB, user ? user.id : null, notes]
   );
 
-  await recalculateStandings(m.tournament_id);
+  await recalculateStandings(m.tournament_id, { force: true });
   if (isCompleted) {
     try {
       const matchBreakService = require('./matchBreakService');
