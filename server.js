@@ -168,4 +168,14 @@ server.listen(PORT, '0.0.0.0', () => {
   chatService.ensureChatSchema()
     .then(() => chatService.backfillExistingGroups())
     .catch((err) => console.warn('Chat schema initialization note:', err.message));
+
+  // Auto-verify user last_login_at column for admin dashboard
+  try {
+    const { ensureLastLoginColumn } = require('./controllers/adminController');
+    if (typeof ensureLastLoginColumn === 'function') {
+      ensureLastLoginColumn().catch(() => {});
+    }
+  } catch (err) {
+    // Ignore
+  }
 });
