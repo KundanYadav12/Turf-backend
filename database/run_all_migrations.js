@@ -25,6 +25,7 @@ const migrations = [
   'migrate_app_branding.js',
   'migrate_chat_system.js',
   'migrate_user_profiles_mentions.js',
+  'migration_last_login.js',
   'seed_superadmin.js'
 ];
 
